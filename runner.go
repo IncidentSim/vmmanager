@@ -9,9 +9,9 @@ import (
 	"syscall"
 )
 
-// runServiceImage owns the workspace lock until the unit is confirmed stopped.
+// runServiceImage holds the workspace lock until receipt-based cleanup completes.
 // It never deletes the caller's disk; callers must preserve it on failure.
-func runServiceImage(disk string) (result error) {
+func runServiceImage(disk, socket string) (result error) {
 	lock, err := lockWorkspace(workspace)
 	if err != nil {
 		return err
@@ -19,7 +19,7 @@ func runServiceImage(disk string) (result error) {
 	defer lock.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	vm, err := startServiceVM(ctx, disk)
+	vm, err := startManagedVM(ctx, workspace, socket, disk)
 	defer func() {
 		if vm != nil {
 			result = errors.Join(result, vm.Stop())
@@ -28,6 +28,6 @@ func runServiceImage(disk string) (result error) {
 	if err != nil {
 		return err
 	}
-	fmt.Println("systemd VM running; guest reboot exits Firecracker; " + journalHint())
+	fmt.Println("VM running; guest reboot exits Firecracker; " + journalHint())
 	return vm.Wait(ctx)
 }

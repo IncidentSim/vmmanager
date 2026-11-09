@@ -1,20 +1,48 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
-func TestRetainedSystemdExitIsRecognized(t *testing.T) {
-	raw := "ActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\nExecMainCode=1\n"
-	done, err := serviceOutcome(raw)
-	if !done || err != nil {
-		t.Fatalf("retained clean exit must complete: done=%v err=%v", done, err)
-	}
-	for _, raw := range []string{
-		"ActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\nExecMainCode=2\n",
-		"ActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=1\nExecMainCode=1\n",
+func TestExitReceiptRequiresExactCleanProcess(t *testing.T) {
+	for _, tc := range []struct {
+		result, code, status string
+		ok                   bool
+	}{
+		{"success", "exited", "0", true}, {"signal", "killed", "9", false}, {"exit-code", "exited", "1", false}, {"success", "killed", "0", false},
 	} {
-		done, err := serviceOutcome(raw)
-		if !done || err == nil {
-			t.Fatalf("unclean retained exit must fail: %v %v", done, err)
+		t.Run(tc.result+tc.code+tc.status, func(t *testing.T) {
+			socket := filepath.Join(t.TempDir(), "api.sock")
+			writeReceipt(t, socket, testID, tc.result, tc.code, tc.status)
+			vm := &managedVM{socket: socket, id: testID, started: true}
+			if err := vm.Wait(context.Background()); (err == nil) != tc.ok {
+				t.Fatalf("receipt result: %v", err)
+			}
+		})
+	}
+}
+func TestReplacementNeverProvesPreviousProcessExited(t *testing.T) {
+	socket := apiServer(t, func(w http.ResponseWriter, r *http.Request) { instanceInfo(w, replacementID, "Not started") })
+	writeReceipt(t, socket, replacementID, "success", "exited", "0")
+	vm := &managedVM{socket: socket, id: testID, started: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := vm.Wait(ctx); err == nil {
+		t.Fatal("replacement used as proof")
+	}
+}
+func TestMalformedOrMismatchedReceiptsFailClosed(t *testing.T) {
+	for _, raw := range []string{`{`, `{"invocation_id":"` + replacementID + `","result":"success","exit_code":"exited","exit_status":"0"}`, `{}`} {
+		socket := filepath.Join(t.TempDir(), "api.sock")
+		os.WriteFile(filepath.Join(filepath.Dir(socket), testID+".exit.json"), []byte(raw), 0600)
+		vm := &managedVM{socket: socket, id: testID, started: true}
+		if err := vm.Wait(context.Background()); err == nil {
+			t.Fatal("accepted invalid receipt")
 		}
 	}
 }

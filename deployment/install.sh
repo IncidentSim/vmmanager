@@ -34,12 +34,15 @@ install -m 0644 -o root -g root "$repo/deployment/firecracker-builder-network.se
 python3 - "$repo" "$client" "$group" <<'PY'
 import os,pathlib,sys
 repo,user,group=sys.argv[1:]
-for source,dest in [('deployment/firecracker-builder@.service','/etc/systemd/system/firecracker-builder@.service'),('deployment/49-firecracker-builder.rules','/etc/polkit-1/rules.d/49-firecracker-builder.rules')]:
+for source,dest in [('deployment/firecracker-builder@.service','/etc/systemd/system/firecracker-builder@.service')]:
     data=(pathlib.Path(repo)/source).read_text().replace('@CLIENT_USER@',user).replace('@CLIENT_GROUP@',group)
     p=pathlib.Path(dest);p.write_text(data);os.chmod(p,0o644);os.chown(p,0,0)
 pathlib.Path('/opt/firecracker-builder/managed-install').write_text('firecracker-builder systemd installation\nclient='+user+'\n')
 PY
+# The client no longer owns service lifecycle; revoke the earlier narrow grant.
+rm -f /etc/polkit-1/rules.d/49-firecracker-builder.rules
 systemd-analyze verify /etc/systemd/system/firecracker-builder@.service /etc/systemd/system/firecracker-builder-network.service
 systemctl daemon-reload
+systemctl enable --now firecracker-builder@main.service
 printf 'Installed. Client: %s; unit: firecracker-builder@main.service; API: /run/firecracker-builder/main.sock\n' "$client"
-printf 'Workspace: /var/lib/firecracker-builder/work (jail path /work). No unit was enabled at boot.\n'
+printf 'Workspace: /var/lib/firecracker-builder/work (jail path /work). Service enabled and started externally.\n'

@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -16,7 +18,6 @@ import (
 )
 
 const workspace = "/var/lib/firecracker-builder/work"
-const serviceUnit = "firecracker-builder@main.service"
 const serviceSocket = "/run/firecracker-builder/main.sock"
 
 // jailDiskPath rejects lexical traversal and every symlink component, including
@@ -90,8 +91,8 @@ func lockWorkspace(root string) (*os.File, error) {
 	return f, nil // close releases the lock; never unlink this stable inode
 }
 
-func configureVM(ctx context.Context, socket, disk string) error {
-	client := firecracker.NewClient(socket, logrus.NewEntry(logrus.New()), false)
+func configureGuest(ctx context.Context, socket, disk string) error {
+	client := sdkClient(socket)
 	cfg := models.MachineConfiguration{VcpuCount: firecracker.Int64(2), MemSizeMib: firecracker.Int64(1024), Smt: firecracker.Bool(false)}
 	if _, err := client.PutMachineConfiguration(ctx, &cfg); err != nil {
 		return err
@@ -108,119 +109,175 @@ func configureVM(ctx context.Context, socket, disk string) error {
 	if _, err := client.PutGuestNetworkInterfaceByID(ctx, "eth0", &iface); err != nil {
 		return err
 	}
-	_, err := client.CreateSyncAction(ctx, &models.InstanceActionInfo{ActionType: firecracker.String("InstanceStart")})
-	return err
+	return nil
 }
 
-func systemctl(ctx context.Context, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, "systemctl", append([]string{"--no-ask-password"}, args...)...).CombinedOutput()
+// managedVM owns only a connection, never the externally managed VMM process.
+type managedVM struct {
+	socket string
+	id     string
+	// Also true for an uncertain InstanceStart response: the guest may be running.
+	started bool
+	// Set while disk configuration may have reached an unknown process.
+	identityUncertain bool
+}
+
+var invocationID = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+func sdkClient(socket string) *firecracker.Client {
+	return firecracker.NewClient(socket, logrus.NewEntry(logrus.New()), false)
+}
+
+// connectVM must run under the workspace lock, before copying or changing disks.
+func connectVM(ctx context.Context, socket string) (*managedVM, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	info, err := sdkClient(socket).GetInstanceInfo(probeCtx)
 	if err != nil {
-		return string(out), fmt.Errorf("systemctl %s: %w: %s", strings.Join(args, " "), err, out)
+		return nil, fmt.Errorf("connect to VMM socket %s: %w; operator must start/restart the VMM externally", socket, err)
 	}
-	return string(out), nil
-}
-func serviceStatus(ctx context.Context) (string, error) {
-	return systemctl(ctx, "show", "--property=ActiveState,SubState,Result,ExecMainStatus,ExecMainCode", serviceUnit)
-}
-func statusFields(raw string) map[string]string {
-	fields := map[string]string{}
-	for _, line := range strings.Split(raw, "\n") {
-		k, v, ok := strings.Cut(line, "=")
-		if ok {
-			fields[k] = v
-		}
+	if info.Payload == nil || info.Payload.State == nil || *info.Payload.State != "Not started" {
+		return nil, fmt.Errorf("VMM is busy or not in Not started state; operator must restart it externally")
 	}
-	return fields
-}
-func serviceOutcome(raw string) (bool, error) {
-	s := statusFields(raw)
-	if s["ActiveState"] == "active" && s["SubState"] == "exited" {
-		// RemainAfterExit keeps exit metadata until the client has inspected it.
-		if s["Result"] == "success" && s["ExecMainStatus"] == "0" && (s["ExecMainCode"] == "1" || s["ExecMainCode"] == "exited") {
-			return true, nil
-		}
-		return true, fmt.Errorf("VMM did not exit cleanly: %s", strings.TrimSpace(raw))
+	if info.Payload.ID == nil || !invocationID.MatchString(*info.Payload.ID) {
+		return nil, fmt.Errorf("invalid VMM invocation id (expected 32 lowercase hex characters)")
 	}
-	switch s["ActiveState"] {
-	case "active", "activating", "deactivating", "reloading":
-		return false, nil
-	case "inactive":
-		// systemd encodes CLD_EXITED as 1; textual exited is accepted too.
-		if s["Result"] == "success" && s["ExecMainStatus"] == "0" && (s["ExecMainCode"] == "1" || s["ExecMainCode"] == "exited") {
-			return true, nil
-		}
-	}
-	return true, fmt.Errorf("VMM did not exit cleanly: %s", strings.TrimSpace(raw))
+	return &managedVM{socket: socket, id: *info.Payload.ID}, nil
 }
 
-type managedVM struct{}
-
-func startServiceVM(ctx context.Context, disk string) (*managedVM, error) {
-	return startManagedVM(ctx, workspace, serviceSocket, disk)
+func (vm *managedVM) configure(ctx context.Context, root, disk string) error {
+	current, err := connectVM(ctx, vm.socket)
+	if err != nil {
+		return err
+	}
+	if current.id != vm.id {
+		return fmt.Errorf("VMM identity changed before configuration; operator must restart externally")
+	}
+	jail, err := prepareDisk(root, disk)
+	if err != nil {
+		return err
+	}
+	configureCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	vm.identityUncertain = true
+	if err := configureGuest(configureCtx, vm.socket, jail); err != nil {
+		return fmt.Errorf("configure VMM: %w; disk must be retained; operator must restart the VMM externally", err)
+	}
+	current, err = connectVM(configureCtx, vm.socket)
+	if err != nil {
+		return err
+	}
+	if current.id != vm.id {
+		return fmt.Errorf("VMM identity changed during configuration; retain disk and restart externally")
+	}
+	vm.identityUncertain = false
+	vm.started = true
+	_, err = sdkClient(vm.socket).CreateSyncAction(configureCtx, &models.InstanceActionInfo{ActionType: firecracker.String("InstanceStart")})
+	if err != nil {
+		return fmt.Errorf("InstanceStart response uncertain: %w", err)
+	}
+	return nil
 }
 
 func startManagedVM(ctx context.Context, root, socket, disk string) (*managedVM, error) {
-	jail, err := prepareDisk(root, disk)
+	vm, err := connectVM(ctx, socket)
 	if err != nil {
 		return nil, err
 	}
-	vm := &managedVM{}
-	// Return vm even on failure: the caller must stop/verify before deleting disk.
-	if _, err := systemctl(ctx, "start", serviceUnit); err != nil {
-		return vm, err
-	}
-	readyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	client := firecracker.NewClient(socket, logrus.NewEntry(logrus.New()), false)
-	for {
-		info, err := client.GetInstanceInfo(readyCtx)
-		if err == nil {
-			if info.Payload.State == nil || *info.Payload.State != "Not started" {
-				return vm, fmt.Errorf("unexpected VMM instance state: %v", info.Payload)
-			}
-			break
-		}
-		select {
-		case <-readyCtx.Done():
-			return vm, fmt.Errorf("waiting for service API: %w", readyCtx.Err())
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-	if err := configureVM(readyCtx, socket, jail); err != nil {
-		return vm, fmt.Errorf("configure VMM: %w", err)
-	}
-	return vm, nil
+	// A partially configured VMM can hold the disk open. Return it on failure so
+	// cleanup refuses to discard the disk without a per-process exit receipt.
+	return vm, vm.configure(ctx, root, disk)
 }
+
+type exitReceipt struct {
+	InvocationID string `json:"invocation_id"`
+	Result       string `json:"result"`
+	ExitCode     string `json:"exit_code"`
+	ExitStatus   string `json:"exit_status"`
+}
+
+func (vm *managedVM) receipt() (bool, error) {
+	if vm.identityUncertain {
+		return false, fmt.Errorf("disk configuration may have reached an unknown VMM process; operator must restart externally")
+	}
+	// Validate before deriving any filesystem path, even for internal callers.
+	if !invocationID.MatchString(vm.id) {
+		return false, fmt.Errorf("invalid VMM invocation id")
+	}
+	path := filepath.Join(filepath.Dir(vm.socket), vm.id+".exit.json")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read exit receipt: %w", err)
+	}
+	var r exitReceipt
+	if err := json.Unmarshal(data, &r); err != nil {
+		return false, fmt.Errorf("invalid exit receipt: %w", err)
+	}
+	if r.InvocationID != vm.id {
+		return false, fmt.Errorf("exit receipt invocation mismatch")
+	}
+	if r.Result != "success" || r.ExitCode != "exited" || r.ExitStatus != "0" {
+		return true, fmt.Errorf("VMM %s did not exit cleanly: result=%q exit_code=%q exit_status=%q", vm.id, r.Result, r.ExitCode, r.ExitStatus)
+	}
+	return true, nil
+}
+
 func (vm *managedVM) Wait(ctx context.Context) error {
 	for {
-		raw, err := serviceStatus(ctx)
-		if err != nil {
-			return err
-		}
-		done, err := serviceOutcome(raw)
-		if done {
+		done, err := vm.receipt()
+		if done || err != nil {
 			return err
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+			return fmt.Errorf("waiting for VMM %s exit receipt: %w", vm.id, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
+
+// Stop requests a guest reboot through the SDK; it does not stop a host service.
+// Never infer safety from a replacement responding on the same socket.
 func (vm *managedVM) Stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := systemctl(ctx, "stop", serviceUnit); err != nil {
+	if err := vm.abort(ctx); err != nil {
+		return fmt.Errorf("cannot confirm clean VMM exit: %w; retain working disk; operator must restart the VMM externally", err)
+	}
+	return nil
+}
+func (vm *managedVM) abort(ctx context.Context) error {
+	if done, err := vm.receipt(); done || err != nil {
 		return err
 	}
-	raw, err := serviceStatus(ctx)
+	if !vm.started {
+		return fmt.Errorf("configuration did not reach InstanceStart; no safe API process cleanup is available")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	info, err := sdkClient(vm.socket).GetInstanceInfo(probeCtx)
+	cancel()
 	if err != nil {
 		return err
 	}
-	state := statusFields(raw)["ActiveState"]
-	if state != "inactive" && state != "failed" {
-		return fmt.Errorf("refusing disk cleanup: service state %q", state)
+	if info.Payload == nil || info.Payload.ID == nil || *info.Payload.ID != vm.id {
+		// A replacement may have appeared before ExecStopPost's receipt was visible.
+		// Wait for the OLD receipt, never send an action to this process.
+		if done, err := vm.receipt(); done || err != nil {
+			return err
+		}
+		return fmt.Errorf("VMM identity changed; refusing to reboot replacement")
 	}
-	return nil
+	actionCtx, cancelAction := context.WithTimeout(ctx, 2*time.Second)
+	_, err = sdkClient(vm.socket).CreateSyncAction(actionCtx, &models.InstanceActionInfo{ActionType: firecracker.String("SendCtrlAltDel")})
+	cancelAction()
+	// An HTTP failure does not prove the action failed: the VMM can exit
+	// before sending its response. Only the receipt resolves that ambiguity.
+	waitErr := vm.Wait(ctx)
+	if waitErr != nil && err != nil {
+		return errors.Join(fmt.Errorf("request guest reboot: %w", err), waitErr)
+	}
+	return waitErr
 }

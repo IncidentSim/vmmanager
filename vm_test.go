@@ -29,24 +29,6 @@ func TestJailDiskPath(t *testing.T) {
 		}
 	}
 }
-func TestServiceStatus(t *testing.T) {
-	for _, tc := range []struct {
-		raw      string
-		done, ok bool
-	}{
-		{"ActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\nExecMainCode=0", false, false},
-		{"ActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\nExecMainCode=1", true, true},
-		{"ActiveState=failed\nResult=exit-code\nExecMainStatus=1\nExecMainCode=1", true, false},
-		{"ActiveState=inactive\nResult=signal\nExecMainStatus=0\nExecMainCode=2", true, false},
-		{"ActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainCode=2", true, false},
-		{"ActiveState=inactive", true, false},
-	} {
-		done, err := serviceOutcome(tc.raw)
-		if done != tc.done || (err == nil && done) != tc.ok {
-			t.Errorf("%q: done=%v err=%v", tc.raw, done, err)
-		}
-	}
-}
 func TestClientLockIsExclusiveAndStable(t *testing.T) {
 	root := t.TempDir()
 	first, err := lockWorkspace(root)
@@ -76,6 +58,10 @@ func TestConfigureVMUsesOnlyJailPaths(t *testing.T) {
 	var paths []string
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
+		if r.Method == "GET" {
+			instanceInfo(w, testID, "Not started")
+			return
+		}
 		var body map[string]interface{}
 		json.NewDecoder(r.Body).Decode(&body)
 		if r.URL.Path == "/boot-source" && body["kernel_image_path"] != "/kernel/vmlinux" {
@@ -91,10 +77,13 @@ func TestConfigureVMUsesOnlyJailPaths(t *testing.T) {
 	})}
 	go srv.Serve(l)
 	defer srv.Close()
-	if err := configureVM(context.Background(), socket, "/work/disk.ext4"); err != nil {
+	root := t.TempDir()
+	disk := filepath.Join(root, "disk.ext4")
+	os.WriteFile(disk, []byte("disk"), 0600)
+	if _, err := startManagedVM(context.Background(), root, socket, disk); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(paths, []string{"/machine-config", "/boot-source", "/drives/rootfs", "/network-interfaces/eth0", "/actions"}) {
+	if !reflect.DeepEqual(paths, []string{"/", "/", "/machine-config", "/boot-source", "/drives/rootfs", "/network-interfaces/eth0", "/", "/actions"}) {
 		t.Fatal(paths)
 	}
 }

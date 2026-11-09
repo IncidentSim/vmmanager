@@ -16,7 +16,7 @@ func TestCLIExposesServiceRunner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(out), "-run-image") {
+	if !strings.Contains(string(out), "-run-image") || !strings.Contains(string(out), "-socket") {
 		t.Fatal(string(out))
 	}
 	for _, flag := range []string{"-firecracker", "-console-log", "-kernel", "-tap"} {

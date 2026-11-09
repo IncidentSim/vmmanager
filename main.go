@@ -33,13 +33,14 @@ func main() {
 
 	runImage := flag.String("run-image", "", "boot a writable disk inside /var/lib/firecracker-builder/work; supply a disposable copy")
 
+	socket := flag.String("socket", serviceSocket, "existing Firecracker API Unix socket (VMM must already be running)")
 	flag.Parse()
 
 	var err error
 	if *runImage != "" {
-		err = runServiceImage(*runImage)
+		err = runServiceImage(*runImage, *socket)
 	} else {
-		err = build(*base, *key, *output)
+		err = build(*base, *key, *output, *socket)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ERROR:", err)
@@ -47,15 +48,25 @@ func main() {
 	}
 }
 
-func build(base, key, output string) (result error) {
+func build(base, key, output, socket string) (result error) {
+	vmCtx, cancelVM := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancelVM()
+	return buildInWorkspace(vmCtx, workspace, socket, base, key, output)
+}
+
+func buildInWorkspace(vmCtx context.Context, root, socket, base, key, output string) (result error) {
 	if runtime.GOOS != "linux" {
 		return errors.New("Firecracker requires a Linux host with KVM")
 	}
-	lock, err := lockWorkspace(workspace)
+	lock, err := lockWorkspace(root)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
+	vm, err := connectVM(vmCtx, socket)
+	if err != nil {
+		return err
+	}
 	base, err = absoluteFile(base)
 	if err != nil {
 		return err
@@ -78,7 +89,7 @@ func build(base, key, output string) (result error) {
 	}
 
 	// Work with an independent filesystem image, preserving the original base.
-	partial, err := os.CreateTemp(workspace, ".postgres-build-*.ext4")
+	partial, err := os.CreateTemp(root, ".postgres-build-*.ext4")
 	if err != nil {
 		return err
 	}
@@ -103,10 +114,7 @@ func build(base, key, output string) (result error) {
 	defer os.RemoveAll(runDir)
 	knownHosts := filepath.Join(runDir, "known_hosts")
 
-	fmt.Println("[2/5] Starting systemd-managed Firecracker via SDK Unix API")
-	vmCtx, cancelVM := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancelVM()
-	vm, err := startServiceVM(vmCtx, partialPath)
+	fmt.Println("[2/5] Configuring connected Firecracker via SDK Unix API")
 	defer func() {
 		if vm != nil {
 			if stopErr := vm.Stop(); stopErr != nil {
@@ -115,7 +123,7 @@ func build(base, key, output string) (result error) {
 			}
 		}
 	}()
-	if err != nil {
+	if err := vm.configure(vmCtx, root, partialPath); err != nil {
 		return err
 	}
 	waitCh := make(chan error, 1)
@@ -163,6 +171,7 @@ printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=3 update
 apt-get -o Acquire::Retries=3 install -y postgresql
+# These commands run inside the guest over SSH, never on the host.
 systemctl enable postgresql
 systemctl start postgresql
 runuser -u postgres -- psql -Atqc 'SHOW server_version;'
@@ -233,7 +242,7 @@ func run(name string, args ...string) error {
 	return nil
 }
 
-func journalHint() string { return "VMM logs: journalctl -u " + serviceUnit }
+func journalHint() string { return "VMM logs: journalctl -u firecracker-builder@main.service" }
 
 // Stage on the destination filesystem, then publish with no-replace semantics.
 func publishImage(source, output string) error {

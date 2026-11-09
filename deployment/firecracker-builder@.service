@@ -3,10 +3,11 @@ Description=Isolated Firecracker builder VMM (%i)
 Requires=firecracker-builder-network.service
 After=firecracker-builder-network.service
 ConditionPathExists=/dev/kvm
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
-RemainAfterExit=yes
+
 User=root
 Group=@CLIENT_GROUP@
 UMask=0007
@@ -15,6 +16,7 @@ MountAPIVFS=no
 WorkingDirectory=/work
 RuntimeDirectory=firecracker-builder
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
 BindReadOnlyPaths=/opt/firecracker-builder/firecracker:/bin/firecracker
 BindReadOnlyPaths=/opt/firecracker-builder/vmlinux:/kernel/vmlinux
 BindReadOnlyPaths=/usr/local/libexec/firecracker-builder-launcher
@@ -22,7 +24,9 @@ BindPaths=/var/lib/firecracker-builder/work:/work
 BindPaths=/run/firecracker-builder:/run/firecracker-builder
 BindPaths=/dev/kvm /dev/net/tun
 ExecStart=/usr/local/libexec/firecracker-builder-launcher
-Restart=no
+ExecStopPost=/usr/local/libexec/firecracker-builder-launcher record-exit
+Restart=always
+RestartSec=1
 KillMode=control-group
 TimeoutStopSec=10
 NoNewPrivileges=yes
@@ -51,3 +55,6 @@ TasksMax=64
 LimitNOFILE=1024
 StandardOutput=journal
 StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
