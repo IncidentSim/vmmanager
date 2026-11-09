@@ -2,7 +2,8 @@
 """Boot a disposable image copy twice; verify SQL and persistence; remove demo networking."""
 import fcntl, hashlib, json, os, pathlib, shutil, subprocess, tempfile, time
 ROOT=pathlib.Path(__file__).resolve().parent
-IMAGE=ROOT/'images/ubuntu-postgres.ext4'
+IMAGE=pathlib.Path(os.environ.get('FC_VERIFY_IMAGE',str(ROOT/'images/ubuntu-postgres.ext4')))
+REPORT=pathlib.Path(os.environ.get('FC_VERIFY_REPORT',str(ROOT/'verification.json')))
 def digest(path):
     h=hashlib.sha256()
     with open(path,'rb') as f:
@@ -61,7 +62,7 @@ runuser -u postgres -- psql -v ON_ERROR_STOP=1 -Atqc 'SELECT value FROM fc_smoke
         after=digest(IMAGE)
         assert before==after, 'Original output image unexpectedly modified'
         report={'verified':True,'boots':2,'postgresql':'16.15','persistence':'passed','output_image_sha256':after,'output_image_unchanged':True}
-        (ROOT/'verification.json').write_text(json.dumps(report,indent=2)+'\n')
+        REPORT.write_text(json.dumps(report,indent=2)+'\n')
         print(json.dumps(report,indent=2),flush=True)
     finally:
         if vm is not None and vm.poll() is None:
@@ -73,5 +74,5 @@ runuser -u postgres -- psql -v ON_ERROR_STOP=1 -Atqc 'SELECT value FROM fc_smoke
             os.chown(d,uid,gid)
             for f in d.iterdir():
                 if f.is_file(): os.chown(f,uid,gid)
-        if (ROOT/'verification.json').exists():os.chown(ROOT/'verification.json',uid,gid)
+        if REPORT.exists():os.chown(REPORT,uid,gid)
 if __name__=='__main__': main()
