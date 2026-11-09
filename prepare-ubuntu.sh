@@ -3,6 +3,7 @@
 # injects a demo SSH key and creates an ext4 disk for the Go image builder.
 set -euo pipefail
 cd "$(dirname "$0")"
+[[ $(id -u) == 0 ]] || { echo 'Run via sudo ask-exec bash ./prepare-ubuntu.sh' >&2; exit 1; }
 
 if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
   echo 'This example requires an x86_64 Linux host.' >&2
@@ -57,9 +58,9 @@ mkdir -p "$work/rootfs/root/.ssh"
 cp assets/id_ed25519.pub "$work/rootfs/root/.ssh/authorized_keys"
 chmod 700 "$work/rootfs/root/.ssh"
 chmod 600 "$work/rootfs/root/.ssh/authorized_keys"
-sudo chown -R root:root "$work/rootfs"
+chown -R root:root "$work/rootfs"
 
 # PostgreSQL needs more space than the small demo image in upstream examples.
 truncate -s 3G assets/ubuntu-base.ext4
-sudo mkfs.ext4 -F -d "$work/rootfs" assets/ubuntu-base.ext4 >/dev/null
+mkfs.ext4 -F -d "$work/rootfs" assets/ubuntu-base.ext4 >/dev/null
 printf 'Prepared assets/firecracker, assets/vmlinux, assets/ubuntu-base.ext4 and SSH key.\n'

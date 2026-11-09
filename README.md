@@ -33,13 +33,13 @@ injected. The script also downloads the latest Firecracker release executable.
 ## Run
 
 ```bash
-./prepare-ubuntu.sh            # Ubuntu rootfs, Firecracker kernel, SSH key
-sudo ./network.sh up           # tap-fcpg: 172.16.0.1/30, NAT to default route
+sudo ask-exec bash ./prepare-ubuntu.sh # Ubuntu rootfs, Firecracker kernel, SSH key
+sudo ask-exec bash ./network.sh up           # tap-fcpg: 172.16.0.1/30, NAT to default route
 
 go build -o image-builder .
-sudo ./image-builder -output images/ubuntu-postgres.ext4
+sudo ask-exec ./image-builder -output images/ubuntu-postgres.ext4
 
-sudo ./network.sh down         # clean up the TAP and this demo's iptables rules
+sudo ask-exec bash ./network.sh down         # clean up the TAP and this demo's iptables rules
 ```
 
 If your outbound network interface differs from the first default-route
@@ -69,8 +69,8 @@ Firecracker requires the `assets/vmlinux` kernel as well as the ext4 disk. To
 try a new VM from your built image, keep the demo TAP running and launch:
 
 ```bash
-sudo ./network.sh up    # skip if already running
-sudo ./run-image.sh images/ubuntu-postgres.ext4
+sudo ask-exec bash ./network.sh up    # skip if already running
+sudo ask-exec bash ./run-image.sh images/ubuntu-postgres.ext4
 ```
 
 In another terminal, after boot, connect using the demo SSH key:
@@ -83,7 +83,7 @@ reboot       # terminates the Firecracker process gracefully
 ```
 
 `run-image.sh` uses a temporary copy so this test does not mutate the built
-image. After it exits, shut down network using `sudo ./network.sh down`.
+image. After it exits, shut down network using `sudo ask-exec bash ./network.sh down`.
 
 ## Mechanics
 
@@ -114,8 +114,20 @@ up the original TAP. `network.sh down` intentionally leaves the host's global
 The guest uses 1.1.1.1 for DNS during provisioning. Change this in `main.go`
 if your network requires another resolver.
 
-This repository was **compiled with Go**, but a complete VM boot was **not
-runtime-tested here** because `/dev/kvm` was not available.
+Runtime verification completed with Firecracker v1.18.0, guest kernel 6.18.56+,
+Ubuntu 24.04.5 LTS, and PostgreSQL 16.15. The built image was booted using a
+disposable copy, a SQL row was inserted, and the row survived a complete VM
+restart. The original output image remained unchanged; offline `e2fsck -fn`
+passed.
+
+To repeat the two-boot SQL test (requires the demo TAP to be absent initially):
+
+```bash
+sudo ask-exec env TMPDIR="$TMPDIR" python3 ./verify-image.py
+```
+
+The verifier creates and removes the demo TAP/NAT, waits for PostgreSQL readiness
+independently of SSH readiness, and writes `verification.json`.
 
 ## Sources
 

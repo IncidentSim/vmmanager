@@ -1,2 +1,6 @@
 assets/
 images/
+image-builder
+verification.json
+__pycache__/
+
