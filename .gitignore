@@ -2,6 +2,7 @@ assets/
 images/
 image-builder
 verification.json
+verification-sdk.json
 recordings/
 __pycache__/
 

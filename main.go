@@ -5,15 +5,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -30,9 +31,17 @@ func main() {
 	output := flag.String("output", "images/ubuntu-postgres.ext4", "output Firecracker ext4 image")
 	tap := flag.String("tap", "tap-fcpg", "preconfigured Linux TAP device")
 	binary := flag.String("firecracker", "assets/firecracker", "Firecracker executable")
+	runImage := flag.String("run-image", "", "boot this writable image via SDK; caller must supply a disposable copy")
+	consoleLog := flag.String("console-log", "", "guest console log for -run-image (default stdout)")
 	flag.Parse()
 
-	if err := build(*kernel, *base, *key, *output, *tap, *binary); err != nil {
+	var err error
+	if *runImage != "" {
+		err = runSDKImage(*kernel, *runImage, *tap, *binary, *consoleLog)
+	} else {
+		err = build(*kernel, *base, *key, *output, *tap, *binary)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "ERROR:", err)
 		os.Exit(1)
 	}
@@ -97,53 +106,31 @@ func build(kernel, base, key, output, tap, binary string) error {
 		return err
 	}
 	defer os.RemoveAll(runDir)
-	confPath := filepath.Join(runDir, "firecracker.json")
 	logPath := filepath.Join(runDir, "firecracker.log")
 	knownHosts := filepath.Join(runDir, "known_hosts")
-
-	config := map[string]any{
-		"boot-source": map[string]any{
-			"kernel_image_path": kernel,
-			"boot_args":         "console=ttyS0 reboot=k panic=1",
-		},
-		"drives": []map[string]any{{
-			"drive_id": "rootfs", "path_on_host": partialPath,
-			"is_root_device": true, "is_read_only": false,
-		}},
-		"machine-config": map[string]any{
-			"vcpu_count": 2, "mem_size_mib": 1024,
-		},
-		"network-interfaces": []map[string]any{{
-			"iface_id": "eth0", "guest_mac": macAddr, "host_dev_name": tap,
-		}},
-	}
-	encoded, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(confPath, encoded, 0o600); err != nil {
-		return err
-	}
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return err
 	}
 	defer logFile.Close()
 
-	fmt.Println("[2/5] Starting Firecracker microVM")
-	// --config-file starts the VM automatically; --no-api avoids a socket.
-	vm := exec.Command(binary, "--no-api", "--config-file", confPath)
-	vm.Stdout, vm.Stderr = logFile, logFile
-	if err := vm.Start(); err != nil {
-		return fmt.Errorf("start firecracker: %w", err)
+	fmt.Println("[2/5] Starting Firecracker microVM via Go SDK / Unix API")
+	vmCtx, cancelVM := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancelVM()
+	vm, err := startSDKVM(vmCtx, kernel, partialPath, tap, binary, runDir, logFile)
+	if err != nil {
+		return fmt.Errorf("%w; %s", err, logTail(logPath))
 	}
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- vm.Wait() }()
+	go func() { waitCh <- vm.Wait(context.Background()) }()
 	stopped := false
 	defer func() {
 		if !stopped {
-			_ = vm.Process.Kill()
-			<-waitCh
+			cancelVM()       // SDK kills/reaps the VMM on context cancellation
+			_ = vm.StopVMM() // abort only; successful builds use guest reboot below
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = vm.Wait(ctx)
 		}
 	}()
 
@@ -163,7 +150,7 @@ func build(kernel, base, key, output, tap, binary string) error {
 	defer readyBy.Stop()
 	sshReady := false
 	for !sshReady {
-		probeCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		probeCtx, cancel := context.WithTimeout(vmCtx, 4*time.Second)
 		probe := exec.CommandContext(probeCtx, "ssh", append(append([]string{}, sshArgs...), "true")...)
 		sshReady = probe.Run() == nil
 		cancel()
@@ -195,7 +182,7 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 sync
 `
-	provisionCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	provisionCtx, cancel := context.WithTimeout(vmCtx, 10*time.Minute)
 	defer cancel()
 	install := exec.CommandContext(provisionCtx, "ssh", append(append([]string{}, sshArgs...), "bash -se")...)
 	install.Stdin = strings.NewReader(provision)
@@ -207,7 +194,7 @@ sync
 	fmt.Println("[5/5] Rebooting guest to shut down Firecracker cleanly")
 	// x86 Firecracker exits on guest reboot when boot args include reboot=k.
 	// A delayed reboot allows SSH to return before its connection disappears.
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancelShutdown := context.WithTimeout(vmCtx, 10*time.Second)
 	defer cancelShutdown()
 	shutdown := exec.CommandContext(shutdownCtx, "ssh", append(append([]string{}, sshArgs...),
 		`nohup sh -c 'sleep 2; sync; reboot' >/dev/null 2>&1 </dev/null &`)...)
@@ -226,6 +213,9 @@ sync
 	}
 
 	// The guest has shut down, so its filesystem can safely become a new image.
+	if err := vmCtx.Err(); err != nil {
+		return err
+	}
 	if err := os.Rename(partialPath, output); err != nil {
 		return err
 	}

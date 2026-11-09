@@ -1,7 +1,7 @@
 # Build an Ubuntu + PostgreSQL Firecracker image with Go
 
 A small **Linux x86_64 / KVM** demo. The Go program boots an Ubuntu microVM via
-Firecracker, executes `apt-get install postgresql` **inside the guest** over SSH,
+`firecracker-go-sdk`, executes `apt-get install postgresql` **inside the guest** over SSH,
 checks PostgreSQL, cleanly shuts down the guest and publishes a new, bootable
 `ext4` root filesystem image.
 
@@ -51,7 +51,7 @@ Expected stages:
 
 ```
 [1/5] Copying Ubuntu rootfs
-[2/5] Starting Firecracker microVM
+[2/5] Starting Firecracker microVM via Go SDK / Unix API
 [3/5] Waiting for SSH in Ubuntu
 [4/5] Installing PostgreSQL inside Ubuntu
 ... apt output ...
@@ -91,13 +91,42 @@ image. After it exits, shut down network using `sudo ask-exec bash ./network.sh 
    ext4 disk, including a root SSH public key.
 2. `network.sh up` makes a TAP and NAT rules; the guest's Ubuntu network
    configuration assigns `172.16.0.2` from MAC `06:00:AC:10:00:02`.
-3. `main.go` copies the base rootfs, creates a Firecracker JSON config, and
-   launches `firecracker --no-api --config-file ...`.
+3. `main.go` copies the base rootfs. `vm.go` constructs a typed SDK config,
+   creates a machine with `firecracker.NewMachine`, and calls `Start`.
+   The SDK launches the Firecracker executable with `--api-sock`, configures
+   the kernel, writable root disk, 2 vCPUs, 1024 MiB RAM, and the existing
+   TAP through its Unix HTTP API, then sends `InstanceStart`.
 4. Go waits for SSH, installs and enables PostgreSQL through a guest-side
    shell script, then checks `SHOW server_version;`.
 5. Go asks the guest to reboot. On x86_64, `reboot=k` makes Firecracker exit
-   after a graceful guest reboot. Only **after** the exit does Go atomically
+   after a graceful guest reboot. Go waits with SDK `Machine.Wait`.
+   Only **after** a successful exit does Go atomically
    rename the modified working disk to the requested output image.
+
+The SDK dependency is pinned to `github.com/firecracker-microvm/firecracker-go-sdk`
+v1.0.0 in `go.mod`/`go.sum`. The Firecracker executable and Linux/KVM are still
+required: the SDK is an API client and process orchestrator, not a replacement
+hypervisor. Network setup and SSH provisioning are deliberately unchanged.
+
+`run-image.sh` and `verify-image.py` use the same SDK backend through
+`image-builder -run-image PATH`. This low-level flag boots **the supplied writable
+file directly**; use the shell wrapper for an automatic disposable copy.
+Optional `-console-log PATH` captures guest console output. Interrupting a VM
+aborts it; it is not a substitute for clean guest reboot when saving a disk.
+
+## Tests
+
+```bash
+go test -race -cover ./...
+go vet ./...
+python3 -m unittest -v test_verify_image.py
+```
+
+Unit tests check the SDK configuration, API socket command, startup validation,
+runner CLI, and that both image helpers use the SDK runner. They do not require
+root or KVM. The Python regression test checks verifier cleanup on SIGTERM
+without starting a VM or changing networking. The two-boot SQL verifier below
+is the real KVM integration test.
 
 ## Limitations
 
@@ -114,7 +143,7 @@ up the original TAP. `network.sh down` intentionally leaves the host's global
 The guest uses 1.1.1.1 for DNS during provisioning. Change this in `main.go`
 if your network requires another resolver.
 
-Runtime verification completed with Firecracker v1.18.0, guest kernel 6.18.56+,
+SDK runtime verification completed with Firecracker v1.18.0, guest kernel 6.18.56+,
 Ubuntu 24.04.5 LTS, and PostgreSQL 16.15. The built image was booted using a
 disposable copy, a SQL row was inserted, and the row survived a complete VM
 restart. The original output image remained unchanged; offline `e2fsck -fn`
@@ -123,6 +152,7 @@ passed.
 To repeat the two-boot SQL test (requires the demo TAP to be absent initially):
 
 ```bash
+go build -o image-builder .
 sudo ask-exec env TMPDIR="$TMPDIR" python3 ./verify-image.py
 ```
 
