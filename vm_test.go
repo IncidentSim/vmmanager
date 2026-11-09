@@ -2,57 +2,121 @@ package main
 
 import (
 	"context"
-	"io"
-
+	"encoding/json"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-func TestSDKConfigPreservesGuestResources(t *testing.T) {
-	cfg := sdkConfig("/kernel", "/disk.ext4", "tap-test", "/run/vm.sock")
-	if cfg.SocketPath != "/run/vm.sock" || cfg.KernelImagePath != "/kernel" {
-		t.Fatalf("wrong paths: %+v", cfg)
+func TestJailDiskPath(t *testing.T) {
+	root := t.TempDir()
+	disk := filepath.Join(root, "disk.ext4")
+	os.WriteFile(disk, []byte("disk"), 0600)
+	got, err := jailDiskPath(root, disk)
+	if err != nil || got != "/work/disk.ext4" {
+		t.Fatalf("%q %v", got, err)
 	}
-	if *cfg.MachineCfg.VcpuCount != 2 || *cfg.MachineCfg.MemSizeMib != 1024 {
-		t.Fatalf("wrong resources: %+v", cfg.MachineCfg)
-	}
-	if !strings.Contains(cfg.KernelArgs, "reboot=k") {
-		t.Fatal("clean reboot exit must be preserved")
-	}
-	if len(cfg.Drives) != 1 || *cfg.Drives[0].PathOnHost != "/disk.ext4" || !*cfg.Drives[0].IsRootDevice || *cfg.Drives[0].IsReadOnly {
-		t.Fatalf("wrong root drive: %+v", cfg.Drives)
-	}
-	if len(cfg.NetworkInterfaces) != 1 {
-		t.Fatal("expected one interface")
-	}
-	net := cfg.NetworkInterfaces[0].StaticConfiguration
-	if net == nil || net.HostDevName != "tap-test" || net.MacAddress != macAddr {
-		t.Fatalf("wrong network: %+v", net)
+	os.Symlink(disk, filepath.Join(root, "alias"))
+	os.Mkdir(filepath.Join(root, "nested"), 0700)
+	os.Symlink(root, filepath.Join(root, "link"))
+	for _, path := range []string{filepath.Join(root, "alias"), filepath.Join(root, "link", "disk.ext4"), filepath.Dir(root), root + "/nested/../disk.ext4"} {
+		if _, err := jailDiskPath(root, path); err == nil {
+			t.Errorf("accepted unsafe path %s", path)
+		}
 	}
 }
-
-func TestSDKCommandUsesAPISocketInsteadOfConfigFile(t *testing.T) {
-	cmd := sdkCommand(context.Background(), "/custom/firecracker", "/run/vm.sock", io.Discard)
-	if cmd.Path != "/custom/firecracker" {
-		t.Fatalf("binary: %s", cmd.Path)
-	}
-	if !reflect.DeepEqual(cmd.Args[1:], []string{"--api-sock", "/run/vm.sock"}) {
-		t.Fatalf("unexpected SDK arguments: %q", cmd.Args)
-	}
-	if cmd.Stdout != io.Discard || cmd.Stderr != io.Discard {
-		t.Fatal("guest console not redirected")
+func TestServiceStatus(t *testing.T) {
+	for _, tc := range []struct {
+		raw      string
+		done, ok bool
+	}{
+		{"ActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\nExecMainCode=0", false, false},
+		{"ActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\nExecMainCode=1", true, true},
+		{"ActiveState=failed\nResult=exit-code\nExecMainStatus=1\nExecMainCode=1", true, false},
+		{"ActiveState=inactive\nResult=signal\nExecMainStatus=0\nExecMainCode=2", true, false},
+		{"ActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainCode=2", true, false},
+		{"ActiveState=inactive", true, false},
+	} {
+		done, err := serviceOutcome(tc.raw)
+		if done != tc.done || (err == nil && done) != tc.ok {
+			t.Errorf("%q: done=%v err=%v", tc.raw, done, err)
+		}
 	}
 }
-
-func TestStartSDKVMRejectsMissingKernel(t *testing.T) {
-	dir := t.TempDir()
-	_, err := startSDKVM(context.Background(), "/missing/kernel", "/missing/disk", "tap-test", "/missing/firecracker", dir, io.Discard)
-	if err == nil {
-		t.Fatal("missing inputs must not start a VM")
+func TestClientLockIsExclusiveAndStable(t *testing.T) {
+	root := t.TempDir()
+	first, err := lockWorkspace(root)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "kernel") {
-		t.Fatalf("unhelpful error: %v", err)
+	if next, err := lockWorkspace(root); err == nil {
+		next.Close()
+		t.Fatal("concurrent client accepted")
 	}
-
+	first.Close()
+	next, err := lockWorkspace(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next.Close()
+	if _, err := os.Stat(filepath.Join(root, ".client.lock")); err != nil {
+		t.Fatal("lock must remain stable", err)
+	}
+}
+func TestConfigureVMUsesOnlyJailPaths(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "api.sock")
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		var body map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&body)
+		if r.URL.Path == "/boot-source" && body["kernel_image_path"] != "/kernel/vmlinux" {
+			t.Errorf("kernel %v", body)
+		}
+		if r.URL.Path == "/drives/rootfs" && body["path_on_host"] != "/work/disk.ext4" {
+			t.Errorf("disk %v", body)
+		}
+		if r.URL.Path == "/actions" && body["action_type"] != "InstanceStart" {
+			t.Errorf("action %v", body)
+		}
+		w.WriteHeader(204)
+	})}
+	go srv.Serve(l)
+	defer srv.Close()
+	if err := configureVM(context.Background(), socket, "/work/disk.ext4"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(paths, []string{"/machine-config", "/boot-source", "/drives/rootfs", "/network-interfaces/eth0", "/actions"}) {
+		t.Fatal(paths)
+	}
+}
+func TestPublishPreservesExistingOutput(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	out := filepath.Join(root, "out")
+	os.WriteFile(src, []byte("new"), 0600)
+	os.WriteFile(out, []byte("old"), 0600)
+	if err := publishImage(src, out); err == nil {
+		t.Fatal("overwrote existing image")
+	}
+	data, _ := os.ReadFile(out)
+	if string(data) != "old" {
+		t.Fatal(string(data))
+	}
+	os.Remove(out)
+	if err := publishImage(src, out); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(out)
+	if strings.TrimSpace(string(data)) != "new" {
+		t.Fatal(string(data))
+	}
 }

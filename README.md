@@ -1,166 +1,139 @@
-# Build an Ubuntu + PostgreSQL Firecracker image with Go
+# Ubuntu + PostgreSQL image builder
 
-A small **Linux x86_64 / KVM** demo. The Go program boots an Ubuntu microVM via
-`firecracker-go-sdk`, executes `apt-get install postgresql` **inside the guest** over SSH,
-checks PostgreSQL, cleanly shuts down the guest and publishes a new, bootable
-`ext4` root filesystem image.
+Linux x86_64 / KVM image builder. The unprivileged Go client boots a disposable
+Ubuntu ext4 disk, installs PostgreSQL **inside the guest** over SSH, requests a
+clean guest reboot, and publishes the modified filesystem. The output is a
+Firecracker root disk, not an OCI image or a memory snapshot.
 
-This produces a **Firecracker disk image**, not an OCI/Docker image, nor a
-Firecracker memory snapshot. A Firecracker VM boots with a guest kernel plus
-an ext4 root filesystem file.
+## Service deployment contract
 
-## Requirements
+An administrator first installs the units and narrow authorization policy in
+`deployment/` (see its installation instructions). Normal application commands
+below run as **amnezia**, without sudo. The client may start/stop/restart only
+`firecracker-builder@main.service`; the unit owns the VMM process and manages
+networking through its dependency. Do not run `network.sh` from clients.
 
-- x86_64 Linux with working KVM (`ls -l /dev/kvm`)
-- Go 1.22+
-- root access for this demo's TAP networking and Firecracker
-- Internet access from the host and guest
-- Roughly 5 GB free disk space
+- Host API socket: `/run/firecracker-builder/main.sock`, root:amnezia and group
+  writable. This socket is privileged: only trusted local clients may access it.
+- Stable shared workspace: `/var/lib/firecracker-builder/work`, amnezia:amnezia,
+  mode 0770. The jail sees it as `/work`.
+- Fixed host kernel: `/opt/firecracker-builder/vmlinux`; the jail sees
+  `/kernel/vmlinux`. The client neither checks nor opens a local kernel.
+- Working directories use mode 0770; disks use 0660. The root-owned VMM runs
+  with group amnezia and without DAC override, so these group permissions are
+  necessary. Source images and SSH keys need only be readable by the client.
+- One VM/client at a time: every client holds a nonblocking exclusive flock on
+  the stable workspace `.client.lock` inode until service cleanup finishes.
 
-Install host dependencies on Ubuntu/Debian:
+The root-owned filesystem jail and capability policy are deployment concerns.
+The application never launches Firecracker, uses sudo, or configures host
+networking. This remains a single-tenant example with a trusted guest network,
+static TAP/MAC/IP and demo SSH credentials, not a multi-tenant build platform.
+
+## Build and use
+
+Requirements: installed deployment, Go 1.22+, Python 3, OpenSSH client, coreutils,
+working host KVM, guest Internet access, and sufficient disk space. Prepare a
+matching Ubuntu base rootfs and SSH key in `assets/` using the administrator's
+artifact preparation workflow (`prepare-ubuntu.sh`); ensure these resulting
+files are accessible to amnezia. Install the matching kernel in the fixed
+service location during deployment.
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y curl ca-certificates squashfs-tools e2fsprogs \
-  openssh-client iproute2 iptables gawk grep coreutils
-```
-
-`prepare-ubuntu.sh` follows the **official Firecracker getting-started recipe**
-for obtaining a recent CI Ubuntu rootfs and matching guest kernel. Artifacts
-are retrieved from Firecracker's own CI S3 bucket, and a demo SSH key is
-injected. The script also downloads the latest Firecracker release executable.
-
-## Run
-
-```bash
-sudo ask-exec bash ./prepare-ubuntu.sh # Ubuntu rootfs, Firecracker kernel, SSH key
-sudo ask-exec bash ./network.sh up           # tap-fcpg: 172.16.0.1/30, NAT to default route
-
 go build -o image-builder .
-sudo ask-exec ./image-builder -output images/ubuntu-postgres.ext4
-
-sudo ask-exec bash ./network.sh down         # clean up the TAP and this demo's iptables rules
+./image-builder -base assets/ubuntu-base.ext4 -ssh-key assets/id_ed25519 \
+  -output images/ubuntu-postgres.ext4
+bash ./run-image.sh images/ubuntu-postgres.ext4
 ```
 
-If your outbound network interface differs from the first default-route
-interface, override it: `sudo HOST_IFACE=ens5 ./network.sh up` (and use the
-same override for `down`). The IP range `172.16.0.0/30` must not conflict with
-existing host networks.
+The builder copies the base into the workspace. It never changes the base or
+an existing output. After a successful guest reboot, it copies the working disk
+to a temporary file **in the output directory**, syncs it, and atomically renames
+it with no-replace semantics. Workspace and output may be different filesystems.
+An existing output, even one created concurrently, is never overwritten.
 
-Expected stages:
-
-```
-[1/5] Copying Ubuntu rootfs
-[2/5] Starting Firecracker microVM via Go SDK / Unix API
-[3/5] Waiting for SSH in Ubuntu
-[4/5] Installing PostgreSQL inside Ubuntu
-... apt output ...
-[5/5] Rebooting guest to shut down Firecracker cleanly
-Built /absolute/path/images/ubuntu-postgres.ext4
-```
-
-The `images/ubuntu-postgres.ext4` is the output. The original
-`assets/ubuntu-base.ext4` is not modified. `cp --reflink=auto --sparse=always`
-tries to use copy-on-write when possible, but works without reflink support.
-
-## Boot the resulting image
-
-Firecracker requires the `assets/vmlinux` kernel as well as the ext4 disk. To
-try a new VM from your built image, keep the demo TAP running and launch:
-
-```bash
-sudo ask-exec bash ./network.sh up    # skip if already running
-sudo ask-exec bash ./run-image.sh images/ubuntu-postgres.ext4
-```
-
-In another terminal, after boot, connect using the demo SSH key:
+The shell wrapper makes its own disposable workspace copy. From another terminal:
 
 ```bash
 ssh -i assets/id_ed25519 -o StrictHostKeyChecking=accept-new root@172.16.0.2
+# Commands below run inside the guest:
 systemctl status postgresql
 sudo -u postgres psql -Atqc 'SHOW server_version;'
-reboot       # terminates the Firecracker process gracefully
+reboot
 ```
 
-`run-image.sh` uses a temporary copy so this test does not mutate the built
-image. After it exits, shut down network using `sudo ask-exec bash ./network.sh down`.
+Low-level `./image-builder -run-image /var/lib/firecracker-builder/work/NAME.ext4`
+boots that writable file directly. Paths outside the workspace, traversal and
+symlink components are rejected. Do not pass a valuable source image. The old
+`-kernel`, `-tap`, `-firecracker`, and `-console-log` flags have been removed.
 
-## Mechanics
+## Lifecycle and diagnostics
 
-1. `prepare-ubuntu.sh` turns Firecracker's Ubuntu squashfs into a bootable
-   ext4 disk, including a root SSH public key.
-2. `network.sh up` makes a TAP and NAT rules; the guest's Ubuntu network
-   configuration assigns `172.16.0.2` from MAC `06:00:AC:10:00:02`.
-3. `main.go` copies the base rootfs. `vm.go` constructs a typed SDK config,
-   creates a machine with `firecracker.NewMachine`, and calls `Start`.
-   The SDK launches the Firecracker executable with `--api-sock`, configures
-   the kernel, writable root disk, 2 vCPUs, 1024 MiB RAM, and the existing
-   TAP through its Unix HTTP API, then sends `InstanceStart`.
-4. Go waits for SSH, installs and enables PostgreSQL through a guest-side
-   shell script, then checks `SHOW server_version;`.
-5. Go asks the guest to reboot. On x86_64, `reboot=k` makes Firecracker exit
-   after a graceful guest reboot. Go waits with SDK `Machine.Wait`.
-   Only **after** a successful exit does Go atomically
-   rename the modified working disk to the requested output image.
+The client uses `systemctl --no-ask-password start/stop` for the fixed unit and
+the official Firecracker SDK **Client** for Unix HTTP API configuration. It
+waits for `GET /` InstanceInfo `Not started`, then configures 2 vCPUs, 1024 MiB,
+`/kernel/vmlinux`, `/work/<relative-disk>`, and `tap-fcpg`, and sends
+`InstanceStart`. It does not use SDK Machine/process spawning.
 
-The SDK dependency is pinned to `github.com/firecracker-microvm/firecracker-go-sdk`
-v1.0.0 in `go.mod`/`go.sum`. The Firecracker executable and Linux/KVM are still
-required: the SDK is an API client and process orchestrator, not a replacement
-hypervisor. Network setup and SSH provisioning are deliberately unchanged.
+Guest `reboot=k` makes Firecracker exit. The client polls systemd state and
+accepts a retained `active/exited` state (or an inactive state whose metadata is
+still available), `Result=success`, `ExecMainStatus=0`, and normal
+`ExecMainCode=exited` (numeric 1). `RemainAfterExit=yes` prevents systemd from
+garbage-collecting that exit metadata before the client checks it. The client
+then stops the unit, releasing networking. A failed/killed service is never success.
+On errors or signals the client stops the unit and verifies it is not active
+before releasing its lock. If stopping cannot be confirmed, the builder retains
+the working disk. Wrappers conservatively retain their copies on any runner
+failure; inspect and remove them only after confirming the unit is stopped.
+Do not SIGKILL the client: it would bypass its cleanup.
 
-`run-image.sh` and `verify-image.py` use the same SDK backend through
-`image-builder -run-image PATH`. This low-level flag boots **the supplied writable
-file directly**; use the shell wrapper for an automatic disposable copy.
-Optional `-console-log PATH` captures guest console output. Interrupting a VM
-aborts it; it is not a substitute for clean guest reboot when saving a disk.
+VMM and guest console output belong to the root-owned service journal, not the
+client's stdout. Read it with the administrator's journal access policy:
 
-## Tests
+```bash
+journalctl -u firecracker-builder@main.service
+systemctl --no-ask-password show \
+  --property=ActiveState,SubState,Result,ExecMainStatus,ExecMainCode \
+  firecracker-builder@main.service
+```
+
+## Verification
 
 ```bash
 go test -race -cover ./...
 go vet ./...
 python3 -m unittest -v test_verify_image.py
+bash -n run-image.sh demo-lifecycle.sh
 ```
 
-Unit tests check the SDK configuration, API socket command, startup validation,
-runner CLI, and that both image helpers use the SDK runner. They do not require
-root or KVM. The Python regression test checks verifier cleanup on SIGTERM
-without starting a VM or changing networking. The two-boot SQL verifier below
-is the real KVM integration test.
+Unit tests need neither root nor KVM: they check jail path validation, file
+permissions, stable locking, systemd outcomes/cleanup/cancellation, official SDK
+requests against a fake Unix HTTP server, output preservation, and the CLI.
+The Python subprocess regression sends real SIGTERM and verifies runner cleanup.
 
-## Limitations
-
-This is a learning example, **not a hardened production image pipeline**.
-It assumes one builder at a time, static TAP/MAC/IP, demo SSH keys and a
-trusted local guest network. The SSH host keys and machine identity are baked
-into the output image and should be regenerated for production clones. For
-multi-tenant work use Firecracker's jailer, resource limits, per-VM networking,
-image verification, reproducible/pinned dependencies, and cleanup of guest
-identities/credentials. Do not run `network.sh up` repeatedly without cleaning
-up the original TAP. `network.sh down` intentionally leaves the host's global
-`net.ipv4.ip_forward` value unchanged.
-
-The guest uses 1.1.1.1 for DNS during provisioning. Change this in `main.go`
-if your network requires another resolver.
-
-SDK runtime verification completed with Firecracker v1.18.0, guest kernel 6.18.56+,
-Ubuntu 24.04.5 LTS, and PostgreSQL 16.15. The built image was booted using a
-disposable copy, a SQL row was inserted, and the row survived a complete VM
-restart. The original output image remained unchanged; offline `e2fsck -fn`
-passed.
-
-To repeat the two-boot SQL test (requires the demo TAP to be absent initially):
+Real KVM integration, after deployment and image creation:
 
 ```bash
-go build -o image-builder .
-sudo ask-exec env TMPDIR="$TMPDIR" python3 ./verify-image.py
+python3 ./verify-image.py
+# Optional:
+FC_VERIFY_IMAGE=images/ubuntu-postgres.ext4 \
+FC_VERIFY_REPORT=verification.json python3 ./verify-image.py
+bash ./demo-lifecycle.sh
 ```
 
-The verifier creates and removes the demo TAP/NAT, waits for PostgreSQL readiness
-independently of SSH readiness, and writes `verification.json`.
+The verifier runs unprivileged, copies the image into the shared workspace,
+boots it twice through the same runner, performs SQL INSERT/SELECT persistence
+checks, records the **actual SQL server version**, and verifies the published
+image hash did not change. It never changes networking or file ownership.
+Its `boot-*.log` files capture runner diagnostics, not guest console output.
+A successful report is written only after both clean boots; no past SDK-spawned
+verification result is evidence that a new systemd deployment works.
+
+Guest provisioning currently uses DNS 1.1.1.1. Production images should regenerate
+guest identity/SSH host keys and avoid reusable demo credentials.
 
 ## Sources
 
 - [Firecracker Getting Started](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)
 - [Firecracker Network Setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md)
-- [Firecracker FAQ — reboot / power-off semantics](https://github.com/firecracker-microvm/firecracker/blob/main/FAQ.md)
+- [Firecracker FAQ](https://github.com/firecracker-microvm/firecracker/blob/main/FAQ.md)

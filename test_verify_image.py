@@ -16,21 +16,20 @@ with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as root:
     for name in ('assets','images'): (v.ROOT/name).mkdir()
     v.REPORT=v.ROOT/'report.json'
     v.digest=lambda path:'unchanged'
-    v.os.geteuid=lambda:0
+    v.WORKSPACE=v.ROOT/'work';v.WORKSPACE.mkdir()
     v.os.access=lambda *args:True
-    v.os.chown=lambda *args:None
     class VM:
         def poll(self): return None
         def terminate(self): print('VM_STOP',flush=True)
         def wait(self,timeout=None): return 0
     v.subprocess.Popen=lambda *args,**kwargs:VM()
     def run(args,**kwargs):
-        if args[0]=='ip': return types.SimpleNamespace(returncode=1)
+        if args[0]=='cp':
+            pathlib.Path(args[-1]).write_bytes(b'disk')
         if args[0]=='ssh':
             print('READY',flush=True)
             signal.pause()
             raise RuntimeError('signal did not interrupt wait')
-        if args[-1]=='down': print('NETWORK_DOWN',flush=True)
         return types.SimpleNamespace(returncode=0)
     v.subprocess.run=run
     getattr(v,'install_signal_handlers',lambda:None)()
@@ -38,7 +37,7 @@ with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as root:
 '''
 
 class VerifierSignalTests(unittest.TestCase):
-    def test_sigterm_stops_runner_and_cleans_network(self):
+    def test_sigterm_stops_runner_without_privileged_network_cleanup(self):
         proc = subprocess.Popen([sys.executable, '-c', HARNESS], stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, cwd=Path(__file__).parent)
         assert proc.stdout is not None
@@ -50,7 +49,7 @@ class VerifierSignalTests(unittest.TestCase):
             proc.send_signal(signal.SIGTERM)
             out, _ = proc.communicate(timeout=10)
             self.assertIn('VM_STOP', out)
-            self.assertIn('NETWORK_DOWN', out)
+            self.assertNotIn('NETWORK_DOWN', out)
             self.assertEqual(proc.returncode, 128 + signal.SIGTERM)
         finally:
             if proc.poll() is None:

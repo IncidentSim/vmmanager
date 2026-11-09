@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -25,21 +27,19 @@ const (
 )
 
 func main() {
-	kernel := flag.String("kernel", "assets/vmlinux", "Firecracker-compatible guest kernel")
 	base := flag.String("base", "assets/ubuntu-base.ext4", "Ubuntu base ext4 rootfs")
 	key := flag.String("ssh-key", "assets/id_ed25519", "SSH private key matching rootfs authorized_keys")
 	output := flag.String("output", "images/ubuntu-postgres.ext4", "output Firecracker ext4 image")
-	tap := flag.String("tap", "tap-fcpg", "preconfigured Linux TAP device")
-	binary := flag.String("firecracker", "assets/firecracker", "Firecracker executable")
-	runImage := flag.String("run-image", "", "boot this writable image via SDK; caller must supply a disposable copy")
-	consoleLog := flag.String("console-log", "", "guest console log for -run-image (default stdout)")
+
+	runImage := flag.String("run-image", "", "boot a writable disk inside /var/lib/firecracker-builder/work; supply a disposable copy")
+
 	flag.Parse()
 
 	var err error
 	if *runImage != "" {
-		err = runSDKImage(*kernel, *runImage, *tap, *binary, *consoleLog)
+		err = runServiceImage(*runImage)
 	} else {
-		err = build(*kernel, *base, *key, *output, *tap, *binary)
+		err = build(*base, *key, *output)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ERROR:", err)
@@ -47,30 +47,20 @@ func main() {
 	}
 }
 
-func build(kernel, base, key, output, tap, binary string) error {
+func build(base, key, output string) (result error) {
 	if runtime.GOOS != "linux" {
 		return errors.New("Firecracker requires a Linux host with KVM")
 	}
-	if os.Geteuid() != 0 {
-		return errors.New("run as root (sudo); this demo uses a root-owned TAP and /dev/kvm")
-	}
-	if _, err := os.Stat("/dev/kvm"); err != nil {
-		return fmt.Errorf("missing /dev/kvm: %w", err)
-	}
-	var err error
-	kernel, err = absoluteFile(kernel)
+	lock, err := lockWorkspace(workspace)
 	if err != nil {
 		return err
 	}
+	defer lock.Close()
 	base, err = absoluteFile(base)
 	if err != nil {
 		return err
 	}
 	key, err = absoluteFile(key)
-	if err != nil {
-		return err
-	}
-	binary, err = absoluteFile(binary)
 	if err != nil {
 		return err
 	}
@@ -88,13 +78,18 @@ func build(kernel, base, key, output, tap, binary string) error {
 	}
 
 	// Work with an independent filesystem image, preserving the original base.
-	partial, err := os.CreateTemp(filepath.Dir(output), ".postgres-build-*.ext4")
+	partial, err := os.CreateTemp(workspace, ".postgres-build-*.ext4")
 	if err != nil {
 		return err
 	}
 	partialPath := partial.Name()
 	_ = partial.Close()
-	defer os.Remove(partialPath) // no image is published unless all steps succeed
+	safeCleanup := true
+	defer func() {
+		if safeCleanup {
+			os.Remove(partialPath)
+		}
+	}()
 
 	fmt.Println("[1/5] Copying Ubuntu rootfs")
 	if err := run("cp", "--reflink=auto", "--sparse=always", base, partialPath); err != nil {
@@ -106,33 +101,25 @@ func build(kernel, base, key, output, tap, binary string) error {
 		return err
 	}
 	defer os.RemoveAll(runDir)
-	logPath := filepath.Join(runDir, "firecracker.log")
 	knownHosts := filepath.Join(runDir, "known_hosts")
-	logFile, err := os.Create(logPath)
+
+	fmt.Println("[2/5] Starting systemd-managed Firecracker via SDK Unix API")
+	vmCtx, cancelVM := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancelVM()
+	vm, err := startServiceVM(vmCtx, partialPath)
+	defer func() {
+		if vm != nil {
+			if stopErr := vm.Stop(); stopErr != nil {
+				safeCleanup = false
+				result = errors.Join(result, fmt.Errorf("%w; disk retained at %s", stopErr, partialPath))
+			}
+		}
+	}()
 	if err != nil {
 		return err
 	}
-	defer logFile.Close()
-
-	fmt.Println("[2/5] Starting Firecracker microVM via Go SDK / Unix API")
-	vmCtx, cancelVM := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancelVM()
-	vm, err := startSDKVM(vmCtx, kernel, partialPath, tap, binary, runDir, logFile)
-	if err != nil {
-		return fmt.Errorf("%w; %s", err, logTail(logPath))
-	}
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- vm.Wait(context.Background()) }()
-	stopped := false
-	defer func() {
-		if !stopped {
-			cancelVM()       // SDK kills/reaps the VMM on context cancellation
-			_ = vm.StopVMM() // abort only; successful builds use guest reboot below
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = vm.Wait(ctx)
-		}
-	}()
+	go func() { waitCh <- vm.Wait(vmCtx) }()
 
 	sshArgs := []string{
 		"-T", "-i", key,
@@ -159,10 +146,11 @@ func build(kernel, base, key, output, tap, binary string) error {
 		}
 		select {
 		case vmErr := <-waitCh:
-			stopped = true
-			return fmt.Errorf("firecracker stopped before SSH became ready: %v; %s", vmErr, logTail(logPath))
+			return fmt.Errorf("firecracker stopped before SSH became ready: %v; %s", vmErr, journalHint())
+		case <-vmCtx.Done():
+			return vmCtx.Err()
 		case <-readyBy.C:
-			return fmt.Errorf("SSH timeout; check guest network and rootfs config; %s", logTail(logPath))
+			return fmt.Errorf("SSH timeout; check guest network and rootfs config; %s", journalHint())
 		case <-time.After(time.Second):
 		}
 	}
@@ -204,23 +192,24 @@ sync
 
 	select {
 	case vmErr := <-waitCh:
-		stopped = true
 		if vmErr != nil {
-			return fmt.Errorf("firecracker stopped with error: %w; %s", vmErr, logTail(logPath))
+			return fmt.Errorf("firecracker stopped with error: %w; %s", vmErr, journalHint())
 		}
+	case <-vmCtx.Done():
+		return vmCtx.Err()
 	case <-time.After(60 * time.Second):
-		return fmt.Errorf("VM did not exit after reboot; refusing to publish image; %s", logTail(logPath))
+		return fmt.Errorf("VM did not exit after reboot; refusing to publish image; %s", journalHint())
 	}
 
 	// The guest has shut down, so its filesystem can safely become a new image.
 	if err := vmCtx.Err(); err != nil {
 		return err
 	}
-	if err := os.Rename(partialPath, output); err != nil {
+	if err := publishImage(partialPath, output); err != nil {
 		return err
 	}
 	fmt.Printf("Built %s\n", output)
-	fmt.Println("Boot this ext4 file with the same guest kernel and a fresh TAP/VM config.")
+	fmt.Println("Boot a disposable copy with run-image.sh; the service supplies the fixed guest kernel.")
 	return nil
 }
 
@@ -244,13 +233,31 @@ func run(name string, args ...string) error {
 	return nil
 }
 
-func logTail(path string) string {
-	data, err := os.ReadFile(path)
+func journalHint() string { return "VMM logs: journalctl -u " + serviceUnit }
+
+// Stage on the destination filesystem, then publish with no-replace semantics.
+func publishImage(source, output string) error {
+	f, err := os.CreateTemp(filepath.Dir(output), ".publish-*.ext4")
 	if err != nil {
-		return "no VM log available"
+		return err
 	}
-	if len(data) > 4096 {
-		data = data[len(data)-4096:]
+	temp := f.Name()
+	f.Close()
+	defer os.Remove(temp)
+	if err := run("cp", "--reflink=auto", "--sparse=always", source, temp); err != nil {
+		return err
 	}
-	return "VM log tail:\n" + string(data)
+	f, err = os.OpenFile(temp, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return unix.Renameat2(unix.AT_FDCWD, temp, unix.AT_FDCWD, output, unix.RENAME_NOREPLACE)
 }

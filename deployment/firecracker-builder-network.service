@@ -1,0 +1,17 @@
+[Unit]
+Description=Private TAP/NAT for the Firecracker builder
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/firecracker-builder-network up
+ExecStop=/usr/local/libexec/firecracker-builder-network down
+TimeoutStartSec=20
+TimeoutStopSec=20
+User=root
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW

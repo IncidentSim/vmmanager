@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Boot a disposable image copy twice; verify SQL and persistence; remove demo networking."""
+"""Boot a disposable image copy twice; verify SQL and persistence; use the systemd-managed VMM."""
 import hashlib, json, os, pathlib, shutil, signal, subprocess, tempfile, time
 ROOT=pathlib.Path(__file__).resolve().parent
 IMAGE=pathlib.Path(os.environ.get('FC_VERIFY_IMAGE',str(ROOT/'images/ubuntu-postgres.ext4')))
+WORKSPACE=pathlib.Path('/var/lib/firecracker-builder/work')
 REPORT=pathlib.Path(os.environ.get('FC_VERIFY_REPORT',str(ROOT/'verification.json')))
 def install_signal_handlers():
     def stop(signum, frame):
@@ -18,23 +19,23 @@ def digest(path):
         for b in iter(lambda:f.read(1024*1024),b''): h.update(b)
     return h.hexdigest()
 def main():
-    assert os.geteuid()==0, 'Run through sudo ask-exec'
-    if subprocess.run(['ip','link','show','tap-fcpg'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0:
-        raise RuntimeError('tap-fcpg already exists; refusing to touch another VM/network')
     if not os.access(ROOT/'image-builder',os.X_OK):
         raise RuntimeError('Build the SDK runner first: go build -o image-builder .')
     before=digest(IMAGE)
-    work=pathlib.Path(tempfile.mkdtemp(prefix='fc-pg-verify-',dir=os.environ['TMPDIR']))
+    work=pathlib.Path(tempfile.mkdtemp(prefix='fc-pg-verify-',dir=WORKSPACE))
+    work.chmod(0o770)
+    safe_cleanup=True
     vm=None
     try:
-        subprocess.run(['bash',str(ROOT/'network.sh'),'up'],check=True)
         disk=work/'running.ext4'
         subprocess.run(['cp','--reflink=auto','--sparse=always',str(IMAGE),str(disk)],check=True)
+        disk.chmod(0o660)
 
         ssh=['ssh','-T','-i',str(ROOT/'assets/id_ed25519'),'-o','BatchMode=yes','-o','ConnectTimeout=2','-o','StrictHostKeyChecking=accept-new','-o','UserKnownHostsFile='+str(work/'known_hosts'),'-o','LogLevel=ERROR','root@172.16.0.2']
         for boot in (1,2):
             with open(work/f'boot-{boot}.log','w') as log:
-                vm=subprocess.Popen([str(ROOT/'image-builder'),'-run-image',str(disk),'-kernel',str(ROOT/'assets/vmlinux'),'-firecracker',str(ROOT/'assets/firecracker')],stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+                safe_cleanup=False
+                vm=subprocess.Popen([str(ROOT/'image-builder'),'-run-image',str(disk)],stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
                 deadline=time.monotonic()+90
                 while True:
                     if vm.poll() is not None: raise RuntimeError((work/f'boot-{boot}.log').read_text()[-6000:])
@@ -70,27 +71,27 @@ runuser -u postgres -- psql -v ON_ERROR_STOP=1 -Atqc 'SELECT value FROM fc_smoke
                 version=subprocess.run(ssh+["runuser -u postgres -- psql -Atqc 'SHOW server_version;'"],check=True,capture_output=True,text=True,timeout=15).stdout.strip()
                 subprocess.run(ssh+["nohup sh -c 'sleep 2; sync; reboot' >/dev/null 2>&1 </dev/null &"],check=True,timeout=15)
                 code=vm.wait(timeout=60);vm=None
-                if code: raise RuntimeError(f'Firecracker exit {code}')
+                if code: raise RuntimeError(f'Runner exit {code}; disk preserved in {work}')
+                safe_cleanup=True
         after=digest(IMAGE)
         assert before==after, 'Original output image unexpectedly modified'
-        report={'verified':True,'vm_backend':'firecracker-go-sdk','boots':2,'postgresql':version,'persistence':'passed','output_image_sha256':after,'output_image_unchanged':True}
+        report={'verified':True,'vm_backend':'systemd/firecracker-go-sdk','boots':2,'postgresql':version,'persistence':'passed','output_image_sha256':after,'output_image_unchanged':True}
         REPORT.write_text(json.dumps(report,indent=2)+'\n')
         print(json.dumps(report,indent=2),flush=True)
     finally:
-        if vm is not None and vm.poll() is None:
-            vm.terminate()
-            try: vm.wait(timeout=10)
+        # The runner stops the root-owned service and verifies its state. Never
+        # SIGKILL it: that would bypass the only process responsible for cleanup.
+        if vm is not None:
+            if vm.poll() is None:
+                vm.terminate()
+            try:
+                safe_cleanup = vm.wait(timeout=40) == 0
             except subprocess.TimeoutExpired:
-                os.killpg(vm.pid,signal.SIGKILL)
-                vm.wait()
-        shutil.rmtree(work)
-        subprocess.run(['bash',str(ROOT/'network.sh'),'down'],check=True)
-        uid,gid=1000,1000
-        for d in (ROOT/'assets',ROOT/'images'):
-            os.chown(d,uid,gid)
-            for f in d.iterdir():
-                if f.is_file(): os.chown(f,uid,gid)
-        if REPORT.exists():os.chown(REPORT,uid,gid)
+                safe_cleanup = False
+        if safe_cleanup:
+            shutil.rmtree(work)
+        else:
+            print(f'Working disk retained for safety: {work}',flush=True)
 if __name__=='__main__':
     install_signal_handlers()
     main()

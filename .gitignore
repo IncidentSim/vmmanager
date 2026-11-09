@@ -3,6 +3,7 @@ images/
 image-builder
 verification.json
 verification-sdk.json
+verification-systemd.json
 recordings/
 __pycache__/
 

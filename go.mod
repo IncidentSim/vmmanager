@@ -2,7 +2,11 @@ module example.com/firecracker-postgres-builder
 
 go 1.22
 
-require github.com/firecracker-microvm/firecracker-go-sdk v1.0.0
+require (
+	github.com/firecracker-microvm/firecracker-go-sdk v1.0.0
+	github.com/sirupsen/logrus v1.8.1
+	golang.org/x/sys v0.0.0-20220204135822-1c1b9b1eba6a
+)
 
 require (
 	github.com/PuerkitoBio/purell v1.1.1 // indirect
@@ -31,12 +35,10 @@ require (
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/sirupsen/logrus v1.8.1 // indirect
 	github.com/vishvananda/netlink v1.1.1-0.20210330154013-f5de75959ad5 // indirect
 	github.com/vishvananda/netns v0.0.0-20210104183010-2eb08e3e575f // indirect
 	go.mongodb.org/mongo-driver v1.8.3 // indirect
 	golang.org/x/net v0.0.0-20220127200216-cd36cc0744dd // indirect
-	golang.org/x/sys v0.0.0-20220204135822-1c1b9b1eba6a // indirect
 	golang.org/x/text v0.3.7 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
