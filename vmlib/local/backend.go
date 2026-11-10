@@ -370,6 +370,12 @@ func New(cfg Config) (*Backend, error) {
 		b.Close()
 		return nil, err
 	}
+	// MkdirAll applies the caller's umask. The jailed VMM needs group traversal
+	// even when the daemon runs with a restrictive UMask=0077.
+	if err := os.Chmod(filepath.Join(work, "vms"), 0o770); err != nil {
+		b.Close()
+		return nil, err
+	}
 	if err := b.reconcile(); err != nil {
 		b.Close()
 		return nil, err
