@@ -89,8 +89,65 @@ class NetworkScriptTests(unittest.TestCase):
 
     def test_other_slots_network_is_not_a_collision_for_this_slot(self):
         routes = "default via 1.1.1.1 dev eth0\n10.213.1.0/30 dev tap-vm1 proto kernel"
-        self.assertEqual(self.run_check(0, routes)[0], 0)
-        self.assertNotEqual(self.run_check(1, routes)[0], 0)
+        self.assertEqual(self.run_check(0, routes)[0], 0)      # another slot's network: fine
+        self.assertEqual(self.run_check(1, routes)[0], 0)      # slot 1's OWN interface route: fine
+        foreign = "default via 1.1.1.1 dev eth0\n10.213.1.0/30 dev docker1 proto kernel"
+        self.assertEqual(self.run_check(0, foreign)[0], 0)
+        self.assertNotEqual(self.run_check(1, foreign)[0], 0)  # someone else on slot 1's range
+
+    def test_every_routing_table_is_inspected(self):
+        _, _, calls = self.run_check(0, self.CLEAN)
+        self.assertIn("route show table all", calls)
+
+    def test_overlapping_route_in_a_non_main_table_is_a_collision(self):
+        for name, route in {
+            "vpn table": "10.213.0.0/16 dev wg0 table 100 scope link",
+            "vpn table named": "10.213.0.0/24 dev tun0 table vpn proto static",
+            "local table address": "local 10.213.0.1 dev lo table local proto kernel scope host src 10.213.0.1",
+            "local table broadcast": "broadcast 10.213.0.3 dev eth1 table local proto kernel scope link src 10.213.0.1",
+            "throw": "throw 10.213.0.0/24 table 200",
+            "blackhole": "blackhole 10.213.0.0/30",
+            "prohibit": "prohibit 10.213.0.0/16 table 7",
+            "unreachable in table": "unreachable 10.213.0.0/28 table 9",
+            "foreign tap": "10.213.0.0/30 dev tap-vm1 proto kernel scope link src 10.213.0.1",
+            "foreign tap broadcast": "broadcast 10.213.0.3 dev tap-vm1 table local proto kernel scope link src 10.213.0.1",
+        }.items():
+            rc, err, _ = self.run_check(0, "default via 1.1.1.1 dev eth0\n" + route)
+            self.assertNotEqual(rc, 0, name)
+            self.assertIn("overlaps", err, name)
+
+    def test_unrelated_routes_in_other_tables_are_fine(self):
+        routes = "\n".join([
+            "default via 10.0.0.1 dev wg0 table 100",
+            "192.168.5.0/24 dev wg0 table 100 scope link",
+            "local 192.168.1.50 dev eth0 table local proto kernel scope host src 192.168.1.50",
+            "broadcast 192.168.1.255 dev eth0 table local proto kernel scope link src 192.168.1.50",
+            "local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1",
+            "throw 10.99.0.0/16 table 200",
+            "unreachable 203.0.113.0/24 table 9",
+            "blackhole 198.51.100.0/24",
+            "default via 192.168.1.1 dev eth0 proto dhcp",
+        ])
+        rc, err, _ = self.run_check(0, routes)
+        self.assertEqual(rc, 0, err)
+
+    def test_the_slots_own_interface_routes_are_not_a_collision(self):
+        own = "\n".join([
+            "default via 192.168.1.1 dev eth0",
+            "10.213.0.0/30 dev tap-vm0 proto kernel scope link src 10.213.0.1",
+            "local 10.213.0.1 dev tap-vm0 table local proto kernel scope host src 10.213.0.1",
+            "broadcast 10.213.0.0 dev tap-vm0 table local proto kernel scope link src 10.213.0.1",
+            "broadcast 10.213.0.3 dev tap-vm0 table local proto kernel scope link src 10.213.0.1",
+        ])
+        self.assertEqual(self.run_check(0, own)[0], 0)
+        # ...but only for the slot's OWN device: the same routes seen by slot 1's pool slice are fine,
+        # and a different device claiming slot 0's range is not.
+        self.assertNotEqual(self.run_check(0, own.replace("tap-vm0", "tap-other"))[0], 0)
+
+    def test_own_tap_address_is_not_a_collision_but_a_foreign_one_is(self):
+        own = "3: tap-vm0    inet 10.213.0.1/30 brd 10.213.0.3 scope global tap-vm0"
+        self.assertEqual(self.run_check(0, self.CLEAN, addrs=own)[0], 0)
+        self.assertNotEqual(self.run_check(0, self.CLEAN, addrs=own.replace("tap-vm0", "tap-other"))[0], 0)
 
     def test_default_route_is_expected(self):
         self.assertEqual(self.run_check(0, "default via 10.213.0.1 dev eth0\n0.0.0.0/0 dev eth0")[0], 0)

@@ -9,7 +9,7 @@
 # refuses an existing interface, and removes only what its marker says it created.
 # Legacy tap-fcpg / 172.16.0.0/30 and every unrelated route are never touched.
 #
-#   fc-vm-network check N   (no root: only the collision check)
+#   fc-vm-network check N   (no root: only the collision check; all routing tables)
 #   fc-vm-network up N | down N
 set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -64,22 +64,33 @@ overlaps() {
   (( ( $(ip2int "$addr") & mask ) == ( slotnet & mask ) ))
 }
 
+# Route types iproute2 prints before the destination (unicast is implicit).
+route_types=" unicast local broadcast multicast throw unreachable prohibit blackhole nat anycast "
+
+# check_collisions inspects EVERY routing table (VPN/policy tables included) and
+# every interface address. A route is skipped only if it is a default route or one
+# of this slot's own interface routes (dev tap-vmN); anything else overlapping the
+# slot /30 is a collision. The destination is the first word, or the second when
+# the first is a route type; "table N" annotations are ignored for the decision.
 check_collisions() {
-  local routes addrs tok
-  routes=$(ip -4 route show) || die "cannot list routes"
+  local routes addrs dest dev i
+  routes=$(ip -4 route show table all) || die "cannot list routes"
   while read -r -a f; do
-    [[ ${#f[@]} -gt 0 && ${f[0]} != default ]] || continue
-    for tok in "${f[@]:0:2}"; do
-      if [[ $tok =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-        if overlaps "$tok"; then die "route $tok overlaps guest subnet ${net_addr}/30; choose another GUEST_PREFIX"; fi
-        break
-      fi
+    [[ ${#f[@]} -gt 0 ]] || continue
+    if [[ $route_types == *" ${f[0]} "* ]]; then dest=${f[1]:-}; else dest=${f[0]}; fi
+    [[ -n $dest && $dest != default ]] || continue
+    dev=''
+    for ((i=0;i<${#f[@]}-1;i++)); do
+      if [[ ${f[i]} == dev ]]; then dev=${f[i+1]}; break; fi
     done
+    [[ $dest =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] || continue
+    [[ $dev == "$tap" ]] && continue
+    if overlaps "$dest"; then die "route $dest (${f[*]}) overlaps guest subnet ${net_addr}/30; choose another GUEST_PREFIX"; fi
   done <<< "$routes"
   addrs=$(ip -4 -o addr show) || die "cannot list addresses"
   while read -r -a f; do
     for ((i=0;i<${#f[@]}-1;i++)); do
-      if [[ ${f[i]} == inet ]]; then
+      if [[ ${f[i]} == inet && ${f[1]:-} != "$tap" ]]; then
         if overlaps "${f[i+1]}"; then die "interface address ${f[i+1]} overlaps guest subnet ${net_addr}/30"; fi
       fi
     done
