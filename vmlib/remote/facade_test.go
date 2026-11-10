@@ -21,7 +21,7 @@ type facadeEnv struct {
 	addr   string
 }
 
-func serveFacade(t *testing.T, svc vmlib.Lifecycle) *facadeEnv {
+func serveFacade(t *testing.T, svc vmlib.Lifecycle, opts ...remote.FacadeOption) *facadeEnv {
 	t.Helper()
 	ca := pkitest.NewCA(t, "facade-ca") // distinct trust domain from the backend's
 	srvPair := ca.Server(t, host)
@@ -30,7 +30,7 @@ func serveFacade(t *testing.T, svc vmlib.Lifecycle) *facadeEnv {
 		t.Fatal(err)
 	}
 	srv := remote.NewGRPCServer(cfg)
-	remote.RegisterFacade(srv, svc)
+	remote.RegisterFacade(srv, svc, opts...)
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -197,5 +197,69 @@ func TestRemotePackageHasNoKVMDependencies(t *testing.T) {
 		if strings.Contains(string(out), bad) {
 			t.Errorf("vmlib/remote depends on %s", bad)
 		}
+	}
+}
+
+func TestFacadeKeyReferenceAndLabelsSurviveTheWire(t *testing.T) {
+	svc, _ := vmlib.NewService(vmlibtest.New(2, "base"))
+	f := serveFacade(t, svc)
+	c := facadeClient(t, f)
+	ctx := context.Background()
+	if _, err := c.Create(ctx, vmlib.CreateRequest{ID: "k1", ImageID: "base", Profile: "small",
+		Labels: map[string]string{"team": "x"}, SSHKeyReference: "laptop-ed25519"}); err != nil {
+		t.Fatal(err)
+	}
+	// A second client with no shared in-process state sees the same data.
+	c2 := facadeClient(t, f)
+	info, err := c2.SSHInfo(ctx, "k1")
+	if err != nil || info.KeyReference != "laptop-ed25519" {
+		t.Fatalf("%v %+v", err, info)
+	}
+	vm, _ := c2.Get(ctx, "k1")
+	if vm.Labels["team"] != "x" {
+		t.Fatalf("%+v", vm)
+	}
+}
+
+// A lost or failed Create response must still let the caller find the VM.
+func TestAmbiguousCreateIsReconcilableOverRPC(t *testing.T) {
+	be := vmlibtest.New(1, "base")
+	be.StartUncertainErr = errors.New("response lost after InstanceStart")
+	svc, _ := vmlib.NewService(be)
+	c := facadeClient(t, serveFacade(t, svc))
+	ctx := context.Background()
+	vm, err := c.Create(ctx, vmlib.CreateRequest{ImageID: "base", Profile: "small"}) // no ID supplied
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if vm.ID == "" {
+		t.Fatal("client must know the VM ID after an ambiguous create (client-allocated ID)")
+	}
+	got, gerr := c.Get(ctx, vm.ID)
+	if gerr != nil || got.State != vmlib.StateRunning {
+		t.Fatalf("orphan not reconcilable: %v %+v", gerr, got)
+	}
+	if res, derr := c.Delete(ctx, vm.ID); derr != nil || !res.Deleted {
+		t.Fatalf("%v %+v", derr, res)
+	}
+}
+
+func TestRetainedDeleteKeepsStructuredResultOverRPC(t *testing.T) {
+	be := vmlibtest.New(1, "base")
+	be.AutoExit = false
+	svc, _ := vmlib.NewService(be)
+	c := facadeClient(t, serveFacade(t, svc, remote.WithOperationTimeout(100*time.Millisecond)))
+	if _, err := c.Create(context.Background(), vmlib.CreateRequest{ID: "d1", ImageID: "base", Profile: "small"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := c.Delete(ctx, "d1")
+	if !errors.Is(err, vmlib.ErrRetained) || !res.Retained || res.Deleted || res.Detail == "" {
+		t.Fatalf("retained result lost across RPC: %v %+v", err, res)
+	}
+	vm, gerr := c.Get(context.Background(), "d1")
+	if gerr != nil || !vm.Retained || vm.RetainedReason == "" {
+		t.Fatalf("retained state not queryable: %v %+v", gerr, vm)
 	}
 }

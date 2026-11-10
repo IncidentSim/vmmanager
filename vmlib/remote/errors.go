@@ -51,11 +51,49 @@ func toStatus(err error) error {
 }
 
 func precondition(msg, reason string) error {
-	st := status.New(codes.FailedPrecondition, msg)
-	if d, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason, Domain: "vmlib"}); err == nil {
+	return withMetadata(status.New(codes.FailedPrecondition, msg), reason, nil)
+}
+
+// withMetadata attaches a machine-readable reason and string metadata so a
+// client can recover structured results (VM id, retained flag...) that a bare
+// gRPC status would drop.
+func withMetadata(st *status.Status, reason string, md map[string]string) error {
+	if d, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason, Domain: "vmlib", Metadata: md}); err == nil {
 		return d.Err()
 	}
 	return st.Err()
+}
+
+// errMetadata returns the vmlib ErrorInfo metadata of a gRPC error, if any.
+func errMetadata(err error) map[string]string {
+	st, ok := status.FromError(err)
+	if !ok {
+		return nil
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.Domain == "vmlib" {
+			return info.Metadata
+		}
+	}
+	return nil
+}
+
+// toStatusWithVM is toStatus plus the VM that the failed call concerns.
+func toStatusWithVM(err error, vm vmlib.VM) error {
+	base := toStatus(err)
+	if vm.ID == "" {
+		return base
+	}
+	st, _ := status.FromError(base)
+	reason := ""
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok {
+			reason = info.Reason
+		}
+	}
+	return withMetadata(status.New(st.Code(), st.Message()), reason, map[string]string{
+		"vm_id": vm.ID, "vm_state": string(vm.State), "retained": fmt.Sprint(vm.Retained), "retained_reason": vm.RetainedReason,
+	})
 }
 
 type remoteError struct {

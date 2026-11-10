@@ -31,7 +31,8 @@ func (s *backendServer) Capabilities(ctx context.Context, _ *pb.CapabilitiesRequ
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	out := &pb.CapabilitiesResponse{MaxVms: uint32(c.MaxVMs), SshUser: c.SSHUser, SshAuthMode: c.SSHAuthMode}
+	out := &pb.CapabilitiesResponse{MaxVms: uint32(c.MaxVMs), SshUser: c.SSHUser, SshAuthMode: c.SSHAuthMode,
+		MaxTotalMemMib: c.MaxTotalMemMiB, MaxTotalVcpu: c.MaxTotalVCPU}
 	for _, p := range c.Profiles {
 		out.Profiles = append(out.Profiles, &pb.Profile{Name: p.Name, Vcpu: p.VCPU, MemMib: p.MemMiB, DiskMib: p.DiskMiB})
 	}
@@ -49,14 +50,28 @@ func imageFromPB(i *pb.Image) vmlib.Image {
 	return vmlib.Image{ID: i.GetId(), SizeBytes: i.GetSizeBytes(), SHA256: i.GetSha256(), Base: i.GetBase()}
 }
 
+func guestToPB(g *vmlib.GuestNetwork) *pb.GuestNetwork {
+	if g == nil {
+		return nil
+	}
+	return &pb.GuestNetwork{Address: g.Address, Gateway: g.Gateway, Dns: g.DNS, Configuration: g.Configuration}
+}
+
+func guestFromPB(g *pb.GuestNetwork) *vmlib.GuestNetwork {
+	if g == nil {
+		return nil
+	}
+	return &vmlib.GuestNetwork{Address: g.GetAddress(), Gateway: g.GetGateway(), DNS: g.GetDns(), Configuration: g.GetConfiguration()}
+}
+
 func hostToPB(h vmlib.HostVM) *pb.HostVM {
-	return &pb.HostVM{VmId: h.ID, ImageId: h.ImageID, Profile: h.Profile, State: h.State, GuestIp: h.GuestIP,
+	return &pb.HostVM{Guest: guestToPB(h.Guest), VmId: h.ID, ImageId: h.ImageID, Profile: h.Profile, State: h.State, GuestIp: h.GuestIP,
 		Retained: h.Retained, RetainedReason: h.RetainedReason, SshHostKeyFingerprint: h.HostKeyFingerprint,
 		PublicKeyProvisioned: h.PublicKeyProvisioned}
 }
 
 func hostFromPB(h *pb.HostVM) vmlib.HostVM {
-	return vmlib.HostVM{ID: h.GetVmId(), ImageID: h.GetImageId(), Profile: h.GetProfile(), State: h.GetState(),
+	return vmlib.HostVM{Guest: guestFromPB(h.GetGuest()), ID: h.GetVmId(), ImageID: h.GetImageId(), Profile: h.GetProfile(), State: h.GetState(),
 		GuestIP: h.GetGuestIp(), Retained: h.GetRetained(), RetainedReason: h.GetRetainedReason(),
 		HostKeyFingerprint: h.GetSshHostKeyFingerprint(), PublicKeyProvisioned: h.GetPublicKeyProvisioned()}
 }
@@ -199,7 +214,8 @@ func (c *BackendClient) Capabilities(ctx context.Context) (vmlib.Capabilities, e
 	if err != nil {
 		return vmlib.Capabilities{}, fromStatus(err)
 	}
-	out := vmlib.Capabilities{MaxVMs: int(r.GetMaxVms()), SSHUser: r.GetSshUser(), SSHAuthMode: r.GetSshAuthMode()}
+	out := vmlib.Capabilities{MaxVMs: int(r.GetMaxVms()), SSHUser: r.GetSshUser(), SSHAuthMode: r.GetSshAuthMode(),
+		MaxTotalMemMiB: r.GetMaxTotalMemMib(), MaxTotalVCPU: r.GetMaxTotalVcpu()}
 	for _, p := range r.GetProfiles() {
 		out.Profiles = append(out.Profiles, vmlib.Profile{Name: p.GetName(), VCPU: p.GetVcpu(), MemMiB: p.GetMemMib(), DiskMiB: p.GetDiskMib()})
 	}

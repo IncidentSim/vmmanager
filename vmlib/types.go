@@ -105,6 +105,17 @@ type Profile struct {
 	VCPU, MemMiB, DiskMiB uint32
 }
 
+// GuestNetwork is how the guest is expected to be configured. It is metadata
+// for external provisioning: a base image that does not derive its address from
+// the MAC (as the Firecracker CI Ubuntu rootfs does) must be configured by the
+// caller using these values. Configuration says who sets the address.
+type GuestNetwork struct {
+	Address       string // CIDR, e.g. 172.17.0.2/30
+	Gateway       string
+	DNS           []string
+	Configuration string // "mac-derived" (base derives IP from MAC) or "external"
+}
+
 type Bastion struct {
 	Host string
 	Port int
@@ -118,6 +129,10 @@ type Capabilities struct {
 	Bastion     *Bastion
 	SSHUser     string
 	SSHAuthMode string
+	// Aggregate admission caps across all live VMs (0 = not enforced by the
+	// backend). They must not exceed the installed per-unit/slice limits.
+	MaxTotalMemMiB uint32
+	MaxTotalVCPU   uint32
 }
 
 // HostVM is a backend's view of one VM.
@@ -128,6 +143,7 @@ type HostVM struct {
 	RetainedReason              string
 	HostKeyFingerprint          string
 	PublicKeyProvisioned        bool
+	Guest                       *GuestNetwork
 }
 
 type ExitReceipt struct {
@@ -198,6 +214,7 @@ type SSHInfo struct {
 	HostKeyFingerprint   string
 	Bastion              *Bastion
 	Ready                bool
+	Guest                *GuestNetwork
 }
 
 type DeleteResult struct {

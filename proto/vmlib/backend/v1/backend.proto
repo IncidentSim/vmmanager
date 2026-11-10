@@ -45,6 +45,17 @@ message CapabilitiesResponse {
   string ssh_user = 4;
   // image-preinstalled | provision-public-key
   string ssh_auth_mode = 5;
+  // Aggregate admission caps across live VMs; 0 means not enforced.
+  uint32 max_total_mem_mib = 6;
+  uint32 max_total_vcpu = 7;
+}
+
+message GuestNetwork {
+  string address = 1;
+  string gateway = 2;
+  repeated string dns = 3;
+  // mac-derived | external
+  string configuration = 4;
 }
 
 message ListImagesRequest {}
@@ -88,6 +99,7 @@ message HostVM {
   string retained_reason = 7;
   string ssh_host_key_fingerprint = 8;
   bool public_key_provisioned = 9;
+  GuestNetwork guest = 10;
 }
 
 message ListRequest {}

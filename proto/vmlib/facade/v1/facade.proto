@@ -25,6 +25,8 @@ message CreateVMRequest {
   map<string, string> labels = 4;
   // Optional OpenSSH public key to provision into this VM's disk copy.
   string ssh_public_key = 5;
+  // Non-secret client label echoed back in SSHInfo.key_reference.
+  string ssh_key_reference = 6;
 }
 
 message VMRef {
@@ -68,6 +70,14 @@ message SSHInfo {
   string host_key_fingerprint = 8;
   Bastion bastion = 9;
   bool ready = 10;
+  GuestNetwork guest = 11;
+}
+
+message GuestNetwork {
+  string address = 1;
+  string gateway = 2;
+  repeated string dns = 3;
+  string configuration = 4;
 }
 
 message CommitVMRequest {

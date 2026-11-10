@@ -2,10 +2,15 @@ package remote
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
-	"sync"
+	"encoding/hex"
+	"fmt"
+	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/status"
 
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 	pb "github.com/petruekhin/vibe-firecracker/vmlib/gen/vmlib/facade/v1"
@@ -33,7 +38,8 @@ func facadeImageFromPB(i *pb.Image) vmlib.Image {
 
 func sshToPB(s vmlib.SSHInfo) *pb.SSHInfo {
 	out := &pb.SSHInfo{Host: s.Host, Port: uint32(s.Port), User: s.User, AuthMode: s.AuthMode, KeyReference: s.KeyReference,
-		PublicKeyProvisioned: s.PublicKeyProvisioned, HostKeyPolicy: s.HostKeyPolicy, HostKeyFingerprint: s.HostKeyFingerprint, Ready: s.Ready}
+		PublicKeyProvisioned: s.PublicKeyProvisioned, HostKeyPolicy: s.HostKeyPolicy, HostKeyFingerprint: s.HostKeyFingerprint, Ready: s.Ready,
+		Guest: facadeGuestToPB(s.Guest)}
 	if s.Bastion != nil {
 		out.Bastion = &pb.Bastion{Host: s.Bastion.Host, Port: uint32(s.Bastion.Port), User: s.Bastion.User}
 	}
@@ -42,31 +48,70 @@ func sshToPB(s vmlib.SSHInfo) *pb.SSHInfo {
 
 func sshFromPB(s *pb.SSHInfo) vmlib.SSHInfo {
 	out := vmlib.SSHInfo{Host: s.GetHost(), Port: int(s.GetPort()), User: s.GetUser(), AuthMode: s.GetAuthMode(), KeyReference: s.GetKeyReference(),
-		PublicKeyProvisioned: s.GetPublicKeyProvisioned(), HostKeyPolicy: s.GetHostKeyPolicy(), HostKeyFingerprint: s.GetHostKeyFingerprint(), Ready: s.GetReady()}
+		PublicKeyProvisioned: s.GetPublicKeyProvisioned(), HostKeyPolicy: s.GetHostKeyPolicy(), HostKeyFingerprint: s.GetHostKeyFingerprint(), Ready: s.GetReady(),
+		Guest: facadeGuestFromPB(s.GetGuest())}
 	if b := s.GetBastion(); b != nil {
 		out.Bastion = &vmlib.Bastion{Host: b.GetHost(), Port: int(b.GetPort()), User: b.GetUser()}
 	}
 	return out
 }
 
+func facadeGuestToPB(g *vmlib.GuestNetwork) *pb.GuestNetwork {
+	if g == nil {
+		return nil
+	}
+	return &pb.GuestNetwork{Address: g.Address, Gateway: g.Gateway, Dns: g.DNS, Configuration: g.Configuration}
+}
+
+func facadeGuestFromPB(g *pb.GuestNetwork) *vmlib.GuestNetwork {
+	if g == nil {
+		return nil
+	}
+	return &vmlib.GuestNetwork{Address: g.GetAddress(), Gateway: g.GetGateway(), DNS: g.GetDns(), Configuration: g.GetConfiguration()}
+}
+
 // ---- server -----------------------------------------------------------------
 
 type facadeServer struct {
 	pb.UnimplementedVMServiceServer
-	l vmlib.Lifecycle
+	l       vmlib.Lifecycle
+	opLimit time.Duration
+}
+
+// FacadeOption configures RegisterFacade.
+type FacadeOption func(*facadeServer)
+
+// WithOperationTimeout bounds how long the server waits inside Stop, Commit and
+// Delete (for example for an exit receipt). It lets the server answer with a
+// typed, structured "retained" result before a longer client deadline expires.
+// It bounds the call only; it never stops a VM.
+func WithOperationTimeout(d time.Duration) FacadeOption {
+	return func(s *facadeServer) { s.opLimit = d }
+}
+
+func (s *facadeServer) bound(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.opLimit <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, s.opLimit)
 }
 
 // RegisterFacade exposes a lifecycle facade (any vmlib.Lifecycle, normally a
 // *vmlib.Service over a local or remote backend).
-func RegisterFacade(s grpc.ServiceRegistrar, l vmlib.Lifecycle) {
-	pb.RegisterVMServiceServer(s, &facadeServer{l: l})
+func RegisterFacade(s grpc.ServiceRegistrar, l vmlib.Lifecycle, opts ...FacadeOption) {
+	srv := &facadeServer{l: l, opLimit: 5 * time.Minute}
+	for _, o := range opts {
+		o(srv)
+	}
+	pb.RegisterVMServiceServer(s, srv)
 }
 
 func (s *facadeServer) CreateVM(ctx context.Context, r *pb.CreateVMRequest) (*pb.VM, error) {
-	if r.GetVmId() != "" {
-		if err := vmlib.ValidateID("vm", r.GetVmId()); err != nil {
-			return nil, toStatus(err)
-		}
+	if err := vmlib.ValidateID("vm", r.GetVmId()); err != nil {
+		return nil, toStatus(err) // the client allocates the ID so a lost response is recoverable
+	}
+	if len(r.GetSshKeyReference()) > 128 {
+		return nil, toStatus(vmlib.ErrInvalidArgument)
 	}
 	for _, c := range [][2]string{{"image", r.GetImageId()}, {"profile", r.GetProfile()}} {
 		if err := vmlib.ValidateID(c[0], c[1]); err != nil {
@@ -82,9 +127,9 @@ func (s *facadeServer) CreateVM(ctx context.Context, r *pb.CreateVMRequest) (*pb
 	// The client's RPC context bounds this call only; Service never ties a
 	// running VM's lifetime to it.
 	vm, err := s.l.Create(ctx, vmlib.CreateRequest{ID: r.GetVmId(), ImageID: r.GetImageId(), Profile: r.GetProfile(),
-		Labels: r.GetLabels(), SSHPublicKey: r.GetSshPublicKey()})
+		Labels: r.GetLabels(), SSHPublicKey: r.GetSshPublicKey(), SSHKeyReference: r.GetSshKeyReference()})
 	if err != nil {
-		return nil, toStatus(err)
+		return nil, toStatusWithVM(err, vm) // ambiguous failures keep the VM id
 	}
 	return vmToPB(vm), nil
 }
@@ -104,6 +149,8 @@ func (s *facadeServer) GetVM(ctx context.Context, r *pb.VMRef) (*pb.VM, error) {
 	return s.vm(ctx, r.GetVmId(), s.l.Get)
 }
 func (s *facadeServer) StopVM(ctx context.Context, r *pb.VMRef) (*pb.VM, error) {
+	ctx, cancel := s.bound(ctx)
+	defer cancel()
 	return s.vm(ctx, r.GetVmId(), s.l.Stop)
 }
 
@@ -137,6 +184,8 @@ func (s *facadeServer) CommitVM(ctx context.Context, r *pb.CommitVMRequest) (*pb
 	if err := vmlib.ValidateID("image", r.GetNewImageId()); err != nil {
 		return nil, toStatus(err)
 	}
+	ctx, cancel := s.bound(ctx)
+	defer cancel()
 	i, err := s.l.Commit(ctx, r.GetVmId(), r.GetNewImageId())
 	if err != nil {
 		return nil, toStatus(err)
@@ -148,10 +197,12 @@ func (s *facadeServer) DeleteVM(ctx context.Context, r *pb.VMRef) (*pb.DeleteVMR
 	if err := vmlib.ValidateID("vm", r.GetVmId()); err != nil {
 		return nil, toStatus(err)
 	}
+	ctx, cancel := s.bound(ctx)
+	defer cancel()
 	res, err := s.l.Delete(ctx, r.GetVmId())
 	if err != nil {
-		// A retained disk is reported with its explicit error code.
-		return nil, toStatus(err)
+		// A retained disk keeps its structured result in the error metadata.
+		return nil, withDeleteMetadata(toStatus(err), res)
 	}
 	return &pb.DeleteVMResponse{Deleted: res.Deleted, Retained: res.Retained, Detail: res.Detail}, nil
 }
@@ -168,6 +219,18 @@ func (s *facadeServer) ListImages(ctx context.Context, _ *pb.ListImagesRequest) 
 	return out, nil
 }
 
+func withDeleteMetadata(base error, res vmlib.DeleteResult) error {
+	st, _ := status.FromError(base)
+	reason := ""
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok {
+			reason = info.Reason
+		}
+	}
+	return withMetadata(status.New(st.Code(), st.Message()), reason, map[string]string{
+		"deleted": fmt.Sprint(res.Deleted), "retained": fmt.Sprint(res.Retained), "detail": res.Detail})
+}
+
 // ---- client -----------------------------------------------------------------
 
 // FacadeClient implements vmlib.Lifecycle over generated gRPC+mTLS. It needs no
@@ -175,25 +238,7 @@ func (s *facadeServer) ListImages(ctx context.Context, _ *pb.ListImagesRequest) 
 type FacadeClient struct {
 	conn *grpc.ClientConn
 	c    pb.VMServiceClient
-
-	mu      sync.Mutex
-	keyRefs map[string]string // client-local key labels, never sent to the server
 }
-
-func (c *FacadeClient) remember(id, ref string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.keyRefs == nil {
-		c.keyRefs = map[string]string{}
-	}
-	c.keyRefs[id] = ref
-}
-func (c *FacadeClient) keyRef(id string) string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.keyRefs[id]
-}
-func (c *FacadeClient) forget(id string) { c.mu.Lock(); defer c.mu.Unlock(); delete(c.keyRefs, id) }
 
 var _ vmlib.Lifecycle = (*FacadeClient)(nil)
 
@@ -219,14 +264,25 @@ func (c *FacadeClient) vm(r *pb.VM, err error) (vmlib.VM, error) {
 }
 
 func (c *FacadeClient) Create(ctx context.Context, req vmlib.CreateRequest) (vmlib.VM, error) {
-	// SSHKeyReference stays client-side metadata and is re-attached below; the
-	// server never learns a client-local key label.
-	vm, err := c.vm(c.c.CreateVM(ctx, &pb.CreateVMRequest{VmId: req.ID, ImageId: req.ImageID, Profile: req.Profile,
-		Labels: req.Labels, SshPublicKey: req.SSHPublicKey}))
-	if err == nil && req.SSHKeyReference != "" {
-		c.remember(vm.ID, req.SSHKeyReference)
+	// The client allocates the ID so that a lost or ambiguous response can always
+	// be reconciled with Get/Stop/Delete. SSHKeyReference is a non-secret label.
+	if req.ID == "" {
+		id, err := newVMID()
+		if err != nil {
+			return vmlib.VM{}, err
+		}
+		req.ID = id
 	}
-	return vm, err
+	r, err := c.c.CreateVM(ctx, &pb.CreateVMRequest{VmId: req.ID, ImageId: req.ImageID, Profile: req.Profile,
+		Labels: req.Labels, SshPublicKey: req.SSHPublicKey, SshKeyReference: req.SSHKeyReference})
+	if err != nil {
+		partial := vmlib.VM{ID: req.ID, ImageID: req.ImageID, Profile: req.Profile}
+		if md := errMetadata(err); md != nil {
+			partial.State, partial.Retained, partial.RetainedReason = vmlib.VMState(md["vm_state"]), md["retained"] == "true", md["retained_reason"]
+		}
+		return partial, fromStatus(err)
+	}
+	return vmFromPB(r), nil
 }
 
 func (c *FacadeClient) Get(ctx context.Context, id string) (vmlib.VM, error) {
@@ -253,11 +309,7 @@ func (c *FacadeClient) SSHInfo(ctx context.Context, id string) (vmlib.SSHInfo, e
 	if err != nil {
 		return vmlib.SSHInfo{}, fromStatus(err)
 	}
-	info := sshFromPB(r)
-	if info.KeyReference == "" {
-		info.KeyReference = c.keyRef(id)
-	}
-	return info, nil
+	return sshFromPB(r), nil
 }
 
 func (c *FacadeClient) Commit(ctx context.Context, id, newID string) (vmlib.Image, error) {
@@ -271,9 +323,12 @@ func (c *FacadeClient) Commit(ctx context.Context, id, newID string) (vmlib.Imag
 func (c *FacadeClient) Delete(ctx context.Context, id string) (vmlib.DeleteResult, error) {
 	r, err := c.c.DeleteVM(ctx, &pb.VMRef{VmId: id})
 	if err != nil {
-		return vmlib.DeleteResult{}, fromStatus(err)
+		var res vmlib.DeleteResult
+		if md := errMetadata(err); md != nil {
+			res = vmlib.DeleteResult{Deleted: md["deleted"] == "true", Retained: md["retained"] == "true", Detail: md["detail"]}
+		}
+		return res, fromStatus(err)
 	}
-	c.forget(id)
 	return vmlib.DeleteResult{Deleted: r.GetDeleted(), Retained: r.GetRetained(), Detail: r.GetDetail()}, nil
 }
 
@@ -287,4 +342,12 @@ func (c *FacadeClient) ListImages(ctx context.Context) ([]vmlib.Image, error) {
 		out = append(out, facadeImageFromPB(i))
 	}
 	return out, nil
+}
+
+func newVMID() (string, error) {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "vm-" + hex.EncodeToString(b[:]), nil
 }
