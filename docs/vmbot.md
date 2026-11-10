@@ -1,37 +1,64 @@
-# vmbot: Telegram single-VM bot
+# vmbot: Telegram multi-VM bot
 
-Decisions: [ADR 0002](adr/0002-telegram-single-vm-bot.md). `vmbot` is an ordinary
+Decisions: [ADR 0002](adr/0002-telegram-single-vm-bot.md) (base design) and
+[ADR 0003](adr/0003-vmbot-multi-vm.md) (several VMs, state v2, per-VM isolation;
+it supersedes every "exactly one VM" statement below and in ADR 0002). `vmbot` is an ordinary
 mTLS client of the `vmd` facade (`remote.DialFacade`); it does not change daemon
 policy and does not touch the legacy builder or the multi-VM deployment.
 
-Source only: nothing here is installed, started or proven live (see
-[Verification boundaries](#verification-boundaries)).
+The multi-VM/DBOS variant is not activated as the production bot. Its controller,
+gateway and real guests passed the bounded host smoke test in
+[DBOS verification](vmbot-dbos-verification.md); distinguish that evidence from
+[offline verification boundaries](#tests-and-verification-boundaries).
+
+The current orchestration design is [ADR 0004](adr/0004-vmbot-dbos-orchestration.md):
+DBOS Transact Go v1.8.0, embedded pure-Go SQLite under
+`<state_dir>/orchestration/dbos.db`. There is no workflow server or broker.
+Builds require Go 1.25+; Make selects the matching child toolchain for coverage
+without modifying the system Go installation. Back up the whole private state
+directory while stopped, including JSON domain state and the SQLite database
+(and WAL if present). Never delete the database to repair a pending operation.
 
 ## UX (Russian, private chat only)
 
 | Command / button | Effect |
 |---|---|
-| `/start`, `/help` | help and the persistent keyboard (Создать, Статус, Терминал, Удалить) |
-| `/create` | create the one VM (refused if any VM exists); on success the status and then the secret terminal link are sent automatically |
-| `/status` | state of the VM, with inline buttons (Статус, Терминал, Удалить) |
-| `/terminal` | the secret terminal link (previews off, forwarding protected) |
-| `/delete` | revoke the terminal, then delete the VM |
+| `/start`, `/help` | help and the persistent keyboard (Создать, Список, Статус, Терминал, Удалить) |
+| `/create [name]` | create another VM until `max_vms` or backend capacity; no name = short label `vm-<generation>`; success sends the status and then that VM's secret terminal link automatically |
+| `/list` | every owned VM with status and per-VM *Терминал* / *Удалить* buttons (split over several messages if long; none is truncated) |
+| `/status [name\|id]` | state of one VM; with several VMs and no selector it is the list |
+| `/terminal [name\|id]` | the secret terminal link (previews off, forwarding protected) |
+| `/delete [name\|id]` | revoke that VM's terminal, then delete that VM |
 
-The inline *Удалить* button carries the VM generation: pressed on an old message
-after the VM was replaced it answers "Устарело" and deletes nothing. Typing
-`/delete` is explicit and acts on the current VM. Only the configured Telegram
-user ID in a private chat with itself is served; any other sender, group or
+Names are immutable, unique, lowercase ASCII (`[a-z]([a-z0-9-]{0,18}[a-z0-9])?`,
+not starting with `bot-`), display/selection data only: never a path, socket or
+argv element. Selection is by exact name or exact VM ID. With exactly one VM the
+selector may be omitted; with several, the bot shows the list and does nothing
+(never "latest", never "all").
+
+Inline buttons are `s:<gen>`, `t:<gen>`, `d:<gen>` (<= 22 bytes of the 64 allowed).
+A generation names one VM forever: a button for a deleted VM answers "Устарело" and
+cannot reach a replacement (even one with the same name). `d:<gen>` from before the
+upgrade still selects the migrated original. Legacy `s`/`t` act only when
+unambiguous. Callbacks are acknowledged before any slow work. Only the configured
+Telegram user ID in a private chat with itself is served; any other sender, group or
 callback is dropped without a reply.
 
-## Exactly one occupied VM
+## Owned VMs and capacity
 
-* *Occupied* = a VM in any state, including stopped, failed and retained.
-* Create is refused if the durable state holds a VM **or** the shared facade lists
-  any VM (foreign VMs are never adopted, stopped or deleted) **or** listing fails.
-* Duplicate Create calls are serialized by one lock; a second concurrent call gets
-  "already occupied".
-* A failed or unconfirmed delete keeps the slot; run `/delete` again. Only a
-  successful `vmlib` Delete (a settle-and-block barrier) releases the slot; a `Get`
+* A record in any phase and remote state (creating, stopped, failed, retained,
+  uncertain, deleting) occupies one of the `max_vms` slots (config, default 2, 1..8).
+* The backend's own policy stays authoritative (reference capacity 2) and is not
+  raised. Foreign VMs are never adopted, listed as ours, stopped or deleted; they
+  consume backend capacity, and a backend refusal is reported as "no free resources".
+  Create no longer consults `List`.
+* DBOS queue partitions serialize lifecycle work by VM ID; different VMs
+  create/delete/open terminals independently. Queue concurrency does not promise
+  FIFO: durable phase checks enforce command causality. Admission (capacity,
+  unique name, generation) is one atomic state
+  update, so concurrent creates cannot overbook or duplicate a name.
+* A failed or unconfirmed delete keeps that VM's slot; run `/delete <name>` again.
+  Only a successful `vmlib` Delete (a settle-and-block barrier) releases it; a `Get`
   `NotFound` never does (a slow or late Create may still appear).
 * No TTL, summaries or audit feature exist; `vmlib` keeps all safe lifecycle rules
   (retained disks, exit receipts).
@@ -80,15 +107,42 @@ match strict patterns. The advertised bastion is ignored unless
 `"ssh_use_bastion": true` (the reference host reaches guests directly). There is no
 shell anywhere in the chain.
 
+Each VM has its own `ttyd`, unix socket and `known_hosts`. Deleting VM A revokes
+only A (its ttyd, ssh descendants and tracked WebSockets); B's open connections and
+URL keep working. `Close` (process exit) terminates every terminal and deletes no VM.
+Slow starts and terminations never run under the manager lock; a start in flight is
+cancelled by `Revoke`/`Close`. A token cannot be shared by two VMs.
+
 ### Bounds
 
-One `ttyd`, `max_clients` WebSockets (gateway 503 + `ttyd --max-clients`), at most 64
-open gateway connections, header/read/write/idle timeouts, `MemoryMax`/`TasksMax`.
+At most `max_vms` `ttyd` processes, `max_clients` WebSockets per VM (gateway 503 +
+`ttyd --max-clients`), `max_vms * max_clients <= 64` (enforced at config load), at
+most 64 open gateway connections, header/read/write/idle timeouts,
+`MemoryMax`/`TasksMax`.
 
 ## State and recovery
 
-`state_dir` (0700): `state.json` (0600, atomic temp+fsync+rename), `lock` (exclusive
-`flock` for the process lifetime), `known_hosts/`, `ttyd-<vm>.sock`.
+`state_dir` (0700): `state.json` (0600, atomic temp+fsync+rename, schema v2),
+`lock` (exclusive `flock` for the process lifetime), `known_hosts/`,
+`ttyd-<vm>.sock`, `orchestration/dbos.db` (SQLite execution log), and after an
+upgrade `state.json.v1.bak` (0600).
+
+### Upgrade from v1 and rollback
+
+On first start `OpenStore` validates the v1 file, writes its exact bytes to
+`state.json.v1.bak` (never overwriting an earlier backup; a different v1 gets
+`.1`, `.2`, ...), then atomically installs v2. The existing VM keeps its ID,
+token (link), generation, phase and the update offset; it gets the label
+`vm-<generation>`. Corrupt, invalid (duplicate IDs/tokens/generations/labels,
+bad phase/ID, generation above the high-water mark) or future-version state
+makes the process refuse to start and is never modified. No backup possible = no
+migration.
+
+Rollback limits: v1 binaries refuse v2. Restoring the backup is safe only before
+the first v2 write. Afterwards it loses the advanced update offset (commands may
+be replayed), forgets VMs created since (still running and consuming capacity) and
+generation history. Rolling back after extra VMs exist means deleting them first
+and restoring manually with the bot stopped.
 
 | Situation | Behaviour |
 |---|---|
@@ -96,7 +150,7 @@ open gateway connections, header/read/write/idle timeouts, `MemoryMax`/`TasksMax
 | crash during Create | identity+token were saved first; `Get` adopts the VM (even failed/retained/preparing); `NotFound` is resolved only by the Delete barrier, else the slot stays `creating`; an unprovable ambiguous Prepare stays retained until the operator verifies the backend and restarts `vmd` |
 | crash during Delete | the `deleting` phase is persisted before the revoke, so the old link never returns; Delete is resumed |
 | cannot persist state | Delete changes nothing (no revoke, no remote call) and says so |
-| Create/Delete RPC timeout | occupancy kept; resolved by `Get`; never a second VM |
+| Create/Delete RPC timeout | occupancy kept; guarded reconciliation resolves it; identity never reused; another VM still requires its own free slot |
 | remote unreachable | fail closed: no new VM, existing one not abandoned; next operation retries |
 | two bots on one state dir | second one exits (`flock`) |
 | corrupt/loose-permission state or token file | refuses to start |
@@ -116,8 +170,8 @@ open gateway connections, header/read/write/idle timeouts, `MemoryMax`/`TasksMax
   `~/.config/vmbot/vmbot.json`. Unit: `deployment/vmbot/vmbot.service`
   (`Restart`, `UMask=0077`, `NoNewPrivileges`, `MemoryMax`, `TasksMax`, graceful
   `SIGTERM` stop). Build with `make vmbot`.
-* Keep the VM slot policy on the daemon: size `max_vms` knowing this bot refuses to
-  create when any VM exists.
+* `max_vms` (default 2) is only an application ceiling; keep the real resource policy
+  on the daemon. Foreign VMs count against the backend, not against `max_vms`.
 
 ## Tests and verification boundaries
 

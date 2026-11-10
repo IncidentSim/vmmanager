@@ -29,7 +29,8 @@ type ManagerConfig struct {
 	TTYDPath, SSHPath, SSHKeyFile string
 	StateDir                      string // 0700; holds ttyd sockets and per-VM known_hosts
 	PublicOrigin                  string // exact scheme://host[:port] allowed in Host/Origin
-	MaxClients                    int
+	MaxClients                    int    // WebSocket clients per VM
+	MaxSessions                   int    // concurrent VM terminals (ttyd processes)
 	UseBastion                    bool
 	StartTimeout                  time.Duration
 }
@@ -84,14 +85,43 @@ func BuildSSHArgs(cfg ManagerConfig, t TerminalTarget, knownHosts string) ([]str
 	return a, nil
 }
 
-// Manager runs at most one ttyd (one VM) and is also the HTTP gateway handler.
+// Manager runs one ttyd per VM (bounded by MaxSessions) and is also the HTTP
+// gateway handler. Sessions are independent: revoking one never touches another's
+// processes, sockets, connections or link.
 type Manager struct {
 	cfg    ManagerConfig
 	origin *url.URL
 
-	mu     sync.Mutex
-	sess   *session
-	closed bool
+	mu    sync.Mutex          // guards the maps, slot states and closed only; never held across slow work
+	sess  map[string]*session // published (routable) sessions only
+	slots map[string]*slot    // every VM that starts, runs or is still being cleaned up
+	// pending is the subset of slots whose Start is still building the backend
+	// (it leaves pending the moment the slot is published or starts terminating,
+	// but stays in slots until cleanup has fully finished).
+	pending map[string]*slot
+	closed  bool
+}
+
+type slotState int
+
+const (
+	slotStarting    slotState = iota // a Start goroutine owns the half-built backend
+	slotActive                       // published in sess
+	slotTerminating                  // one owner is killing processes / removing files
+)
+
+// slot is the per-VM reservation. It exists from the first Start until ALL
+// cleanup (processes, WebSockets, socket and known_hosts files) has finished, and
+// only then is removed and done closed. Until then it keeps counting against
+// MaxSessions and keeps its capability token reserved, so neither a replacement
+// session nor another VM can be admitted over half-cleaned resources, and
+// Revoke/Close can wait on done no matter which goroutine owns the cleanup.
+type slot struct {
+	vmID, token string
+	state       slotState
+	cancel      context.CancelFunc // aborts a start in flight
+	ready       chan struct{}      // closed when the start attempt has concluded (published or failing)
+	done        chan struct{}      // closed when the slot is gone: all cleanup complete
 }
 
 func NewManager(cfg ManagerConfig) (*Manager, error) {
@@ -102,6 +132,9 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.MaxClients < 1 {
 		return nil, errors.New("terminal config: max clients")
 	}
+	if cfg.MaxSessions < 1 || cfg.MaxSessions > MaxVMsLimit || cfg.MaxSessions*cfg.MaxClients > maxGatewayConns {
+		return nil, errors.New("terminal config: max sessions out of range, or sessions*clients exceeds the gateway connection bound")
+	}
 	if !filepath.IsAbs(cfg.StateDir) || strings.ContainsAny(cfg.StateDir, " \t\r\n\"'\\") {
 		return nil, errors.New("terminal config: state dir must be an absolute path without spaces or quotes")
 	}
@@ -111,7 +144,8 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.StartTimeout <= 0 {
 		cfg.StartTimeout = 10 * time.Second
 	}
-	return &Manager{cfg: cfg, origin: &url.URL{Scheme: u.Scheme, Host: u.Host}}, nil
+	return &Manager{cfg: cfg, origin: &url.URL{Scheme: u.Scheme, Host: u.Host},
+		sess: map[string]*session{}, slots: map[string]*slot{}, pending: map[string]*slot{}}, nil
 }
 
 // KnownHostsPath is the per-VM known_hosts file.
@@ -124,6 +158,7 @@ func (m *Manager) sockPath(vmID string) string {
 }
 
 type session struct {
+	authorize   func() bool
 	vmID, token string
 	sock        string
 	cmd         *exec.Cmd
@@ -140,29 +175,123 @@ type session struct {
 }
 
 // Start launches (or confirms) the ttyd backend for one VM. It is idempotent
-// for the same VM and token, refuses a second VM or a changed token, and fails
-// loudly when the backend does not come up.
+// for the same VM and token, refuses a changed token, a token already used by
+// another VM and any start beyond MaxSessions, and fails loudly when the backend
+// does not come up. Other VMs' terminals are never affected or blocked.
 func (m *Manager) Start(ctx context.Context, t TerminalTarget) error {
+	if t.authorize != nil && !t.authorize() {
+		return ErrNotRunning
+	}
 	if !tokenPattern.MatchString(t.Token) {
 		return errors.New("terminal: malformed capability token")
 	}
+	if err := vmlib.ValidateID("vm", t.VMID); err != nil {
+		return fmt.Errorf("terminal target: %w", err)
+	}
+	for {
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return errors.New("terminal: manager closed")
+		}
+		// A capability token is reserved by every slot (starting, active or
+		// still terminating) until its cleanup is complete.
+		for id, o := range m.slots {
+			if id != t.VMID && subtle.ConstantTimeCompare([]byte(o.token), []byte(t.Token)) == 1 {
+				m.mu.Unlock()
+				return errors.New("terminal: capability token already in use")
+			}
+		}
+		if sl := m.slots[t.VMID]; sl != nil {
+			switch sl.state {
+			case slotTerminating:
+				// Never publish a replacement over half-cleaned files/processes.
+				m.mu.Unlock()
+				return errors.New("terminal: previous terminal of this VM is still shutting down; retry")
+			case slotStarting:
+				m.mu.Unlock()
+				select {
+				case <-sl.ready:
+					continue
+				case <-ctx.Done():
+					return errors.New("terminal: startup canceled")
+				}
+			}
+			s := m.sess[t.VMID]
+			if subtle.ConstantTimeCompare([]byte(sl.token), []byte(t.Token)) != 1 {
+				m.mu.Unlock()
+				return errors.New("terminal: this VM's terminal is active with a different capability; revoke it first")
+			}
+			select {
+			case <-s.exited: // backend died: clean it up completely, then start anew
+				sl.state = slotTerminating
+				delete(m.sess, t.VMID)
+				m.mu.Unlock()
+				m.finishTermination(sl, s)
+				continue
+			default:
+				m.mu.Unlock()
+				return nil
+			}
+		}
+		if len(m.slots) >= m.cfg.MaxSessions {
+			m.mu.Unlock()
+			return errors.New("terminal: too many active terminals")
+		}
+		sctx, scancel := context.WithCancel(context.Background())
+		sl := &slot{vmID: t.VMID, token: t.Token, state: slotStarting, cancel: scancel, ready: make(chan struct{}), done: make(chan struct{})}
+		m.slots[t.VMID] = sl
+		m.pending[t.VMID] = sl
+		m.mu.Unlock()
+		return m.launch(ctx, sctx, sl, t)
+	}
+}
+
+// finishTermination is run by the single owner that moved sl to terminating. It
+// kills everything, removes the files and only then releases the reservation.
+// s may be nil (a start that never produced a backend).
+func (m *Manager) finishTermination(sl *slot, s *session) {
+	if s != nil {
+		s.terminate(m)
+	}
+	os.Remove(m.KnownHostsPath(sl.vmID))
+	os.Remove(m.sockPath(sl.vmID))
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.closed {
-		return errors.New("terminal: manager closed")
+	if m.slots[sl.vmID] == sl {
+		delete(m.slots, sl.vmID)
 	}
-	if s := m.sess; s != nil {
-		if s.vmID != t.VMID || subtle.ConstantTimeCompare([]byte(s.token), []byte(t.Token)) != 1 {
-			return errors.New("terminal: another VM's terminal is still active; revoke it first")
+	m.mu.Unlock()
+	close(sl.done)
+}
+
+// launch runs the slow part of Start without holding m.mu. A Revoke or Close
+// that arrives meanwhile cancels sctx; the half-started backend is then killed
+// and Start fails, so a revoked terminal can never come up afterwards.
+func (m *Manager) launch(ctx, sctx context.Context, sl *slot, t TerminalTarget) (err error) {
+	var s *session
+	defer func() {
+		m.mu.Lock()
+		delete(m.pending, t.VMID)
+		keep := err == nil && s != nil && !m.closed && sctx.Err() == nil && (t.authorize == nil || t.authorize())
+		if keep {
+			sl.state = slotActive
+			m.sess[t.VMID] = s
+			m.mu.Unlock()
+			sl.cancel()
+			close(sl.ready)
+			return
 		}
-		select {
-		case <-s.exited: // backend died: restart below
-			m.sess = nil
-			s.terminate(m)
-		default:
-			return nil
+		sl.state = slotTerminating
+		m.mu.Unlock()
+		sl.cancel()
+		close(sl.ready)
+		if err == nil {
+			err = errors.New("terminal: revoked during startup")
 		}
-	}
+		// The slot stays reserved (and Revoke/Close keep waiting on it) until the
+		// half-started backend and its files are completely gone.
+		m.finishTermination(sl, s)
+	}()
 	kh := m.KnownHostsPath(t.VMID)
 	sshArgs, err := BuildSSHArgs(m.cfg, t, kh)
 	if err != nil {
@@ -191,17 +320,19 @@ func (m *Manager) Start(ctx context.Context, t TerminalTarget) error {
 		os.Remove(kh)
 		return errors.New("terminal: backend failed to start")
 	}
-	sctx, scancel := context.WithCancel(context.Background())
-	s := &session{vmID: t.VMID, token: t.Token, sock: sock, cmd: cmd, exited: make(chan struct{}), max: m.cfg.MaxClients,
-		ctx: sctx, cancel: scancel, conns: map[net.Conn]struct{}{}}
+	rctx, rcancel := context.WithCancel(context.Background())
+	s = &session{vmID: t.VMID, token: t.Token, sock: sock, cmd: cmd, exited: make(chan struct{}), max: m.cfg.MaxClients,
+		ctx: rctx, cancel: rcancel, conns: map[net.Conn]struct{}{}}
+	s.authorize = t.authorize
 	go func() { cmd.Wait(); close(s.exited) }()
 
-	if err := s.waitReady(ctx, m.cfg.StartTimeout); err != nil {
-		s.terminate(m)
+	wctx, wcancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(sctx, wcancel) // Revoke/Close abort the wait
+	defer func() { stop(); wcancel() }()
+	if err := s.waitReady(wctx, m.cfg.StartTimeout); err != nil {
 		return err
 	}
 	s.proxy = m.newProxy(s)
-	m.sess = s
 	return nil
 }
 
@@ -226,37 +357,72 @@ func (s *session) waitReady(ctx context.Context, timeout time.Duration) error {
 	}
 }
 
-// Revoke removes the link, closes every open connection, kills ttyd and the
-// ssh processes beneath it and deletes the per-VM known_hosts. It returns after
-// the backend is gone.
+// Revoke removes one VM's link, closes its open connections, kills its ttyd and
+// the ssh processes beneath it and deletes its known_hosts. It returns after
+// that backend is gone (a start in flight is cancelled and awaited). Other VMs
+// are untouched.
 func (m *Manager) Revoke(vmID string) {
 	if vmlib.ValidateID("vm", vmID) != nil {
 		return
 	}
 	m.mu.Lock()
-	s := m.sess
-	if s != nil && s.vmID == vmID {
-		m.sess = nil
-	} else {
-		s = nil
+	sl := m.slots[vmID]
+	if sl == nil {
+		// Nothing running or being cleaned up for this VM: remove leftovers while
+		// holding the lock so a concurrent Start cannot interleave with the unlink.
+		os.Remove(m.KnownHostsPath(vmID))
+		os.Remove(m.sockPath(vmID))
+		m.mu.Unlock()
+		return
+	}
+	var own *session
+	switch sl.state {
+	case slotActive:
+		own = m.sess[vmID]
+		delete(m.sess, vmID)
+		sl.state = slotTerminating
+	case slotStarting:
+		sl.cancel() // the Start goroutine owns the cleanup
 	}
 	m.mu.Unlock()
-	if s != nil {
-		s.terminate(m)
+	if own != nil {
+		m.finishTermination(sl, own)
+		return
 	}
-	os.Remove(m.KnownHostsPath(vmID))
-	os.Remove(m.sockPath(vmID))
+	<-sl.done // another goroutine owns the cleanup; return only after it is complete
 }
 
-// Close revokes everything; the manager cannot start terminals afterwards.
+// Close revokes every terminal; the manager cannot start terminals afterwards.
+// It does not touch any VM.
 func (m *Manager) Close() {
+	type owned struct {
+		sl *slot
+		s  *session
+	}
 	m.mu.Lock()
 	m.closed = true
-	s := m.sess
-	m.sess = nil
+	var mine []owned
+	var all []*slot // every slot, whoever owns its cleanup
+	for id, sl := range m.slots {
+		all = append(all, sl)
+		switch sl.state {
+		case slotActive:
+			mine = append(mine, owned{sl, m.sess[id]})
+			delete(m.sess, id)
+			sl.state = slotTerminating
+		case slotStarting:
+			sl.cancel()
+		}
+	}
 	m.mu.Unlock()
-	if s != nil {
-		s.terminate(m)
+	var wg sync.WaitGroup
+	for _, o := range mine {
+		wg.Add(1)
+		go func() { defer wg.Done(); m.finishTermination(o.sl, o.s) }()
+	}
+	wg.Wait()
+	for _, sl := range all { // including cleanups owned by other goroutines
+		<-sl.done
 	}
 }
 
@@ -420,10 +586,8 @@ func (m *Manager) serve(w http.ResponseWriter, r *http.Request) {
 	if tail != "" || strings.HasSuffix(rest, "/") {
 		tail = "/" + tail
 	}
-	m.mu.Lock()
-	s := m.sess
-	m.mu.Unlock()
-	if s == nil || subtle.ConstantTimeCompare([]byte(s.token), []byte(tok)) != 1 {
+	s := m.lookup(tok)
+	if s == nil {
 		m.reject(w, http.StatusNotFound)
 		return
 	}
@@ -465,10 +629,26 @@ func (m *Manager) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// lookup finds the session for a capability token. It compares against every
+// session (no early exit) and holds the lock only for the lookup itself.
+func (m *Manager) lookup(tok string) *session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var found *session
+	for _, s := range m.sess {
+		if subtle.ConstantTimeCompare([]byte(s.token), []byte(tok)) == 1 && s.authorized() {
+			found = s
+		}
+	}
+	return found
+}
+
+func (s *session) authorized() bool { return s.authorize == nil || s.authorize() }
+
 func (s *session) acquire() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.revoked || s.clients >= s.max {
+	if s.revoked || !s.authorized() || s.clients >= s.max {
 		return false
 	}
 	s.clients++
@@ -494,7 +674,7 @@ func (w *trackedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *trackedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	w.s.mu.Lock()
-	if w.s.revoked {
+	if w.s.revoked || !w.s.authorized() {
 		w.s.mu.Unlock()
 		return nil, nil, errors.New("terminal revoked")
 	}

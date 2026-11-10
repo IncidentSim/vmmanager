@@ -12,6 +12,7 @@
     "image_id": "base-image-id",
     "profile": "small"
   },
+  "max_vms": 2,
   "state_dir": "/home/USER/.local/state/vmbot",
   "terminal": {
     "listen_addr": "0.0.0.0:8443",

@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/petruekhin/vibe-firecracker/vmlib"
@@ -17,18 +19,28 @@ import (
 // Sentinel errors. Their text is safe to show to the user: it never contains
 // RPC internals, paths, tokens or links.
 var (
-	ErrOccupied   = errors.New("slot occupied by an existing VM")
-	ErrNoVM       = errors.New("no VM owned by this bot")
-	ErrUncertain  = errors.New("remote state is uncertain")
-	ErrBusy       = errors.New("another operation is in progress")
-	ErrStale      = errors.New("stale VM generation")
-	ErrNotRunning = errors.New("VM is not running or its terminal is revoked")
-	ErrFailed     = errors.New("operation failed")
+	ErrCapacity     = errors.New("application VM limit reached")
+	ErrBackendFull  = errors.New("backend has no free capacity")
+	ErrNameTaken    = errors.New("VM name already in use")
+	ErrBadName      = errors.New("invalid VM name")
+	ErrNeedSelector = errors.New("several VMs: a name or id is required")
+	ErrNoVM         = errors.New("no such VM owned by this bot")
+	ErrUncertain    = errors.New("remote state is uncertain")
+	ErrBusy         = errors.New("another operation is in progress")
+	ErrStale        = errors.New("stale VM generation")
+	ErrNotRunning   = errors.New("VM is not running or its terminal is revoked")
+	ErrFailed       = errors.New("operation failed")
 )
+
+// DefaultMaxVMs is the application ceiling when none is configured.
+const DefaultMaxVMs = 2
 
 // TerminalTarget is everything the terminal backend may know about a guest.
 type TerminalTarget struct {
 	VMID, Token, Host, User, ProxyJump string
+	// authorize is a live domain-state fence. A start can outlive its command's
+	// active-state check; publication and new HTTP/WS access must revalidate.
+	authorize func() bool
 }
 
 // Terminals is the terminal manager seam (real: Manager; tests: fake).
@@ -41,31 +53,48 @@ type Terminals interface {
 type ControllerConfig struct {
 	ImageID, Profile string
 	PublicOrigin     string
+	MaxVMs           int           // application ceiling on owned VMs; default 2
 	OpTimeout        time.Duration // bounds one Create/Delete RPC
-	QueryTimeout     time.Duration // bounds Get/List/SSHInfo and the lock wait of Status
+	QueryTimeout     time.Duration // bounds Get/List/SSHInfo and how long status waits for a busy VM
 	Logger           *log.Logger
 }
 
-// Status is the user-facing view of the single slot.
+// Ref selects one VM: by label or ID (Sel), by generation (Gen, used by
+// buttons), or, with both empty, "the only VM". A generation names one VM
+// forever, so a stale Ref can never retarget a replacement.
+type Ref struct {
+	Sel string
+	Gen uint64
+}
+
+// Status is the user-facing view of one VM.
 type Status struct {
 	Present    bool
 	Generation uint64
 	VMID       string
+	Name       string
 	State      string // vmlib state when known
 	Phase      string
 	Retained   bool
 	Reason     string
 	Uncertain  bool // remote state could not be confirmed
+	Busy       bool // another operation on this VM is running; durable data only
 }
 
-// Controller enforces exactly one occupied VM on top of vmlib.Lifecycle. It
-// owns only the VM recorded in its durable state and never touches others.
+// Controller owns the VMs recorded in its durable state on top of
+// vmlib.Lifecycle. It never touches VMs it did not create. All remote and
+// lifecycle work runs as DBOS workflows (orch.go, ADR 0004): the queue
+// partition per VM is the only per-VM serializer.
 type Controller struct {
 	lc   vmlib.Lifecycle
 	st   *Store
 	term Terminals
 	cfg  ControllerConfig
-	op   chan struct{}
+
+	eng      *engine
+	engMu    sync.RWMutex
+	startMu  sync.Mutex
+	intentMu sync.Mutex // short gate: delete-intent decisions only
 }
 
 func NewController(lc vmlib.Lifecycle, st *Store, term Terminals, cfg ControllerConfig) *Controller {
@@ -75,8 +104,11 @@ func NewController(lc vmlib.Lifecycle, st *Store, term Terminals, cfg Controller
 	if cfg.QueryTimeout <= 0 {
 		cfg.QueryTimeout = 20 * time.Second
 	}
+	if cfg.MaxVMs <= 0 {
+		cfg.MaxVMs = DefaultMaxVMs
+	}
 	cfg.PublicOrigin = strings.TrimRight(cfg.PublicOrigin, "/")
-	return &Controller{lc: lc, st: st, term: term, cfg: cfg, op: make(chan struct{}, 1)}
+	return &Controller{lc: lc, st: st, term: term, cfg: cfg}
 }
 
 func (c *Controller) logf(format string, a ...any) {
@@ -85,15 +117,10 @@ func (c *Controller) logf(format string, a ...any) {
 	}
 }
 
-func (c *Controller) lock(ctx context.Context) error {
-	select {
-	case c.op <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ErrBusy
-	}
-}
-func (c *Controller) unlock() { <-c.op }
+// MaxVMs is the effective application ceiling.
+func (c *Controller) MaxVMs() int { return c.cfg.MaxVMs }
+
+func (c *Controller) opWait() time.Duration { return c.cfg.OpTimeout + c.cfg.QueryTimeout }
 
 func randToken() (string, error) {
 	b := make([]byte, 32) // 256 bits
@@ -115,7 +142,7 @@ func statusOf(rec *VMRecord, vm *vmlib.VM) Status {
 	if rec == nil {
 		return Status{}
 	}
-	s := Status{Present: true, Generation: rec.Generation, VMID: rec.ID, Phase: rec.Phase}
+	s := Status{Present: true, Generation: rec.Generation, VMID: rec.ID, Name: rec.Label, Phase: rec.Phase}
 	if vm != nil {
 		s.State, s.Retained, s.Reason = string(vm.State), vm.Retained, vm.RetainedReason
 	}
@@ -126,32 +153,69 @@ func (c *Controller) query(ctx context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(context.WithoutCancel(ctx), c.cfg.QueryTimeout)
 }
 
-// reconcileLocked brings durable state in line with the remote VM. It returns
-// the current status; ErrUncertain means the remote could not be confirmed and
-// occupancy is kept. A definitively missing VM releases the slot.
-func (c *Controller) reconcileLocked(ctx context.Context) (Status, error) {
-	rec := c.st.Snapshot().VM
-	if rec == nil {
-		return Status{}, nil
+// Resolve maps a Ref to a durable record without any remote call.
+func (c *Controller) Resolve(ref Ref) (VMRecord, error) {
+	st := c.st.Snapshot()
+	switch {
+	case ref.Gen != 0:
+		r, ok := st.ByGeneration(ref.Gen)
+		if !ok || (ref.Sel != "" && r.Label != ref.Sel && r.ID != ref.Sel) {
+			return VMRecord{}, ErrStale
+		}
+		return r, nil
+	case ref.Sel != "":
+		r, ok := st.BySelector(ref.Sel)
+		if !ok {
+			return VMRecord{}, ErrNoVM
+		}
+		return r, nil
 	}
+	switch len(st.VMs) {
+	case 0:
+		return VMRecord{}, ErrNoVM
+	case 1:
+		return st.VMs[0], nil
+	}
+	return VMRecord{}, ErrNeedSelector
+}
+
+func (c *Controller) setPhase(id, from, to string) error {
+	return c.st.Update(func(s *State) {
+		s.update(id, func(r *VMRecord) {
+			if r.Phase == from {
+				r.Phase = to
+			}
+		})
+	})
+}
+
+func (c *Controller) drop(id string) error {
+	return c.st.Update(func(s *State) { s.remove(id) })
+}
+
+// reconcileLocked brings one VM's durable record in line with the remote VM. It
+// runs inside a workflow step, so it is the only operation on that VM at the
+// time. ErrUncertain means the remote could not be confirmed and the occupancy
+// is kept. A definitively missing VM releases its record.
+func (c *Controller) reconcileLocked(ctx context.Context, rec VMRecord) (Status, error) {
 	qctx, cancel := c.query(ctx)
 	defer cancel()
 	vm, err := c.lc.Get(qctx, rec.ID)
 	switch {
 	case errors.Is(err, vmlib.ErrNotFound):
-		// NotFound alone never releases the slot: a Create that is still running
+		// NotFound alone never releases the record: a Create that is still running
 		// (or a delayed one) may yet bring the VM into existence. Only a
 		// successful Delete, which waits for the VM's operations to settle and
 		// then blocks late creates, proves it is gone.
 		if !c.confirmGoneLocked(ctx, rec) {
-			s := statusOf(rec, nil)
+			s := statusOf(&rec, nil)
 			s.Uncertain = true
 			return s, fmt.Errorf("%w: VM not visible but its absence is not proven", ErrUncertain)
 		}
 		return Status{}, nil
 	case err != nil:
-		c.logf("reconcile: get failed: %v", err)
-		s := statusOf(rec, nil)
+		c.logf("reconcile %s: get failed: %v", rec.ID, err)
+		s := statusOf(&rec, nil)
 		s.Uncertain = true
 		return s, fmt.Errorf("%w", ErrUncertain)
 	}
@@ -159,106 +223,185 @@ func (c *Controller) reconcileLocked(ctx context.Context) (Status, error) {
 		c.term.Revoke(rec.ID) // idempotent; the terminal must never come back
 	}
 	if rec.Phase == PhaseCreating {
-		if uerr := c.st.Update(func(s *State) {
-			if s.VM != nil && s.VM.ID == rec.ID && s.VM.Phase == PhaseCreating {
-				s.VM.Phase = PhaseActive
-			}
-		}); uerr != nil {
-			return statusOf(rec, &vm), fmt.Errorf("%w: cannot persist state", ErrUncertain)
+		if uerr := c.setPhase(rec.ID, PhaseCreating, PhaseActive); uerr != nil {
+			return statusOf(&rec, &vm), fmt.Errorf("%w: cannot persist state", ErrUncertain)
 		}
-		rec = c.st.Snapshot().VM
+		rec.Phase = PhaseActive
 	}
 	if rec.Phase == PhaseActive && vm.State == vmlib.StateRunning {
 		if terr := c.ensureTerminalLocked(qctx, rec); terr != nil {
-			c.logf("terminal start failed: %v", terr)
+			c.logf("terminal start failed for %s: %v", rec.ID, terr)
 		}
 	}
-	return statusOf(rec, &vm), nil
+	return statusOf(&rec, &vm), nil
 }
 
 // confirmGoneLocked uses vmlib's Delete as the settle-and-block barrier for a VM
 // that Get reports as NotFound. On proof it revokes the terminal and clears the
 // durable record; otherwise the occupancy is kept.
-func (c *Controller) confirmGoneLocked(ctx context.Context, rec *VMRecord) bool {
+func (c *Controller) confirmGoneLocked(ctx context.Context, rec VMRecord) bool {
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.OpTimeout)
 	res, err := c.lc.Delete(dctx, rec.ID)
 	cancel()
 	if err != nil || !res.Deleted {
 		if err != nil {
-			c.logf("absence barrier: %v", err)
+			c.logf("absence barrier %s: %v", rec.ID, err)
 		}
 		return false
 	}
 	c.term.Revoke(rec.ID)
-	if uerr := c.st.Update(func(s *State) {
-		if s.VM != nil && s.VM.ID == rec.ID {
-			s.VM = nil
-		}
-	}); uerr != nil {
-		c.logf("absence barrier: cannot persist state: %v", uerr)
+	if uerr := c.drop(rec.ID); uerr != nil {
+		c.logf("absence barrier %s: cannot persist state: %v", rec.ID, uerr)
 		return false
 	}
 	return true
 }
 
-func (c *Controller) ensureTerminalLocked(ctx context.Context, rec *VMRecord) error {
-	info, err := c.lc.SSHInfo(ctx, rec.ID)
+// ensureTerminalLocked (re)starts one VM's terminal backend from DURABLE state:
+// it grants only for phase active and re-checks after the backend is up. A
+// delete intent persisted in between (the command persists it before it
+// revokes) is therefore always noticed by one of the two sides.
+func (c *Controller) ensureTerminalLocked(ctx context.Context, rec VMRecord) error {
+	cur, ok := c.st.Snapshot().ByID(rec.ID)
+	if !ok || cur.Phase != PhaseActive {
+		c.term.Revoke(rec.ID)
+		return ErrNotRunning
+	}
+	info, err := c.lc.SSHInfo(ctx, cur.ID)
 	if err != nil {
 		return fmt.Errorf("ssh info: %w", err)
 	}
-	return c.term.Start(ctx, TerminalTarget{VMID: rec.ID, Token: rec.Token, Host: info.Host, User: info.User, ProxyJump: info.ProxyJump()})
-}
-
-// Recover is called at startup: it reconciles any recorded VM with the remote.
-// A remote that is unreachable is reported (the app keeps running, occupancy
-// is kept and the next operation reconciles again).
-func (c *Controller) Recover(ctx context.Context) error {
-	if err := c.lock(ctx); err != nil {
+	authorized := func() bool {
+		r, ok := c.st.Snapshot().ByID(cur.ID)
+		return ok && r.Phase == PhaseActive && r.Generation == cur.Generation && r.Token == cur.Token
+	}
+	if err := c.term.Start(ctx, TerminalTarget{VMID: cur.ID, Token: cur.Token, Host: info.Host, User: info.User, ProxyJump: info.ProxyJump(), authorize: authorized}); err != nil {
 		return err
 	}
-	defer c.unlock()
-	_, err := c.reconcileLocked(ctx)
-	return err
+	if after, ok := c.st.Snapshot().ByID(cur.ID); !ok || after.Phase != PhaseActive {
+		c.term.Revoke(cur.ID)
+		return ErrNotRunning
+	}
+	return nil
 }
 
-// Status reports the slot, reconciling first.
-func (c *Controller) Status(ctx context.Context) (Status, error) {
-	lctx, cancel := context.WithTimeout(ctx, c.cfg.QueryTimeout)
-	defer cancel()
-	if err := c.lock(lctx); err != nil {
-		return Status{}, err
+// Recover is called at startup, after Start has launched the orchestration layer
+// (which already resumed this executor's pending workflows). It re-submits the
+// durable intent of every record and rebuilds the terminal projections:
+//
+//	creating -> its create workflow (idempotent by ID), or a guarded reconcile
+//	            when that workflow already concluded
+//	deleting -> the delete workflow of the current attempt; terminals stay revoked
+//	active   -> reconcile, which re-attaches the terminal of a running VM
+//
+// Records are independent: one failure never hides or deletes another.
+func (c *Controller) Recover(ctx context.Context) error {
+	recs := c.st.Snapshot().VMs
+	errs := make([]error, len(recs))
+	var wg sync.WaitGroup
+	for i, r := range recs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = c.recoverOne(r)
+		}()
 	}
-	defer c.unlock()
-	return c.reconcileLocked(ctx)
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
-// Create makes the one VM. Duplicate calls are serialized and refused.
-func (c *Controller) Create(ctx context.Context) (Status, error) {
-	if err := c.lock(ctx); err != nil {
-		return Status{}, err
+func (c *Controller) recoverOne(rec VMRecord) error {
+	switch rec.Phase {
+	case PhaseDeleting:
+		h, _, err := c.submitDelete(rec)
+		if err != nil {
+			return err
+		}
+		r, err := c.wait(h, c.opWait())
+		if err != nil {
+			return err
+		}
+		if r.Code != codeOK {
+			return r.err()
+		}
+		return nil
+	default:
+		s, err := c.reconcileVM(rec, c.opWait())
+		if err == nil && s.Busy {
+			return ErrBusy
+		}
+		return err
 	}
-	defer c.unlock()
+}
 
-	cur, err := c.reconcileLocked(ctx)
-	if err != nil {
-		return cur, err
+// List reports every owned VM, reconciling each first. Uncertain VMs are listed
+// with Uncertain=true and busy ones from durable data; none is dropped.
+func (c *Controller) List(ctx context.Context) ([]Status, error) {
+	recs := c.st.Snapshot().VMs
+	out := make([]Status, len(recs))
+	var wg sync.WaitGroup
+	for i, r := range recs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := c.reconcileVM(r, c.cfg.QueryTimeout)
+			if err != nil && !errors.Is(err, ErrUncertain) {
+				s = statusOf(&r, nil)
+				s.Busy = true
+			}
+			out[i] = s
+		}()
 	}
-	if cur.Present {
-		return cur, ErrOccupied
-	}
-	qctx, cancel := c.query(ctx)
-	vms, err := c.lc.List(qctx)
-	cancel()
-	if err != nil {
-		c.logf("create: list failed: %v", err)
-		return Status{}, fmt.Errorf("%w: cannot list existing VMs", ErrUncertain)
-	}
-	for _, v := range vms {
-		if v.State != vmlib.StateDeleted {
-			return Status{}, ErrOccupied // foreign VM on the shared facade; never adopted
+	wg.Wait()
+	res := make([]Status, 0, len(out))
+	for _, s := range out {
+		if s.Present {
+			res = append(res, s)
 		}
 	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Generation < res[j].Generation })
+	return res, nil
+}
 
+// Status reports one VM, reconciling first.
+func (c *Controller) Status(ctx context.Context, ref Ref) (Status, error) {
+	rec, err := c.Resolve(ref)
+	if err != nil {
+		return Status{}, err
+	}
+	return c.reconcileVM(rec, c.cfg.QueryTimeout)
+}
+
+func pickLabel(s *State, want string) (string, error) {
+	taken := func(l string) bool {
+		for _, r := range s.VMs {
+			if r.Label == l {
+				return true
+			}
+		}
+		return false
+	}
+	if want != "" {
+		if taken(want) {
+			return "", ErrNameTaken
+		}
+		return want, nil
+	}
+	l := fmt.Sprintf("vm-%d", s.Generation)
+	for k := 2; taken(l); k++ {
+		l = fmt.Sprintf("vm-%d-%d", s.Generation, k)
+	}
+	return l, nil
+}
+
+// Create makes another VM. name may be empty (a short label is generated).
+// Admission (capacity, unique name, generation) is one atomic state update that
+// also makes the create intent durable; the create workflow then runs on the
+// VM's own queue partition, so a slow Create never blocks another VM.
+func (c *Controller) Create(ctx context.Context, name string) (Status, error) {
+	if name != "" && ValidateLabel(name) != nil {
+		return Status{}, ErrBadName
+	}
 	id, err := newVMID()
 	if err != nil {
 		return Status{}, fmt.Errorf("%w: random source", ErrFailed)
@@ -268,155 +411,101 @@ func (c *Controller) Create(ctx context.Context) (Status, error) {
 		return Status{}, fmt.Errorf("%w: random source", ErrFailed)
 	}
 	var rec VMRecord
-	if err := c.st.Update(func(s *State) {
+	if err := c.st.UpdateErr(func(s *State) error {
+		if len(s.VMs) >= c.cfg.MaxVMs {
+			return ErrCapacity
+		}
 		s.Generation++
-		rec = VMRecord{ID: id, Token: tok, Phase: PhaseCreating, Generation: s.Generation}
-		s.VM = &rec
+		label, lerr := pickLabel(s, name)
+		if lerr != nil {
+			return lerr
+		}
+		rec = VMRecord{ID: id, Token: tok, Phase: PhaseCreating, Generation: s.Generation, Label: label}
+		s.VMs = append(s.VMs, rec)
+		return nil
 	}); err != nil {
+		if errors.Is(err, ErrCapacity) || errors.Is(err, ErrNameTaken) {
+			return Status{}, err
+		}
 		return Status{}, fmt.Errorf("%w: cannot persist state", ErrFailed)
 	}
-
-	cctx, ccancel := context.WithTimeout(ctx, c.cfg.OpTimeout)
-	vm, cerr := c.lc.Create(cctx, vmlib.CreateRequest{ID: id, ImageID: c.cfg.ImageID, Profile: c.cfg.Profile,
-		Labels: map[string]string{"app": "vmbot"}})
-	ccancel()
-	if cerr != nil {
-		c.logf("create: %v", cerr)
-		return c.classifyCreateFailure(ctx, &rec)
+	h, err := c.ensureCreate(rec)
+	if err != nil { // the intent is durable; Recover/Status will submit it
+		s := statusOf(&rec, nil)
+		s.Uncertain = true
+		return s, fmt.Errorf("%w: creation not yet submitted", ErrUncertain)
 	}
-	if err := c.st.Update(func(s *State) {
-		if s.VM != nil && s.VM.ID == id {
-			s.VM.Phase = PhaseActive
-		}
-	}); err != nil {
-		return statusOf(&rec, &vm), fmt.Errorf("%w: cannot persist state", ErrUncertain)
+	r, err := c.wait(h, c.opWait())
+	if err != nil {
+		s := statusOf(&rec, nil)
+		s.Uncertain = true
+		return s, fmt.Errorf("%w: creation still in progress", ErrUncertain)
 	}
-	rec.Phase = PhaseActive
-	if vm.State == vmlib.StateRunning || vm.State == "" {
-		tctx, tcancel := c.query(ctx)
-		if terr := c.ensureTerminalLocked(tctx, &rec); terr != nil {
-			c.logf("terminal start failed: %v", terr)
-		}
-		tcancel()
+	if r.Code != codeOK {
+		return r.Status, r.err()
 	}
-	return statusOf(&rec, &vm), nil
+	return r.Status, nil
 }
 
-// classifyCreateFailure resolves an unknown Create outcome with Get.
-func (c *Controller) classifyCreateFailure(ctx context.Context, rec *VMRecord) (Status, error) {
-	qctx, cancel := c.query(ctx)
-	defer cancel()
-	vm, err := c.lc.Get(qctx, rec.ID)
-	switch {
-	case errors.Is(err, vmlib.ErrNotFound):
-		if c.confirmGoneLocked(ctx, rec) {
-			return Status{}, fmt.Errorf("%w: VM was not created", ErrFailed)
-		}
-		s := statusOf(rec, nil)
-		s.Uncertain = true
-		return s, fmt.Errorf("%w: creation outcome unknown", ErrUncertain)
-	case err != nil:
-		s := statusOf(rec, nil)
-		s.Uncertain = true
-		return s, fmt.Errorf("%w: creation outcome unknown", ErrUncertain)
-	}
-	_ = c.st.Update(func(s *State) {
-		if s.VM != nil && s.VM.ID == rec.ID && s.VM.Phase == PhaseCreating {
-			s.VM.Phase = PhaseActive
-		}
-	})
-	r := *rec
-	r.Phase = PhaseActive
-	return statusOf(&r, &vm), fmt.Errorf("%w: VM exists but creation reported an error", ErrFailed)
-}
-
-// Terminal returns the secret link for the current VM, (re)starting its backend.
-func (c *Controller) Terminal(ctx context.Context) (string, error) {
-	if err := c.lock(ctx); err != nil {
-		return "", err
-	}
-	defer c.unlock()
-	st, err := c.reconcileLocked(ctx)
+// Terminal returns the secret link for one VM, (re)starting its backend.
+func (c *Controller) Terminal(ctx context.Context, ref Ref) (string, error) {
+	rec, err := c.Resolve(ref)
 	if err != nil {
 		return "", err
 	}
-	if !st.Present {
-		return "", ErrNoVM
+	if rec.Phase == PhaseCreating { // settle the create first (guarded)
+		if _, err := c.reconcileVM(rec, c.opWait()); err != nil {
+			return "", err
+		}
 	}
-	rec := c.st.Snapshot().VM
-	if rec == nil || rec.Phase != PhaseActive || st.State != string(vmlib.StateRunning) {
+	id, err := c.newRunID(opTerminal, rec.ID)
+	if err != nil {
+		return "", fmt.Errorf("%w: random source", ErrFailed)
+	}
+	h, err := c.submit(OpInput{Kind: opTerminal, VMID: rec.ID}, id)
+	if err != nil {
+		return "", err
+	}
+	r, err := c.wait(h, c.opWait())
+	if err != nil {
+		return "", err
+	}
+	if r.Code != codeOK {
+		return "", r.err()
+	}
+	// The link is built from durable state now, never from the workflow result.
+	cur, ok := c.st.Snapshot().ByID(rec.ID)
+	if !ok || cur.Phase != PhaseActive {
 		return "", ErrNotRunning
 	}
-	qctx, cancel := c.query(ctx)
-	defer cancel()
-	if err := c.ensureTerminalLocked(qctx, rec); err != nil {
-		c.logf("terminal start failed: %v", err)
-		return "", fmt.Errorf("%w: terminal backend unavailable", ErrFailed)
-	}
-	return c.cfg.PublicOrigin + "/t/" + rec.Token + "/", nil
+	return c.cfg.PublicOrigin + "/t/" + cur.Token + "/", nil
 }
 
-// Delete removes the current VM. gen != 0 binds the call to one generation so
-// a stale button cannot hit a replacement. The terminal is revoked first.
-func (c *Controller) Delete(ctx context.Context, gen uint64) (Status, error) {
-	if err := c.lock(ctx); err != nil {
+// Delete removes one VM; it never acts without an unambiguous Ref. Ref.Gen
+// binds the call to one generation so a stale button cannot hit a replacement.
+func (c *Controller) Delete(ctx context.Context, ref Ref) (Status, error) {
+	rec, err := c.Resolve(ref)
+	if err != nil {
 		return Status{}, err
 	}
-	defer c.unlock()
-	rec := c.st.Snapshot().VM
-	if rec == nil {
-		return Status{}, ErrNoVM
-	}
-	if gen != 0 && gen != rec.Generation {
-		return statusOf(rec, nil), ErrStale
-	}
-	// The irreversible deleting phase is durable BEFORE anything else happens.
-	// If it cannot be persisted nothing is revoked or deleted and the caller is
-	// told so: a restart must never re-authorize a link we claimed to revoke.
-	if rec.Phase != PhaseDeleting {
-		if err := c.st.Update(func(s *State) {
-			if s.VM != nil && s.VM.ID == rec.ID {
-				s.VM.Phase = PhaseDeleting
-			}
-		}); err != nil {
-			return statusOf(rec, nil), fmt.Errorf("%w: cannot persist state; nothing was changed", ErrFailed)
+	h, cur, err := c.submitDelete(rec)
+	if err != nil {
+		r := cur
+		r.Phase = PhaseDeleting
+		if cur.ID == "" {
+			return Status{}, err
 		}
+		return statusOf(&r, nil), err
 	}
-	c.term.Revoke(rec.ID)
-	r := *rec
-	r.Phase = PhaseDeleting
-
-	dctx, cancel := context.WithTimeout(ctx, c.cfg.OpTimeout)
-	res, derr := c.lc.Delete(dctx, rec.ID)
-	cancel()
-	if derr != nil || !res.Deleted {
-		if derr != nil {
-			c.logf("delete: %v", derr)
-		}
-		// Only a successful Delete releases the slot. A Get that says NotFound is
-		// not proof (a Create may still be settling); the retry, or the next
-		// reconcile, runs the same barrier.
-		qctx, qcancel := c.query(ctx)
-		vm, gerr := c.lc.Get(qctx, rec.ID)
-		qcancel()
-		s := statusOf(&r, nil)
-		if gerr == nil {
-			s = statusOf(&r, &vm)
-		} else {
-			s.Uncertain = true
-		}
-		if errors.Is(derr, vmlib.ErrRetained) || res.Retained {
-			s.Retained = true
-			return s, fmt.Errorf("%w: VM retained, exit not proven", ErrFailed)
-		}
-		return s, fmt.Errorf("%w: delete not confirmed", ErrFailed)
+	r, err := c.wait(h, c.opWait())
+	if err != nil {
+		cur.Phase = PhaseDeleting
+		s := statusOf(&cur, nil)
+		s.Uncertain = true
+		return s, fmt.Errorf("%w: delete still in progress", ErrFailed)
 	}
-	if err := c.st.Update(func(s *State) {
-		if s.VM != nil && s.VM.ID == rec.ID {
-			s.VM = nil
-		}
-	}); err != nil {
-		return statusOf(&r, nil), fmt.Errorf("%w: cannot persist state", ErrUncertain)
+	if r.Code != codeOK {
+		return r.Status, r.err()
 	}
-	return Status{}, nil
+	return r.Status, nil
 }

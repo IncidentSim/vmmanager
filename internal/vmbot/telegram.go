@@ -48,8 +48,8 @@ type Button struct{ Text, Data string }
 type OutMessage struct {
 	ChatID       int64
 	Text         string
-	Inline       []Button // one row; takes precedence over MainKeyboard
-	MainKeyboard bool     // attach the persistent reply keyboard
+	Inline       [][]Button // keyboard rows; takes precedence over MainKeyboard
+	MainKeyboard bool       // attach the persistent reply keyboard
 	Secret       bool
 }
 
@@ -134,7 +134,7 @@ func (c *TelegramClient) GetUpdates(ctx context.Context, offset int64, timeoutSe
 
 var mainKeyboard = map[string]any{
 	"keyboard": [][]map[string]string{
-		{{"text": "Создать"}, {"text": "Статус"}},
+		{{"text": "Создать"}, {"text": "Список"}, {"text": "Статус"}},
 		{{"text": "Терминал"}, {"text": "Удалить"}},
 	},
 	"resize_keyboard": true,
@@ -152,11 +152,15 @@ func (c *TelegramClient) SendMessage(ctx context.Context, m OutMessage) error {
 	}
 	switch {
 	case len(m.Inline) > 0:
-		row := make([]map[string]string, 0, len(m.Inline))
-		for _, b := range m.Inline {
-			row = append(row, map[string]string{"text": b.Text, "callback_data": b.Data})
+		rows := make([][]map[string]string, 0, len(m.Inline))
+		for _, r := range m.Inline {
+			row := make([]map[string]string, 0, len(r))
+			for _, b := range r {
+				row = append(row, map[string]string{"text": b.Text, "callback_data": b.Data})
+			}
+			rows = append(rows, row)
 		}
-		body["reply_markup"] = map[string]any{"inline_keyboard": [][]map[string]string{row}}
+		body["reply_markup"] = map[string]any{"inline_keyboard": rows}
 	case m.MainKeyboard:
 		body["reply_markup"] = mainKeyboard
 	}

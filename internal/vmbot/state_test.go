@@ -41,7 +41,7 @@ func TestStoreExclusiveLockAndReload(t *testing.T) {
 	}
 	_ = s.Update(func(st *State) {
 		st.Generation = 3
-		st.VM = &VMRecord{ID: "bot-a", Token: "tok", Phase: PhaseActive, Generation: 3}
+		st.VMs = append(st.VMs, VMRecord{ID: "bot-a", Token: testTok(1), Phase: PhaseActive, Generation: 3, Label: "alpha"})
 	})
 	if _, err := OpenStore(dir); !errors.Is(err, ErrLocked) {
 		t.Fatalf("second open: want ErrLocked got %v", err)
@@ -53,7 +53,7 @@ func TestStoreExclusiveLockAndReload(t *testing.T) {
 	}
 	defer s2.Close()
 	got := s2.Snapshot()
-	if got.Generation != 3 || got.VM == nil || got.VM.ID != "bot-a" || got.VM.Token != "tok" {
+	if got.Generation != 3 || len(got.VMs) != 1 || got.VMs[0].ID != "bot-a" || got.VMs[0].Token != testTok(1) || got.VMs[0].Label != "alpha" {
 		t.Fatalf("reload: %+v", got)
 	}
 }

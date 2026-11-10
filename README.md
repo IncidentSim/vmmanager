@@ -51,7 +51,7 @@ static TAP/MAC/IP and demo SSH credentials, not a multi-tenant build platform.
 
 ## Build and use
 
-Requirements: installed deployment, Go 1.22+, Make, Python 3, OpenSSH client, coreutils,
+Requirements: installed deployment, Go 1.25+, Make, Python 3, OpenSSH client, coreutils,
 working host KVM, guest Internet access, and sufficient disk space. Prepare a
 matching Ubuntu base rootfs and SSH key in `assets/` using the administrator's
 artifact preparation workflow (`deployment/prepare-ubuntu.sh`); ensure these resulting

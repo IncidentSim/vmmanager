@@ -21,6 +21,7 @@ type Config struct {
 	AllowedUserID     int64          `json:"allowed_user_id"`
 	Facade            FacadeConfig   `json:"facade"`
 	VM                VMConfig       `json:"vm"`
+	MaxVMs            int            `json:"max_vms"` // application ceiling, default 2; backend policy stays authoritative
 	StateDir          string         `json:"state_dir"`
 	Terminal          TerminalConfig `json:"terminal"`
 }
@@ -74,6 +75,9 @@ func LoadConfig(path string) (Config, error) {
 	if c.Terminal.MaxClients == 0 {
 		c.Terminal.MaxClients = 2
 	}
+	if c.MaxVMs == 0 {
+		c.MaxVMs = DefaultMaxVMs
+	}
 	if err := c.validate(); err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)
 	}
@@ -115,6 +119,12 @@ func (c Config) validate() error {
 	t := c.Terminal
 	if t.MaxClients < 1 || t.MaxClients > 8 {
 		return errors.New("terminal.max_clients must be 1..8")
+	}
+	if c.MaxVMs < 1 || c.MaxVMs > MaxVMsLimit {
+		return fmt.Errorf("max_vms must be 1..%d", MaxVMsLimit)
+	}
+	if c.MaxVMs*t.MaxClients > maxGatewayConns {
+		return fmt.Errorf("max_vms*terminal.max_clients must not exceed %d (gateway connection bound)", maxGatewayConns)
 	}
 	if _, _, err := net.SplitHostPort(t.ListenAddr); err != nil {
 		return fmt.Errorf("terminal.listen_addr: %w", err)

@@ -49,7 +49,7 @@ func TestTelegramClientRequestsAndSecretMessageFlags(t *testing.T) {
 		t.Fatalf("path %q", paths[1])
 	}
 	if err := c.SendMessage(context.Background(), OutMessage{ChatID: 1, Text: "hi", MainKeyboard: true,
-		Inline: []Button{{Text: "Удалить", Data: "d:1"}}}); err != nil {
+		Inline: [][]Button{{{Text: "Удалить", Data: "d:1"}}, {{Text: "Терминал", Data: "t:1"}}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := bodies[2]["reply_markup"]; !ok {

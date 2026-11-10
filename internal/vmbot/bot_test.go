@@ -108,12 +108,12 @@ func TestCommandsHappyPathAndRussianUI(t *testing.T) {
 	}
 	b.Handle(ctx, msg(3, testUser, testUser, "private", "/status"))
 	last := api.sent[len(api.sent)-1]
-	if len(last.Inline) == 0 || !strings.HasPrefix(last.Inline[len(last.Inline)-1].Data, "d:1") {
+	if len(last.Inline) == 0 || last.Inline[0][len(last.Inline[0])-1].Data != "d:1" {
 		t.Fatalf("status must offer a generation-bound delete button: %+v", last)
 	}
 	b.Handle(ctx, msg(4, testUser, testUser, "private", "/terminal"))
 	link := api.sent[len(api.sent)-1]
-	tok := e.store.Snapshot().VM.Token
+	tok := e.store.Snapshot().VMs[0].Token
 	if !strings.Contains(link.Text, "/t/"+tok+"/") || !link.Secret {
 		t.Fatalf("link message must carry the secret and Secret=true: %+v", link)
 	}
@@ -140,7 +140,7 @@ func TestStaleDeleteCallbackCannotDeleteReplacement(t *testing.T) {
 	b.Handle(ctx, msg(2, testUser, testUser, "private", "/delete"))
 	b.Handle(ctx, msg(3, testUser, testUser, "private", "/create"))
 	b.Handle(ctx, cb(4, testUser, testUser, "d:1"))
-	if e.be.Count() != 1 || e.store.Snapshot().VM == nil {
+	if e.be.Count() != 1 || len(e.store.Snapshot().VMs) != 1 {
 		t.Fatal("stale callback deleted the replacement VM")
 	}
 	if len(api.answers) != 1 || !strings.Contains(api.answers[0], "Устарело") {
@@ -157,9 +157,10 @@ func TestStaleDeleteCallbackCannotDeleteReplacement(t *testing.T) {
 func TestUserVisibleErrorsHideRPCInternals(t *testing.T) {
 	e := newEnv(t)
 	b, api := newBot(t, e)
-	e.lc.list = func(context.Context) ([]vmlib.VM, error) {
-		return nil, context.DeadlineExceeded
+	e.lc.create = func(context.Context, vmlib.CreateRequest) (vmlib.VM, error) {
+		return vmlib.VM{}, context.DeadlineExceeded
 	}
+	e.lc.get = func(context.Context, string) (vmlib.VM, error) { return vmlib.VM{}, context.DeadlineExceeded }
 	b.Handle(context.Background(), msg(1, testUser, testUser, "private", "/create"))
 	txt := api.texts()
 	if strings.Contains(txt, "deadline") || strings.Contains(txt, "rpc") {
@@ -224,7 +225,7 @@ func TestCreateAutomaticallySendsSecretLinkAfterStatus(t *testing.T) {
 		t.Fatalf("want progress, status and link messages, got %d", n)
 	}
 	status, link := api.sent[n-2], api.sent[n-1]
-	tok := e.store.Snapshot().VM.Token
+	tok := e.store.Snapshot().VMs[0].Token
 	if status.Secret || strings.Contains(status.Text, tok) || len(status.Inline) == 0 {
 		t.Fatalf("status message must be concise, tokenless and keep buttons: %+v", status)
 	}
@@ -236,7 +237,10 @@ func TestCreateAutomaticallySendsSecretLinkAfterStatus(t *testing.T) {
 func TestFailedCreateSendsNoLink(t *testing.T) {
 	e := newEnv(t)
 	b, api := newBot(t, e)
-	e.lc.list = func(context.Context) ([]vmlib.VM, error) { return nil, context.DeadlineExceeded }
+	e.lc.create = func(context.Context, vmlib.CreateRequest) (vmlib.VM, error) {
+		return vmlib.VM{}, context.DeadlineExceeded
+	}
+	e.lc.get = func(context.Context, string) (vmlib.VM, error) { return vmlib.VM{}, context.DeadlineExceeded }
 	b.Handle(context.Background(), msg(1, testUser, testUser, "private", "/create"))
 	for _, m := range api.sent {
 		if m.Secret {

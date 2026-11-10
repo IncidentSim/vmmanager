@@ -1,6 +1,6 @@
 # ADR 0002: Telegram single-VM bot with a capability-link web terminal
 
-Status: Accepted
+Status: Accepted; the single-VM occupancy rule is amended by [ADR 0003](0003-vmbot-multi-vm.md)
 Date: 2026-11-10
 Baseline: commit `76375b2` (verified multi-VM deployment of `vmlib`/`vmd`)
 

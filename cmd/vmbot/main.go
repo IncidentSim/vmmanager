@@ -1,6 +1,7 @@
-// vmbot is a Telegram bot that owns exactly one VM on a vmd facade (mTLS) and
-// exposes a revocable capability-link web terminal (ttyd -> ssh) for it. See
-// docs/vmbot.md and docs/adr/0002-telegram-single-vm-bot.md.
+// vmbot is a Telegram bot that owns up to max_vms VMs on a vmd facade (mTLS) and
+// exposes a revocable capability-link web terminal (ttyd -> ssh) per VM. See
+// docs/vmbot.md, docs/adr/0002-telegram-single-vm-bot.md and
+// docs/adr/0003-vmbot-multi-vm.md.
 //
 //	vmbot -config /path/to/vmbot.json
 //
@@ -53,6 +54,10 @@ func run(cfgPath string, logger *log.Logger) error {
 		return fmt.Errorf("state: %w", err)
 	}
 	defer store.Close()
+	if m := store.Migration(); m != nil {
+		logger.Printf("state migrated v1 -> v2; v1 backup kept at %s (restoring it is only safe before any v2 change: "+
+			"later it loses the update offset and any VM created since; see docs/adr/0003-vmbot-multi-vm.md)", m.BackupPath)
+	}
 
 	tlsCfg, err := remote.ClientTLSFromFiles(cfg.Facade.CAFile, cfg.Facade.CertFile, cfg.Facade.KeyFile, cfg.Facade.ServerName)
 	if err != nil {
@@ -67,13 +72,16 @@ func run(cfgPath string, logger *log.Logger) error {
 	t := cfg.Terminal
 	mgr, err := vmbot.NewManager(vmbot.ManagerConfig{
 		TTYDPath: t.TTYDPath, SSHPath: t.SSHPath, SSHKeyFile: t.SSHKeyFile, StateDir: cfg.StateDir,
-		PublicOrigin: t.PublicOrigin, MaxClients: t.MaxClients, UseBastion: t.SSHUseBastion,
+		PublicOrigin: t.PublicOrigin, MaxClients: t.MaxClients, MaxSessions: cfg.MaxVMs, UseBastion: t.SSHUseBastion,
 	})
 	if err != nil {
 		return err
 	}
+	// Recover can start terminal projections before Listen succeeds. Always
+	// drain them on an early startup error too, not only via ServeGateway.
+	defer mgr.Close()
 	ctl := vmbot.NewController(facade, store, mgr, vmbot.ControllerConfig{
-		ImageID: cfg.VM.ImageID, Profile: cfg.VM.Profile, PublicOrigin: t.PublicOrigin, Logger: logger,
+		ImageID: cfg.VM.ImageID, Profile: cfg.VM.Profile, PublicOrigin: t.PublicOrigin, MaxVMs: cfg.MaxVMs, Logger: logger,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -81,6 +89,17 @@ func run(cfgPath string, logger *log.Logger) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// The state-dir lifetime flock (OpenStore) is already held, so no second
+	// instance can share the orchestration database. Start resumes pending
+	// workflows; Recover re-submits intents and rebuilds terminal projections.
+	if err := ctl.Start(ctx); err != nil {
+		return fmt.Errorf("orchestration: %w", err)
+	}
+	defer func() {
+		if err := ctl.Close(); err != nil {
+			logger.Printf("orchestration shutdown: %v", err)
+		}
+	}()
 	if err := ctl.Recover(ctx); err != nil {
 		logger.Printf("startup reconcile incomplete (VM kept; will retry on next operation): %v", err)
 	}

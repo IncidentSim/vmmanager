@@ -1,6 +1,10 @@
 .DEFAULT_GOAL := build
 
 GO ?= go
+# Go <=1.24 auto-switching to early 1.25 releases can invoke the old `go`
+# binary for coverage tools (golang/go#75031). Keep child tool invocations on
+# the selected toolchain too, without installing/changing the system Go.
+export PATH := $(shell $(GO) env GOROOT)/bin:$(PATH)
 PYTHON ?= python3
 BUILD_DIR ?= .
 IMAGE ?= images/ubuntu-postgres.ext4
@@ -17,7 +21,7 @@ remote-client:
 	$(GO) build -o "$(BUILD_DIR)/remote-client" ./cmd/remote-client
 
 test:
-	$(GO) test -race -cover ./...
+	$(GO) test -race -cover -timeout 3m ./...
 	$(PYTHON) -m unittest -v test_verify_image.py test_project_layout.py deployment/test_mtls.py deployment/multivm/test_deploy.py scripts/integration/test_multi_vm.py
 
 vet:
