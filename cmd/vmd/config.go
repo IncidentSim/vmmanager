@@ -33,13 +33,17 @@ type localConfig struct {
 	// mount can never fall back to the root filesystem.
 	StorageMount string `json:"storage_mount"`
 	// Aggregate admission; keep within the installed cgroup slice budget.
-	MaxTotalMemMiB  uint32          `json:"max_total_mem_mib"`
-	MaxTotalVCPU    uint32          `json:"max_total_vcpu"`
-	UnitMemLimitMiB uint32          `json:"unit_mem_limit_mib"`
-	VMMOverheadMiB  uint32          `json:"vmm_overhead_mib"`
-	GuestDNS        []string        `json:"guest_dns,omitempty"`
-	Profiles        []profileConfig `json:"profiles"`
-	Bastion         *bastionConfig  `json:"bastion,omitempty"`
+	MaxTotalMemMiB  uint32   `json:"max_total_mem_mib"`
+	MaxTotalVCPU    uint32   `json:"max_total_vcpu"`
+	UnitMemLimitMiB uint32   `json:"unit_mem_limit_mib"`
+	VMMOverheadMiB  uint32   `json:"vmm_overhead_mib"`
+	GuestDNS        []string `json:"guest_dns,omitempty"`
+	// GuestPrefix is the operator-chosen guest pool "A.B" (slot N = A.B.N.0/30);
+	// PoolConf is the shared root-owned pool file that must agree with it.
+	GuestPrefix string          `json:"guest_prefix"`
+	PoolConf    string          `json:"pool_conf"`
+	Profiles    []profileConfig `json:"profiles"`
+	Bastion     *bastionConfig  `json:"bastion,omitempty"`
 }
 
 type remoteConfig struct {
@@ -106,6 +110,9 @@ func (c *config) validate() error {
 		}
 		if l.StorageMount == "" {
 			return errors.New("backend.local.storage_mount is required (bounded storage mount guard)")
+		}
+		if l.GuestPrefix == "" || l.PoolConf == "" {
+			return errors.New("backend.local guest_prefix and pool_conf are required (operator-chosen collision-free pool)")
 		}
 		if l.MaxTotalMemMiB == 0 || l.MaxTotalVCPU == 0 || l.UnitMemLimitMiB == 0 {
 			return errors.New("backend.local max_total_mem_mib, max_total_vcpu and unit_mem_limit_mib are required admission policy")

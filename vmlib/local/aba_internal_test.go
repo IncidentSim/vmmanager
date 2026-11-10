@@ -31,7 +31,7 @@ func abaBackend(t *testing.T) (*Backend, string) {
 	d := t.TempDir()
 	cfg := Config{WorkRoot: filepath.Join(d, "w"), ImagesDir: filepath.Join(d, "i"), RunDir: filepath.Join(d, "r"), MaxVMs: 2,
 		Profiles: []vmlib.Profile{{Name: "small", VCPU: 1, MemMiB: 128, DiskMiB: 8}},
-		Launcher: nopLauncher{}, VMM: nopVMM{}, MaxTotalMemMiB: 1024, MaxTotalVCPU: 8, UnitMemLimitMiB: 768, VMMOverheadMiB: 64,
+		Launcher: nopLauncher{}, VMM: nopVMM{}, MaxTotalMemMiB: 1024, MaxTotalVCPU: 8, UnitMemLimitMiB: 768, VMMOverheadMiB: 64, GuestPrefix: "172.30",
 		CopyFile: func(src, dst string) error { return os.WriteFile(dst, []byte("disk"), 0o600) },
 	}
 	for _, p := range []string{cfg.WorkRoot, cfg.ImagesDir, cfg.RunDir} {

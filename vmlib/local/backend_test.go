@@ -109,6 +109,7 @@ func newRig(t *testing.T, max int) *rig {
 		SSHUser:  "root", Bastion: &vmlib.Bastion{Host: "bastion.example.test", Port: 22, User: "jump"},
 		Launcher: r.launcher, VMM: r.vmm, MinFreeMiB: 0,
 		MaxTotalMemMiB: 4096, MaxTotalVCPU: 16, UnitMemLimitMiB: 768, VMMOverheadMiB: 64,
+		GuestPrefix: "172.30",
 	}
 	return r
 }
@@ -151,7 +152,7 @@ func TestPrepareCopiesImageAndNeverTouchesBase(t *testing.T) {
 	before := sum(t, filepath.Join(r.images, "base.ext4"))
 	b := r.backend()
 	h, err := prep(b, "a")
-	if err != nil || h.State != vmlib.HostPrepared || h.GuestIP != "172.17.0.2" {
+	if err != nil || h.State != vmlib.HostPrepared || h.GuestIP != "172.30.0.2" {
 		t.Fatalf("%v %+v", err, h)
 	}
 	disk := filepath.Join(r.root, "vms", "a", "disk.ext4")
@@ -240,7 +241,7 @@ func TestStartConfiguresDerivedResourcesOnly(t *testing.T) {
 		t.Fatalf("launcher slots %v", r.launcher.slots)
 	}
 	s := r.vmm.specs[0]
-	if s.Tap != "tap-vm1" || s.MAC != "06:00:AC:11:01:02" || s.DiskJailPath != "/work/vms/b/disk.ext4" ||
+	if s.Tap != "tap-vm1" || s.MAC != "06:00:AC:1E:01:02" || s.DiskJailPath != "/work/vms/b/disk.ext4" ||
 		s.Kernel != "/kernel/vmlinux" || s.VCPU != 1 || s.MemMiB != 256 {
 		t.Fatalf("%+v", s)
 	}
@@ -413,7 +414,7 @@ func TestReleaseOnlyWithProofAndFreesSlot(t *testing.T) {
 	if res, err := b.Release(ctx, "a"); err != nil || !res.Released {
 		t.Fatal("release must be idempotent")
 	}
-	if h, err := prep(b, "b"); err != nil || h.GuestIP != "172.17.0.2" {
+	if h, err := prep(b, "b"); err != nil || h.GuestIP != "172.30.0.2" {
 		t.Fatalf("slot not reusable after release: %v %+v", err, h)
 	}
 }
@@ -471,7 +472,7 @@ func TestFacadeServiceOverLocalBackendFlow(t *testing.T) {
 		t.Fatalf("%v %+v", err, vm)
 	}
 	info, _ := svc.SSHInfo(ctx, "src")
-	if info.Host != "172.17.0.2" || info.ProxyJump() != "jump@bastion.example.test" || info.AuthMode != vmlib.AuthImagePreinstalled {
+	if info.Host != "172.30.0.2" || info.ProxyJump() != "jump@bastion.example.test" || info.AuthMode != vmlib.AuthImagePreinstalled {
 		t.Fatalf("%+v", info)
 	}
 	go func() { time.Sleep(30 * time.Millisecond); r.receipt(0, inv, "success", "exited", "0") }()

@@ -18,7 +18,7 @@ import (
 
 func TestParseConfigRejectsUnsafeShapes(t *testing.T) {
 	tls := `{"listen":"127.0.0.1:0","ca":"/a","cert":"/b","key":"/c"}`
-	localBackend := `"backend":{"kind":"local","local":{"work_root":"/w","images_dir":"/i","run_dir":"/r","max_vms":2,"helper":"/usr/local/libexec/fc-vm-helper","ssh_user":"root","storage_mount":"/var/lib/firecracker-builder/storage","max_total_mem_mib":1024,"max_total_vcpu":1,"unit_mem_limit_mib":768,"profiles":[{"name":"small","vcpu":1,"mem_mib":256,"disk_mib":1024}]}}`
+	localBackend := `"backend":{"kind":"local","local":{"work_root":"/w","images_dir":"/i","run_dir":"/r","max_vms":2,"helper":"/usr/local/libexec/fc-vm-helper","ssh_user":"root","storage_mount":"/var/lib/firecracker-builder/storage","max_total_mem_mib":1024,"max_total_vcpu":1,"unit_mem_limit_mib":768,"guest_prefix":"10.213","pool_conf":"/etc/firecracker-vms/pool.conf","profiles":[{"name":"small","vcpu":1,"mem_mib":256,"disk_mib":1024}]}}`
 	remoteBackend := `"backend":{"kind":"remote","remote":{"addr":"h:1","server_name":"h","ca":"/a","cert":"/b","key":"/c"}}`
 	cases := map[string]struct {
 		json string
@@ -33,6 +33,8 @@ func TestParseConfigRejectsUnsafeShapes(t *testing.T) {
 		"missing tls key":       {`{` + localBackend + `,"serve_facade":{"listen":"127.0.0.1:0","ca":"/a","cert":"/b"}}`, false},
 		"no storage mount":      {strings.Replace(`{`+localBackend+`,"serve_facade":`+tls+`}`, `"storage_mount":"/var/lib/firecracker-builder/storage",`, "", 1), false},
 		"no aggregate caps":     {strings.Replace(`{`+localBackend+`,"serve_facade":`+tls+`}`, `"max_total_mem_mib":1024,`, "", 1), false},
+		"no guest prefix":       {strings.Replace(`{`+localBackend+`,"serve_facade":`+tls+`}`, `"guest_prefix":"10.213",`, "", 1), false},
+		"no pool conf":          {strings.Replace(`{`+localBackend+`,"serve_facade":`+tls+`}`, `"pool_conf":"/etc/firecracker-vms/pool.conf",`, "", 1), false},
 		"unknown field":         {`{` + localBackend + `,"serve_facade":` + tls + `,"insecure":true}`, false},
 		"relative helper":       {strings.Replace(`{`+localBackend+`,"serve_facade":`+tls+`}`, "/usr/local/libexec/fc-vm-helper", "helper", 1), false},
 		"remote w/o servername": {strings.Replace(`{`+remoteBackend+`,"serve_facade":`+tls+`}`, `"server_name":"h"`, `"server_name":""`, 1), false},
@@ -93,7 +95,7 @@ func TestRunCombinedModeEndToEnd(t *testing.T) {
 	bsCA, bsCert, bsKey := writePKI(t, d, "bs", beCA, true)
 	fsCA, fsCert, fsKey := writePKI(t, d, "fs", faCA, true)
 	cfg := &config{
-		Backend: backendConfig{Kind: "local", Local: &localConfig{WorkRoot: work, ImagesDir: images, RunDir: run, MaxVMs: 2, Helper: "/bin/true", MaxTotalMemMiB: 1024, MaxTotalVCPU: 4, UnitMemLimitMiB: 768,
+		Backend: backendConfig{Kind: "local", Local: &localConfig{WorkRoot: work, ImagesDir: images, RunDir: run, MaxVMs: 2, Helper: "/bin/true", MaxTotalMemMiB: 1024, MaxTotalVCPU: 4, UnitMemLimitMiB: 768, GuestPrefix: "10.213",
 			SSHUser: "root", Profiles: []profileConfig{{Name: "small", VCPU: 1, MemMiB: 256, DiskMiB: 64}}}},
 		ServeBackend: &listenConfig{Listen: "127.0.0.1:0", CA: bsCA, Cert: bsCert, Key: bsKey},
 		ServeFacade:  &listenConfig{Listen: "127.0.0.1:0", CA: fsCA, Cert: fsCert, Key: fsKey},

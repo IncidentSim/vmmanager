@@ -21,7 +21,7 @@ func TestSecondOwnerOfSameRootsIsRejectedAndCloseReleases(t *testing.T) {
 	r := newRig(t, 1)
 	b1 := r.backend()
 	if _, err := local.New(r.cfg); err == nil {
-		t.Fatal("a second Backend over the same roots was accepted (would double-allocate 172.17.0.2)")
+		t.Fatal("a second Backend over the same roots was accepted (would double-allocate 172.30.0.2)")
 	}
 	base := filepath.Dir(r.root)
 	cfg2 := r.cfg
@@ -321,7 +321,7 @@ func TestInspectReportsGuestNetworkMetadata(t *testing.T) {
 	prep(b, "b")
 	h, _ := b.Inspect(ctx, "b")
 	g := h.Guest
-	if g == nil || g.Address != "172.17.1.2/30" || g.Gateway != "172.17.1.1" || len(g.DNS) != 1 || g.Configuration != "mac-derived" {
+	if g == nil || g.Address != "172.30.1.2/30" || g.Gateway != "172.30.1.1" || len(g.DNS) != 1 || g.Configuration != "mac-derived" {
 		t.Fatalf("%+v", g)
 	}
 }
@@ -376,6 +376,48 @@ func TestRootsOnTheStorageMountAreAccepted(t *testing.T) {
 	os.MkdirAll(r.cfg.WorkRoot, 0o700)
 	os.MkdirAll(r.cfg.ImagesDir, 0o700)
 	r.cfg.StorageMount = "/dev/shm"
+	b, err := local.New(r.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+}
+
+// ---- operator-chosen guest pool ------------------------------------------------------
+
+func TestGuestPrefixIsRequiredAndValidated(t *testing.T) {
+	for _, bad := range []string{"", "172", "172.30.1", "127.0", "169.254", "300.1", "0.1"} {
+		r := newRig(t, 1)
+		r.cfg.GuestPrefix = bad
+		if b, err := local.New(r.cfg); err == nil {
+			b.Close()
+			t.Errorf("prefix %q accepted", bad)
+		}
+	}
+}
+
+func TestPoolFileMustAgreeWithBackendPolicy(t *testing.T) {
+	write := func(r *rig, body string) string {
+		p := filepath.Join(filepath.Dir(r.root), "pool.conf")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	for name, body := range map[string]string{
+		"prefix mismatch": "GUEST_PREFIX=172.31\nMAX_SLOTS=4\n",
+		"too few slots":   "GUEST_PREFIX=172.30\nMAX_SLOTS=1\n",
+		"garbage":         "GUEST_PREFIX=172.30;reboot\nMAX_SLOTS=4\n",
+	} {
+		r := newRig(t, 2)
+		r.cfg.PoolConf = write(r, body)
+		if b, err := local.New(r.cfg); err == nil {
+			b.Close()
+			t.Errorf("%s accepted", name)
+		}
+	}
+	r := newRig(t, 2)
+	r.cfg.PoolConf = write(r, "GUEST_PREFIX=172.30\nMAX_SLOTS=2\n")
 	b, err := local.New(r.cfg)
 	if err != nil {
 		t.Fatal(err)

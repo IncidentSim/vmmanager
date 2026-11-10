@@ -81,7 +81,7 @@ func buildLocal(l *localConfig, d deps) (*local.Backend, error) {
 	return local.New(local.Config{WorkRoot: l.WorkRoot, ImagesDir: l.ImagesDir, RunDir: l.RunDir, MaxVMs: l.MaxVMs,
 		Profiles: profiles, SSHUser: l.SSHUser, Bastion: bastion, Launcher: launcher, VMM: vmm, MinFreeMiB: l.MinFreeMiB,
 		StorageMount: l.StorageMount, MaxTotalMemMiB: l.MaxTotalMemMiB, MaxTotalVCPU: l.MaxTotalVCPU,
-		UnitMemLimitMiB: l.UnitMemLimitMiB, VMMOverheadMiB: l.VMMOverheadMiB, GuestDNS: l.GuestDNS})
+		UnitMemLimitMiB: l.UnitMemLimitMiB, VMMOverheadMiB: l.VMMOverheadMiB, GuestDNS: l.GuestDNS, GuestPrefix: l.GuestPrefix, PoolConf: l.PoolConf})
 }
 
 // run_ serves until ctx is cancelled. Cancelling ctx stops listeners only; it

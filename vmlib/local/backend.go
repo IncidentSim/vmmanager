@@ -35,6 +35,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/petruekhin/vibe-firecracker/internal/vmhelper"
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
@@ -91,6 +92,15 @@ type Config struct {
 	// satisfy MemMiB+VMMOverheadMiB <= UnitMemLimitMiB.
 	UnitMemLimitMiB uint32
 	VMMOverheadMiB  uint32 // default 64
+
+	// GuestPrefix is the operator-chosen "A.B" of the guest pool: slot N uses
+	// A.B.N.0/30 with the guest at .2 (and the MAC 06:00:A:B:N:02 that the CI
+	// Ubuntu base derives its address from). Required: pick a range that collides
+	// with nothing on the host (not Docker's 172.17/16).
+	GuestPrefix string
+	// PoolConf, when set, is the root-owned pool file shared with the network
+	// script and helper; it must agree with GuestPrefix and cover MaxVMs.
+	PoolConf string
 
 	// GuestDNS and GuestConfiguration are advertised to clients as guest network
 	// metadata. GuestConfiguration defaults to "mac-derived": the base image is
@@ -228,6 +238,18 @@ func New(cfg Config) (*Backend, error) {
 	}
 	if cfg.MaxTotalMemMiB == 0 || cfg.MaxTotalVCPU == 0 || cfg.UnitMemLimitMiB == 0 {
 		return nil, errors.New("MaxTotalMemMiB, MaxTotalVCPU and UnitMemLimitMiB are required admission policy")
+	}
+	if err := vmhelper.ValidatePrefix(cfg.GuestPrefix); err != nil {
+		return nil, fmt.Errorf("GuestPrefix is required: %w", err)
+	}
+	if cfg.PoolConf != "" {
+		pool, err := vmhelper.ReadPool(cfg.PoolConf)
+		if err != nil {
+			return nil, fmt.Errorf("pool configuration: %w", err)
+		}
+		if pool.Prefix != cfg.GuestPrefix || cfg.MaxVMs > pool.MaxSlots {
+			return nil, fmt.Errorf("pool file (%s, %d slots) disagrees with backend policy (%s, %d VMs)", pool.Prefix, pool.MaxSlots, cfg.GuestPrefix, cfg.MaxVMs)
+		}
 	}
 	if cfg.VMMOverheadMiB == 0 {
 		cfg.VMMOverheadMiB = 64
@@ -420,9 +442,13 @@ func (b *Backend) profile(name string) (vmlib.Profile, bool) {
 	return vmlib.Profile{}, false
 }
 
-func slotIP(slot int) string  { return fmt.Sprintf("172.17.%d.2", slot) }
-func slotGW(slot int) string  { return fmt.Sprintf("172.17.%d.1", slot) }
-func slotMAC(slot int) string { return fmt.Sprintf("06:00:AC:11:%02X:02", slot) }
+func (b *Backend) slotIP(slot int) string { return fmt.Sprintf("%s.%d.2", b.cfg.GuestPrefix, slot) }
+func (b *Backend) slotGW(slot int) string { return fmt.Sprintf("%s.%d.1", b.cfg.GuestPrefix, slot) }
+func (b *Backend) slotMAC(slot int) string {
+	var a, c int
+	fmt.Sscanf(b.cfg.GuestPrefix, "%d.%d", &a, &c)
+	return fmt.Sprintf("06:00:%02X:%02X:%02X:02", a, c, slot)
+}
 func slotTap(slot int) string { return fmt.Sprintf("tap-vm%d", slot) }
 
 // host maps internal states to the contract: retention is a FLAG over the real
@@ -435,9 +461,9 @@ func (b *Backend) host(m meta) vmlib.HostVM {
 	case stateLaunching, stateConfiguring:
 		state = vmlib.HostRunning // a VMM may exist; shutdown is identity-checked
 	}
-	return vmlib.HostVM{ID: m.ID, ImageID: m.ImageID, Profile: m.Profile, State: state, GuestIP: slotIP(m.Slot),
+	return vmlib.HostVM{ID: m.ID, ImageID: m.ImageID, Profile: m.Profile, State: state, GuestIP: b.slotIP(m.Slot),
 		Retained: m.Retained, RetainedReason: m.Reason,
-		Guest: &vmlib.GuestNetwork{Address: slotIP(m.Slot) + "/30", Gateway: slotGW(m.Slot),
+		Guest: &vmlib.GuestNetwork{Address: b.slotIP(m.Slot) + "/30", Gateway: b.slotGW(m.Slot),
 			DNS: append([]string(nil), b.cfg.GuestDNS...), Configuration: b.cfg.GuestConfiguration}}
 }
 
@@ -786,7 +812,7 @@ func (b *Backend) Start(ctx context.Context, id string) (vmlib.HostVM, error) {
 		return b.host(e.m), err
 	}
 	spec := MachineSpec{VCPU: prof.VCPU, MemMiB: prof.MemMiB, Kernel: "/kernel/vmlinux", BootArgs: "console=ttyS0 reboot=k panic=1 pci=off",
-		DiskJailPath: "/work/vms/" + id + "/disk.ext4", Tap: slotTap(e.m.Slot), MAC: slotMAC(e.m.Slot)}
+		DiskJailPath: "/work/vms/" + id + "/disk.ext4", Tap: slotTap(e.m.Slot), MAC: b.slotMAC(e.m.Slot)}
 	if err := b.cfg.VMM.Configure(dctx, e.m.Slot, spec); err != nil {
 		e.m.Reason = "VMM configuration failed; disk retained: " + err.Error()
 		_ = b.persist(&e.m)
