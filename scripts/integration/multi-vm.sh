@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # OPERATOR-RUN real multi-VM verification. NOT part of `make check`, and it has
-# not been executed by the author of this change. It talks to a running vmd
+# been exercised on the reference host (docs/verification-live.md). It talks to a running vmd
 # facade over mTLS and to guests through your ProxyJump bastion; it never uses
 # sudo or systemctl.
 #
@@ -93,7 +93,9 @@ for v in "${vms[1]}" "${vms[2]}"; do
   wait_ssh "$v"
   [[ $(guest "$v" cat /root/it-marker) == "$run" ]] || { echo "FAIL: marker missing in $v" >&2; exit 1; }
 done
-ips=$(for v in "${vms[1]}" "${vms[2]}"; do vmctl ssh-info "$v" | grep '"Host"'; done | sort -u | wc -l)
+ips=$(for v in "${vms[1]}" "${vms[2]}"; do
+  vmctl ssh-info "$v" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Host"])'
+done | sort -u | wc -l)
 [[ $ips -eq 2 ]] || { echo "FAIL: VMs share an address" >&2; exit 1; }
 echo "== 5. breakage on one VM must not affect the other"
 mutate "${vms[1]}" "rm -f /root/it-marker && echo broken > /root/only-a && sync" FC_BREAKAGE_PLAYBOOK

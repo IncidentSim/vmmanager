@@ -54,7 +54,7 @@ case $cmd in
     ip=$(cat "$S/ip.$id")
     if [[ $fmt == ssh ]]; then echo "-J jump@bastion.example.test -p 22 root@$ip";
     elif [[ $fmt == ansible ]]; then echo "$id ansible_host=$ip"
-    else echo "  \"Host\": \"$ip\","; fi ;;
+    else printf '{\n  "Host": "%s",\n  "Bastion": {\n    "Host": "bastion.example.test"\n  }\n}\n' "$ip"; fi ;;
   *) echo "unexpected $cmd" >&2; exit 2 ;;
 esac
 '''
