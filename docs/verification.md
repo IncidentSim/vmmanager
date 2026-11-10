@@ -13,15 +13,24 @@ fails if committed code differs).
 | mTLS | real loopback gRPC with ephemeral PKI: valid; no client cert; client cert from wrong CA; server from wrong CA; hostname mismatch; constructors fail closed |
 | Remote backend/facade | error mapping to sentinels, ID/path/key rejection before the backend is called, local / facade-over-remote-backend / combined composition, separate trust domains |
 | Local backend | slot-derived resources, admission cap, symlink/oversize/profile rejection, replacement-VMM identity refusal, original-receipt requirement, no-replace publication, release only with proof, restart reconciliation fails closed, corrupt metadata blocks admission - through fake launcher/VMM seams |
-| Helper | exact verb/argument validation with a recording fake `systemctl` |
+| Ownership and recovery | second owner over the same / overlapping / symlinked roots rejected; close and reopen reconcile; restart + Stop/Commit/Delete use identity-checked shutdown; unknown identity fails closed; ambiguous launcher failure keeps lease and slot; stale Release cannot delete a re-created workspace (deterministic hook test) |
+| Data races | concurrent Get/List/SSHInfo against Stop/Commit/Delete with a delayed receipt under `-race` |
+| Durability, admission | marker-before-image publication, classification survives restart, aggregate memory/vCPU caps, profile vs unit-limit, storage-mount guard before any write |
+| Privilege boundary | one-line protocol validation, pool.conf parsing, idle-unit-only handler (fake `systemctl`), client refusal of anything but `start-slot N` |
+| Network script | collision logic against canned `ip` output: covering/more-specific routes, interface addresses, other slots, default route, bad pool/slot input, root requirement |
+| Units | static contracts (no network exec in the jail, Requires/After network unit, Assert*/RequiresMountsFor storage guard, socket mode/group) and `make verify-units` (real `systemd-analyze verify` on rendered copies) |
+| Integration script | offline sequence/admission test with fake `vmctl`/`ssh`: source is deleted before descendants under `max_vms=2` |
 | `vmd` | config validation; combined mode wiring over real mTLS with fake seams |
 
 ## NOT proven by `make check`
 
 * That a real Firecracker VM boots from a published image, that TAP/NAT work,
   that SSH through `ProxyJump` works, or that `SendCtrlAltDel` ends a real guest.
-* `firecracker-vm@.service`, `fc-vm-network.sh` and `cmd/vm-launcher` on a real
-  systemd host (only `vm-launcher`'s Go logic and the helper script are unit-tested).
+* The units, `fc-vm-network.sh` and the helper on a real systemd host.
+  `systemd-analyze verify` checks syntax and dependency wiring only; it does not run
+  the jail, the `Requires=`/`After=` start/stop order, `AssertPathIsMountPoint`, the
+  socket activation or the network script against a real kernel.
+* That the guest base honours `Guest.Configuration` (MAC-derived address) in practice.
 * Real cgroup budget enforcement and the shared 20 GiB storage bound.
 * The privilege path by which `vmd` may invoke the helper (operator-defined).
 * Multi-tenant isolation (a non-goal) or host-key pinning.

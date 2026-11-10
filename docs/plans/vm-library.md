@@ -59,3 +59,11 @@ docs/                                     architecture, ssh, migration, verifica
 
 Deployment-dependent checks stay open until the operator installs the proposed
 units and runs the integration script.
+
+## Post-review fixes (second pass)
+
+Module renamed to `github.com/petruekhin/vibe-firecracker`; Service race fixes and
+facade contract; local backend ownership/retention/launch-intent/ABA/durability/
+admission/mount guard; socket-activated helper, split networking, operator-chosen
+pool, collision checks, real `systemd-analyze verify`; guest network metadata and
+readiness semantics; integration-script sequencing. See the ADR amendments.

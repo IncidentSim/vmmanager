@@ -16,6 +16,8 @@ Plan: [`plans/vm-library.md`](plans/vm-library.md).
 | `cmd/vmd` | daemon: backend-only, facade-only or combined | host |
 | `cmd/vmctl` | facade CLI client (JSON, `ssh`/Ansible output) | no |
 | `cmd/vm-launcher` | per-slot launcher + receipt writer (proposed, runs in jail) | host |
+| `cmd/vm-helper`, `cmd/vm-helper-client` | root side / unprivileged side of the one-request `start-slot N` boundary (proposed) | host |
+| `internal/vmhelper` | protocol, strict `pool.conf` parsing, idle-unit-only handler | no |
 | `examples/pgprovision` | PostgreSQL provisioning as an application over `Lifecycle` | no |
 
 The legacy CLI (`package main`) and `internal/remote` HTTPS build manager are unchanged.
@@ -60,6 +62,10 @@ written once for local, remote-backend and remote-facade composition.
 * Anything uncertain (shutdown, identity, configuration, restart) sets
   `retained` on the VM and keeps the lease; `Delete` then returns
   `vmlib.ErrRetained`. Check `VM.Retained` / `RetainedReason`.
+* A local backend owns its roots exclusively until `Close()`; `Close` never stops VMs.
+  A second backend over the same (or overlapping/symlinked) roots fails at `New`.
+* `Create` over the facade takes a client-allocated ID; after a failed or lost
+  response, `Get`/`Delete` that ID. `VM.Retained` is a flag over the lifecycle state.
 * `WaitSSHReady` uses a prober. The default dials TCP, which only works where the
   host-private guest IP is routable (on the host). A remote client should pass
   `vmlib.WithSSHProber` that goes through its bastion (e.g. `ssh -J ... true`).

@@ -139,10 +139,14 @@ process state.
   externally installed launcher/service contract (new template unit
   `firecracker-vm@.service` driven by a new narrow privileged helper; see below).
   Separate processes are inherent and differ from the legacy per-build self-exec.
-* Per-slot unique socket directory, TAP (`tap-vmN`), IP (`172.17.N.2` in a
-  host-private /30), MAC (`06:00:AC:11:NN:02`, which the CI Ubuntu rootfs maps to
-  that IP) and jail disk path, all derived from a server-allocated slot number,
-  never from user input.
+* Per-slot unique socket directory, TAP (`tap-vmN`), a /30 inside an
+  **operator-chosen** pool (`PREFIX.N.0/30`, guest `.2`, from the root-owned
+  `/etc/firecracker-vms/pool.conf`, never Docker's `172.17/16`), MAC
+  (`06:00:A:B:N:02`, which the CI Ubuntu rootfs maps to that IP) and jail disk
+  path, all derived from a server-allocated slot number, never from user input.
+  The network script refuses any existing non-default route or interface address
+  overlapping the slot /30, and `vmd` refuses to start if its config disagrees
+  with the pool file.
 * The lease spans configuration, guest lifetime, exit proof and publication or
   deletion. A responding socket does **not** prove an old VMM exited; only the
   invocation-ID receipt does (same scheme as `cmd/service-launcher`).
@@ -159,19 +163,25 @@ process state.
 * No SIGKILL fallback. No normal library or CLI path reaches arbitrary host
   services.
 
-### 6. Privileged helper (proposed, narrow)
+### 6. Privileged boundary (proposed, narrow)
 
-A new root helper (separate from the legacy launcher and the active
-`firecracker-builder@main.service`) with **one fixed operation**:
-`start-slot N` (starts systemd instance `firecracker-vm@N`), where `N` is a
-bounded decimal. There is intentionally no stop, restart or release verb: a guest
-ends by graceful shutdown and the library waits for the launcher's exit receipt,
-so no kill path exists. It accepts no paths, commands, interface names or IPs and
-refuses a slot whose unit is not `inactive`/`failed`. TAP/route/NAT setup runs
-from the unit (`fc-vm-network up|down N`), is derived from `N` alone, and refuses
-to touch an interface it did not create (no blind deletion). Delivered as **source templates/scripts only**; operator approval is
-required to install or activate. Nothing here runs sudo or systemctl. The
-legacy CLI is **never** turned into a root systemctl caller.
+The only privileged request is `start-slot N`. It is carried over a
+**socket-activated, group-restricted unix socket** (`fc-vm-helper.socket`,
+`root:<group> 0660`, `Accept=yes`): the unprivileged `vmd` runs
+`vm-helper-client start-slot N`, systemd starts one `cmd/vm-helper` (root) per
+connection, which validates a single 63-byte line, requires `N < MAX_SLOTS` from
+`pool.conf`, and starts `firecracker-vm@N.service` only if its ActiveState is
+`inactive`/`failed`. There is no stop, restart, kill, path, unit-name, interface
+or command verb, no sudoers/polkit rule and no blanket systemctl right; a
+root-owned script alone cannot elevate, so the socket's owner/group/mode is the
+authorization boundary and is delivered as a reviewable unit file. Delivered as
+**source templates only**; operator approval is required to install or activate.
+
+`RootDirectory=` applies to every `Exec*` line of the VMM unit, so networking is
+**not** run from that unit. TAP/NAT is a separate host-root oneshot,
+`firecracker-vm-network@N.service` (`Requires=`/`After=` from the VMM unit, hence
+stopped after it and after its exit receipt), and the jail contains no
+shell/ip/iptables. Nothing in the library runs sudo or systemctl.
 
 The new multi-VM deployment is **separate** from the active legacy service:
 different unit names, runtime directory (`/run/firecracker-vms`), socket
@@ -283,3 +293,54 @@ restarting the active legacy VMM service.
 All new code is additive. Remove the new units/helper (operator action) and stop
 `vmd`; the legacy `firecracker-builder@main.service`, CLI and HTTPS build API
 are unchanged and remain the fallback.
+
+## Amendments after independent review (2026-11)
+
+* **Ownership.** A local `Backend` takes exclusive non-blocking `flock`s on a lock
+  file in each of WorkRoot, RunDir and ImagesDir (canonical paths; overlapping
+  roots are rejected) for its whole lifetime. A second owner of the same roots
+  fails at `New`, so slots/IPs cannot be double-allocated. Lock files are never
+  unlinked. `Close()` is explicit and idempotent, releases the locks only and
+  never stops a VM or removes state; operations after `Close` fail.
+* **Retention is a flag.** `HostVM.Retained` is orthogonal to the lifecycle state
+  (`prepared|running|exiting|exited`). A restarted or uncertain VM with a recorded
+  invocation id is asked to shut down (identity-checked, never a replacement);
+  with an unknown invocation the backend refuses to signal anything and refuses
+  to release.
+* **Launch intent is durable.** `Start` persists "launching, retained" before the
+  helper runs and then runs to completion regardless of the caller's context (a
+  cancelled helper can lose its acknowledgement). After an ambiguous failure the
+  lease, slot and disk are kept; the operator procedure is in
+  `deployment/multivm/README.md`.
+* **No stale deletes.** Workspace entries carry a tombstone checked under the
+  entry lock; a delayed `Release` that looked up an old entry reports "already
+  released" and never touches a workspace re-created under the same ID.
+* **Durability.** Metadata, workspace creation, image publication and the launcher's
+  receipt fsync their containing directories. The "committed" classification
+  marker is made durable before the image appears and its failure publishes
+  nothing.
+* **Admission is explicit policy, not the slice.** `max_vms`, `max_total_mem_mib`,
+  `max_total_vcpu` and per-profile `mem + vmm_overhead <= unit_mem_limit` are
+  enforced under the table lock and counted for retained VMs too. The instances
+  share the legacy `system-firecracker\x2dbuilder.slice` (2 GiB / 1 CPU), which is
+  a ceiling that kills on overrun, not admission; the policy must be set inside it
+  and the legacy VMM's budget share.
+* **Storage guard.** `storage_mount` must be a real mount point and the work and
+  images roots must be on that device; checked before anything is written. The
+  unit repeats the guard with `AssertPathIsMountPoint`/`RequiresMountsFor`.
+* **Facade contract.** The client allocates VM IDs so a lost or ambiguous `Create`
+  response can always be reconciled; errors carry machine-readable metadata (VM id,
+  retained flag, delete result). `ssh_key_reference` is a first-class non-secret
+  field. A server-side operation timeout lets a retained result reach a client
+  with a longer deadline.
+* **Guest network metadata.** `HostVM`/`SSHInfo` carry `GuestNetwork` (address,
+  gateway, DNS, and whether the base derives its address from the MAC or is
+  configured externally). The supported base contract is documented in
+  `docs/ssh-automation.md`; PostgreSQL stays outside the library.
+* **Readiness.** `Lifecycle.WaitSSHReady` exists on every implementation. "Ready"
+  means what the configured prober proves: the default TCP prober is port-open
+  only; `SSHCommandProber` proves an authenticated login through the bastion.
+* **Module path.** `github.com/petruekhin/vibe-firecracker`. A real `go get` works
+  only after publication; until then `make consumer-smoke` proves importability
+  through a local `replace`, and the portable clients cross-build for
+  darwin/windows.
