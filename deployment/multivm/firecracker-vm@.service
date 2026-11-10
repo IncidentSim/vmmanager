@@ -1,0 +1,67 @@
+# PROPOSED template (source only). Install only after operator review/approval.
+# One VMM process per slot N (firecracker-vm@N.service). Separate from the
+# active legacy firecracker-builder@main.service: different unit, runtime dir,
+# jail, TAP prefix (tap-vmN), address range (172.17.N.0/30) and receipts.
+# Replace @CLIENT_GROUP@ with the unprivileged vmd user's primary group.
+#
+# Slot instances share the legacy aggregate budget slice so 2 GiB / 1 CPU is not
+# silently multiplied; see deployment/resources.md and deployment/multivm/README.md.
+[Unit]
+Description=Isolated Firecracker VMM for VM slot %i
+ConditionPathExists=/dev/kvm
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+Slice=system-firecracker\x2dbuilder.slice
+User=root
+Group=@CLIENT_GROUP@
+UMask=0007
+RootDirectory=/var/lib/firecracker-vms/jail
+MountAPIVFS=no
+WorkingDirectory=/work
+RuntimeDirectory=firecracker-vms/slot-%i
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+BindReadOnlyPaths=/opt/firecracker-builder/firecracker:/bin/firecracker
+BindReadOnlyPaths=/opt/firecracker-builder/vmlinux:/kernel/vmlinux
+BindReadOnlyPaths=/usr/local/libexec/fc-vm-launcher
+BindPaths=/var/lib/firecracker-vms/work:/work
+BindPaths=/run/firecracker-vms/slot-%i:/run/slot
+BindPaths=/dev/kvm /dev/net/tun
+# TAP/NAT for this slot only; refuses existing interfaces/routes it did not create.
+ExecStartPre=+/usr/local/libexec/fc-vm-network up %i
+ExecStart=/usr/local/libexec/fc-vm-launcher run %i
+ExecStopPost=/usr/local/libexec/fc-vm-launcher record-exit %i
+ExecStopPost=+/usr/local/libexec/fc-vm-network down %i
+# A guest reboot/exit ends the VMM; the slot stays idle until the helper starts it again.
+Restart=no
+KillMode=control-group
+TimeoutStopSec=10
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+TemporaryFileSystem=/proc:ro /sys:ro
+InaccessiblePaths=/proc /sys
+ReadWritePaths=/work /run/slot
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/net/tun rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Per-instance cap (guest RAM + VMM overhead); the shared slice enforces the aggregate.
+MemoryMax=768M
+TasksMax=64
+LimitNOFILE=1024
+StandardOutput=journal
+StandardError=journal
