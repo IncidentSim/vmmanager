@@ -1,8 +1,11 @@
 # Ubuntu + PostgreSQL image builder
 
-The current transport is a local Unix socket only. A future remote controller
-over HTTPS/mTLS is deferred; it will also need server-side disk operations and
-guest access routing. No remote API listener is installed by this version.
+Local execution remains Unix-socket-only. An optional HTTPS/mTLS build manager
+runs that same local CLI as an unprivileged child, using server-owned paths.
+The portable remote client never accesses the VMM socket or runs host commands.
+No remote listener is enabled unless `-serve` is selected. For certificate issuance,
+user-service installation and the trust/resource boundaries, see
+[`deployment/remote.md`](deployment/remote.md).
 
 Linux x86_64 / KVM image builder. The unprivileged Go client boots a disposable
 Ubuntu ext4 disk, installs PostgreSQL **inside the guest** over SSH, requests a
@@ -78,6 +81,88 @@ Low-level `./image-builder -run-image /var/lib/firecracker-builder/work/NAME.ext
 boots that writable file directly. Paths outside the workspace, traversal and
 symlink components are rejected. Do not pass a valuable source image. The old
 `-kernel`, `-tap`, `-firecracker`, and `-console-log` flags have been removed.
+
+## Remote build manager (optional)
+
+An operator supplies a private CA, server certificate with the endpoint's DNS/IP
+SAN, and client-auth certificates. Keep private keys outside the repository.
+The manager requires TLS 1.3 and verified client certificates. The client verifies
+the CA and hostname; there is no insecure mode or plaintext fallback. Every
+client trusted by that CA may start, inspect, cancel and download every job:
+this is a trusted-user service, not per-user authorization or a public API.
+
+On the Linux builder host, as the normal unprivileged application user:
+
+```bash
+go build -o image-builder .
+./image-builder -serve -listen 0.0.0.0:19443 \
+  -tls-ca /secure/ca.pem -tls-cert /secure/server.pem -tls-key /secure/server.key \
+  -job-dir /home/amnezia/build-jobs \
+  -base assets/ubuntu-base.ext4 -ssh-key assets/id_ed25519 \
+  -socket /run/firecracker-builder/main.sock
+```
+
+`-listen` defaults to `0.0.0.0:19443`; all TLS files and `-job-dir` are required
+in server mode. Base, SSH key and socket retain their local defaults. Do not
+combine `-serve` with `-run-image`. The server spawns its own executable with
+only fixed `-base`, `-ssh-key`, `-socket`, and server-chosen `-output` arguments;
+requests cannot supply commands, paths, flags or guest configuration. The
+server does not start/restart the VMM, change networking, or call host systemctl.
+Firewalling, PKI issuance/rotation and process supervision remain operator tasks.
+
+On macOS or another client machine (standard library only, no KVM dependencies):
+
+```bash
+go build -o remote-client ./cmd/remote-client
+./remote-client -endpoint https://builder.example:19443 \
+  -tls-ca /secure/ca.pem -tls-cert /secure/client.pem -tls-key /secure/client.key
+# Add -output ./ubuntu-postgres.ext4 to download after success.
+# With the same endpoint/TLS flags, use -status JOB_ID or -cancel JOB_ID.
+# -status JOB_ID -output ./image.ext4 downloads an already-successful job.
+```
+
+By default the client starts one build, polls the bounded log tail every second,
+and reports that the result is retained server-side. Interrupting the client
+leaves the job running; use `-cancel` explicitly. Downloads stream to a private
+same-directory temporary file, verify the reported byte count and SHA256, sync,
+and atomically publish via a no-replace hard link. Existing files and symlinks
+are never overwritten. The destination filesystem must support hard links;
+a failure leaves no published partial image. Downloads are opt-in.
+
+API (all routes require mTLS):
+
+| Method / path | Behavior |
+| --- | --- |
+| `POST /v1/builds` with `{}` | Fixed PostgreSQL build, 202 with job status; 409 while busy |
+| `GET /v1/builds/ID` | Status: `id`, `state`, bounded `log`, optional `error`, `sha256`, `size` |
+| `GET /v1/builds/ID/image` | Successful completed image only; otherwise 409 |
+| `DELETE /v1/builds/ID` | Request graceful cancellation, 202; does not release the slot early |
+
+IDs are 32 lowercase hexadecimal characters. Unknown IDs return 404; malformed
+IDs/traversal, query strings, oversized bodies or nonempty build parameters are
+rejected. States are `running`, `cancelling`, `succeeded`, `failed`, `cancelled`.
+The latest 64 KiB of combined child stdout/stderr is held in memory. API job
+metadata/logs are in memory and do **not** survive a manager restart. Artifacts
+are retained in private job directories beneath `-job-dir`; no automatic disk
+retention/expiry policy is implemented. Protect that directory from untrusted
+local users and remove old artifacts manually only after confirming inactivity.
+
+Each job has a server-owned **30-minute execution deadline**. Cancellation,
+deadline or manager SIGTERM sends the child SIGTERM, letting its existing
+receipt-based cleanup finish. The manager never force-kills it or deletes a
+possibly active disk. A slot stays occupied until the child actually exits
+(and successful output hashing completes), so cleanup can exceed 30 minutes;
+this is not a strict VM/disk TTL or a promise of deletion at that instant.
+Shutdown also waits for the child; supervisors must not impose an unsafe
+SIGKILL timeout. If cleanup cannot prove a clean VMM exit, the existing local
+builder retains its working disk and reports the reason in the job log.
+
+Only one job/underlying VMM is supported. Aggregate **2 GiB RAM / 1 CPU / 20 GB
+disk** limits are not implemented here: they require an externally configured
+shared cgroup/systemd slice and filesystem quota covering the VMM, manager,
+work disks, staging copies and retained artifacts. Current VM configuration
+remains 2 vCPUs / 1024 MiB. A 30-minute strict multi-VM TTL and automatic safe
+artifact deletion would require additional lifecycle/quota work.
 
 ## Lifecycle and diagnostics
 

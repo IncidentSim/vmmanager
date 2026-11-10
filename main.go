@@ -34,10 +34,24 @@ func main() {
 	runImage := flag.String("run-image", "", "boot a writable disk inside /var/lib/firecracker-builder/work; supply a disposable copy")
 
 	socket := flag.String("socket", serviceSocket, "existing Firecracker API Unix socket (VMM must already be running)")
+	serve := flag.Bool("serve", false, "serve the fixed build operation over mutual TLS")
+	listen := flag.String("listen", "0.0.0.0:19443", "mTLS listener address")
+	tlsCA := flag.String("tls-ca", "", "trusted CA PEM file")
+	tlsCert := flag.String("tls-cert", "", "server certificate PEM file")
+	tlsKey := flag.String("tls-key", "", "server private key PEM file")
+	jobDir := flag.String("job-dir", "", "server-controlled artifact directory (required with -serve)")
 	flag.Parse()
 
 	var err error
-	if *runImage != "" {
+	if *serve {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		if *runImage != "" || flag.NArg() != 0 {
+			err = errors.New("-serve cannot be combined with -run-image or positional arguments")
+		} else {
+			err = serveBuilds(ctx, *listen, *tlsCA, *tlsCert, *tlsKey, *jobDir, *base, *key, *socket)
+		}
+	} else if *runImage != "" {
 		err = runServiceImage(*runImage, *socket)
 	} else {
 		err = build(*base, *key, *output, *socket)

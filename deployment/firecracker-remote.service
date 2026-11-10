@@ -1,0 +1,25 @@
+# User service: install as ~/.config/systemd/user/firecracker-remote.service.
+# Replace @HOME@ and @PROJECT@ with absolute paths. Does not control the VMM unit.
+[Unit]
+Description=Firecracker remote build manager (mandatory mutual TLS)
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=@PROJECT@
+ExecStart=@HOME@/firecracker-remote/image-builder -serve -listen 0.0.0.0:19443 -tls-ca @HOME@/firecracker-remote/pki/ca.crt -tls-cert @HOME@/firecracker-remote/pki/server.crt -tls-key @HOME@/firecracker-remote/pki/server.key -job-dir @HOME@/firecracker-remote/jobs -base @PROJECT@/assets/ubuntu-base.ext4 -ssh-key @PROJECT@/assets/id_ed25519 -socket /run/firecracker-builder/main.sock
+Environment=TMPDIR=@HOME@/firecracker-remote/tmp
+UMask=0077
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=90
+MemoryMax=512M
+TasksMax=128
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
