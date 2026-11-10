@@ -103,7 +103,7 @@ func TestControlDeleteImageTransientFailureRetriesWithNewKey(t *testing.T) {
 	}
 	// Owner still sees the image, with its deleting phase; it is not bootable.
 	got, ok := r.image(11, img)
-	if !ok || got.Phase != "deleting" || got.Shared {
+	if !ok || got.Phase != "deleting" || !got.Shared || !got.CanDelete {
 		t.Fatalf("owner visibility lost: %+v %v", got, ok)
 	}
 	if _, ok := r.image(22, img); ok {

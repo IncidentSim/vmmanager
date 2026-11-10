@@ -248,7 +248,7 @@ class UnitContractTests(unittest.TestCase):
                 self.assertNotIn("ask-exec", text, p.name)
 
     def test_example_config_is_consistent_with_units_and_pool(self):
-        cfg = json.loads((HERE / "vmd.example.json").read_text())["backend"]["local"]
+        cfg = json.loads((HERE.parent / "vmapi" / "backend.local.example.json").read_text())
         pool = dict(l.split("=") for l in (HERE / "pool.conf.example").read_text().splitlines() if l and not l.startswith("#"))
         self.assertEqual(cfg["guest_prefix"], pool["GUEST_PREFIX"])
         self.assertLessEqual(cfg["max_vms"], int(pool["MAX_SLOTS"]))

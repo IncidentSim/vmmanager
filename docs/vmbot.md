@@ -3,7 +3,7 @@
 Decisions: [ADR 0002](adr/0002-telegram-single-vm-bot.md) (base design) and
 [ADR 0003](adr/0003-vmbot-multi-vm.md) (several VMs, state v2, per-VM isolation;
 it supersedes every "exactly one VM" statement below and in ADR 0002). `vmbot` is an ordinary
-mTLS client of the `vmd` facade (`remote.DialFacade`); it does not change daemon
+legacy direct client of the since-removed `vmd` facade (historical; the bot is now an HTTP-only API client, see `bot-api-client.md`); it does not change daemon
 policy and does not touch the legacy builder or the multi-VM deployment.
 
 The multi-VM/DBOS variant is not activated as the production bot. Its controller,

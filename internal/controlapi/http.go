@@ -422,7 +422,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) publicImages(u int64) []map[string]any {
 	out := []map[string]any{}
 	for _, i := range s.ctl.ControlImages(u) {
-		out = append(out, map[string]any{"id": i.ID, "name": i.Name, "shared": i.Shared})
+		// shared: visible to every admitted user. can_delete: permission only
+		// (creator, not a system image); delete may still be refused with 409.
+		out = append(out, map[string]any{"id": i.ID, "name": i.Name, "shared": i.Shared, "phase": i.Phase, "can_delete": i.CanDelete})
 	}
 	return out
 }

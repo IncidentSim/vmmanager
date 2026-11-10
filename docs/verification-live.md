@@ -1,5 +1,10 @@
 # Reference deployment: real multi-VM verification
 
+> Historical evidence for the pre-ADR-0007 `vmd`/gRPC deployment, not proof that
+> the embedded-backend HTTP migration has been deployed. References to active
+> listeners/services below describe the run recorded here, not current status.
+> The migration needs its own parent/operator live acceptance report.
+
 Date: 2026-11-10. Firecracker 1.18.0, Linux x86_64 with KVM, Ubuntu 24.04 guest.
 This is actual host execution, separate from root/KVM-free `make check`.
 

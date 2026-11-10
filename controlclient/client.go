@@ -34,7 +34,13 @@ type VM struct {
 type Image struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
-	Shared bool   `json:"shared"`
+	// Shared: visible and bootable by every admitted user (common registry).
+	Shared bool `json:"shared"`
+	// Phase is ready or deleting (a deleting image is not bootable).
+	Phase string `json:"phase,omitempty"`
+	// CanDelete is the caller's permission (creator, not a system image), not a
+	// guarantee that no VM references the image; delete may still return 409.
+	CanDelete bool `json:"can_delete"`
 }
 type Profile struct {
 	Name      string `json:"name"`

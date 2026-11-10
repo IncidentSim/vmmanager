@@ -4,9 +4,10 @@
 owner of application state: users/quota, VM and image ownership, DBOS workflows,
 the state-directory lifetime lock, and terminal projections. The Telegram
 frontend (`cmd/vmbot`, see `bot-api-client.md`) is a separate HTTP-only client
-and has **no** direct facade/gRPC fallback: if the API is down, the bot reports
-an error and does nothing else. The API reuses the existing `vmlib` facade
-(`vmd`, mTLS gRPC, Firecracker); backend additions are in
+and has **no** direct VM fallback: if the API is down, the bot reports
+an error and does nothing else. The API embeds `vmlib.Service` over
+`vmlib/local.Backend` in-process (Firecracker via the host helper); there is no
+VM gRPC plane or `vmd`. Backend additions and the private `backend` policy are in
 `control-api-backend.md`. Rationale: `adr/0005-control-api.md`. Machine-readable
 schema: `control-api-openapi.yaml`.
 
@@ -28,7 +29,7 @@ Strict JSON (unknown/duplicate-trailing data rejected, max 128 KiB); one flag,
 | `max_vms` (default 2), `max_vms_per_user` (default 1) | positive quotas. The backend capacity stays the final authority. |
 | `default_profile` (default `small`) | used when a Create omits `resources`. |
 | `credentials[]` | each `{"token_file":path}` (0600 regular file, ≤4 KiB, one token, no whitespace) or `{"sha256":hex}`; plus either `"user_id":N` (ordinary user bearer) or `"service":true` (delegated bot connector). Digests are compared in constant time; tokens are never logged. |
-| `facade.*` | `addr`, `server_name`, `ca_file`, `cert_file`, `key_file` for the mTLS facade connection. |
+| `backend` | required private local-backend policy: exactly the object formerly at `vmd` `backend.local` (roots, helper, profiles, aggregate caps, storage mount, guest pool, bastion). A leftover `facade` section is rejected. Mapping and handoff: `control-api-backend.md`. |
 | `terminal.*` | optional. Empty `public_origin` disables terminals (Terminal operations then fail `unavailable`). Plaintext listener only on loopback; `max_clients*max_vms ≤ 64`. |
 
 ## Authentication and authorization
@@ -128,8 +129,8 @@ operation is checked independently of whether its VM still exists).
   with `invalid_argument` or `capacity`; the VM record stays occupied until the
   caller issues an explicit Delete. Disk size is separate and is not resized.
 * **`/v1/capabilities` is a live forward of backend policy.** Each request calls
-  the facade `GetCapabilities` RPC (backend `Capabilities` → `vmlib.Service` →
-  facade gRPC/mTLS → API); nothing is cached or hardcoded. `profiles` lists the
+  `vmlib.Service.Capabilities` (backend `Capabilities` → `vmlib.Service` → API,
+  in-process); nothing is cached or hardcoded. `profiles` lists the
   backend's advertised profiles (`vcpu`, `memory_mib`, `disk_mib`), which also
   define the per-VM maxima for explicit `resources`. `max_total_memory_mib` and
   `max_total_vcpu` are the backend aggregate caps and are **omitted** when the
@@ -247,12 +248,12 @@ state directory at once; the lifetime lock enforces that for vmapi/legacy.
 Passing tests (root/KVM-free) include: real HTTP server + real DBOS SQLite with
 fake backend effects (idempotency replay/conflict, foreign IDs, quota, terminal
 fences, crash/kill recovery, caller disconnect), v1/v2 migration, public client
-against the actual handler, and an **executable smoke** that builds and runs
-the real `vmapi` binary over real mTLS to a facade whose backend is the
-in-memory `vmlibtest` fake: health/auth, create with resources, poll, SSH,
+against the actual handler, and an **executable smoke** that runs the real
+`vmapi` `run()` in-process with the in-memory `vmlibtest` fake injected through a
+test-only opener seam (the deployed binary only contains the real local backend): health/auth, create with resources, poll, SSH,
 cold commit, delete, create from the derived image, image protection, delete
 image, restart. **Not covered:** Firecracker/KVM, real guest boot or SSH login,
-real ttyd/ssh terminals (unit-tested with fakes only), a live backend daemon,
+real ttyd/ssh terminals (unit-tested with fakes only), a live local backend (host helper/systemd),
 production data, live Telegram.
 
 ```sh

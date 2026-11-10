@@ -10,7 +10,7 @@ BUILD_DIR ?= .
 IMAGE ?= images/ubuntu-postgres.ext4
 FC_SOCKET ?= /run/firecracker-builder/main.sock
 
-.PHONY: build remote-client test vet check shell-syntax run verify demo proto proto-check consumer-smoke verify-units vmd vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi control-build control-smoke
+.PHONY: build remote-client test vet check shell-syntax run verify demo consumer-smoke verify-units vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi control-build control-smoke no-grpc-check
 
 build:
 	mkdir -p "$(BUILD_DIR)"
@@ -22,7 +22,7 @@ remote-client:
 
 test:
 	$(GO) test -race -cover -timeout 3m ./...
-	$(PYTHON) -m unittest -v test_verify_image.py test_project_layout.py deployment/test_mtls.py deployment/multivm/test_deploy.py scripts/integration/test_multi_vm.py
+	$(PYTHON) -m unittest -v test_verify_image.py test_project_layout.py deployment/test_mtls.py deployment/multivm/test_deploy.py scripts/integration/test_multi_vm.py scripts/test_no_grpc.py
 
 vet:
 	$(GO) vet ./...
@@ -31,7 +31,7 @@ shell-syntax:
 	@for script in scripts/*.sh scripts/integration/*.sh deployment/*.sh deployment/multivm/*.sh; do bash -n "$$script" || exit; done
 
 # New multi-VM applications (build only; no install, no sudo).
-vmd vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi:
+vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi:
 	mkdir -p "$(BUILD_DIR)"
 	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/$@" ./cmd/$@
 
@@ -40,18 +40,18 @@ vmd vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi:
 control-build:
 	$(GO) build ./cmd/vmapi ./cmd/vmbot
 
-# Executable smoke: builds and runs the REAL vmapi process against an in-memory
-# vmlibtest fake behind a real mTLS facade, driven by the public controlclient.
-# No Firecracker/KVM/root/network beyond loopback. Included in `test` already;
-# kept as an explicit, fast, focused target.
+# Executable smoke: runs the REAL vmapi run() entry point in-process against an
+# in-memory vmlibtest fake injected through the backendOpener test seam, driven by
+# the public controlclient. No Firecracker/KVM/root/network beyond loopback. The
+# deployed binary only contains the real local backend. Included in `test`
+# already; kept as an explicit, fast, focused target.
 control-smoke:
-	$(GO) test -count=1 -timeout 3m -run 'TestExecutableControlFlow|TestRecoveryFailureKeepsServingDegraded' ./cmd/vmapi
+	$(GO) test -count=1 -timeout 3m -run 'TestExecutableControlFlow|TestExecutableJWTAndComposedHTTPSGateway|TestRecoveryFailureKeepsServingDegraded' ./cmd/vmapi
 
-proto:
-	bash scripts/gen-proto.sh
-
-proto-check:
-	bash scripts/gen-proto.sh --check
+# The VM plane has no RPC transport: no application package may import
+# gRPC/protobuf, and the API/CLI binaries must not link them.
+no-grpc-check:
+	bash scripts/no-grpc-check.sh
 
 consumer-smoke:
 	bash scripts/consumer-smoke.sh
@@ -60,7 +60,7 @@ consumer-smoke:
 verify-units:
 	bash scripts/verify-units.sh
 
-check: test vet shell-syntax control-build proto-check consumer-smoke verify-units
+check: test vet shell-syntax control-build no-grpc-check consumer-smoke verify-units
 
 # Runtime helpers expect image-builder in the repository root.
 # These targets use the existing external VMM; no host-service management.

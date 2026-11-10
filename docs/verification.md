@@ -4,28 +4,28 @@
 
 `make check` runs `go test -race -cover ./...`, the Python unit tests (legacy
 verifier/layout/mTLS, `deployment/multivm/test_deploy.py` and the offline integration-script tests), `go vet`, `bash -n`
-on all scripts, and `make proto-check` (regenerates protobuf with pinned tools and
-fails if committed code differs).
+on all scripts, `make no-grpc-check` (no application imports of gRPC/protobuf, no
+removed gRPC tree) and the external-consumer/cross-build smoke.
 
 | Area | Evidence (all with FAKES or loopback, never a real VM) |
 |---|---|
 | Facade `vmlib.Service` | external-package tests: create/start, SSH metadata, idempotent/concurrent stop+delete, commit, no overwrite, cap and unique-IP races, cancellation, retained disks, no publish without receipt |
-| mTLS | real loopback gRPC with ephemeral PKI: valid; no client cert; client cert from wrong CA; server from wrong CA; hostname mismatch; constructors fail closed |
-| Remote backend/facade | error mapping to sentinels, ID/path/key rejection before the backend is called, local / facade-over-remote-backend / combined composition, separate trust domains |
+| HTTP API auth and client | real HTTP handler + `controlclient`: bearer/JWT negatives, username binding, loopback-only plaintext, `vmctl` token-file permission/argv/leak checks and non-loopback plaintext refusal (the removed gRPC mTLS negatives have no VM transport to apply to; builder HTTP/mTLS tests are unchanged) |
+| Embedded local backend | `vmlib.Service` directly over the real local backend (fake launcher/VMM only), dynamic resources, image-reference guards |
 | Local backend | slot-derived resources, admission cap, symlink/oversize/profile rejection, replacement-VMM identity refusal, original-receipt requirement, no-replace publication, release only with proof, restart reconciliation fails closed, corrupt metadata blocks admission - through fake launcher/VMM seams |
 | Ownership and recovery | second owner over the same / overlapping / symlinked roots rejected; close and reopen reconcile; restart + Stop/Commit/Delete use identity-checked shutdown; unknown identity fails closed; ambiguous launcher failure keeps lease and slot; stale Release cannot delete a re-created workspace (deterministic hook test) |
 | Close lifecycle | a blocking `CopyFile` held across `Close` (second owner refused until drained, late failure cleanup cannot touch the new owner's workspace), a concurrent Close/Prepare/Start/Publish/Release stress with a byte-exact tree fingerprint after Close returns, `WaitExit` released by Close |
 | Receipt trust | writable runtime parent/ancestor, untrusted owner (test seam), missing/symlink/world-writable/directory run lock, unsafe existing slot dirs, forged receipts (symlinked slot dir, symlinked receipt, group/world-writable receipt or slot dir, receipt as a directory) refused by WaitExit/Release/Publish; owner/mode rules over synthetic `stat` data (chown is not possible unprivileged) |
 | Reservations, publish | profile edits across a restart (memory and vCPU) and legacy/unknown-profile metadata counted conservatively; two publishers of one target with a deterministic hook, marker survives, classification survives reopen |
 | Stale reads | a parked `Get` raced against Stop/Commit/Delete and several parked readers, under `-race` |
-| Shipped policy | the real `vmd.example.json` through the real parser and backend admits two guests and refuses a third; the offline integration test derives its cap from the same file |
+| Shipped policy | the real `deployment/vmapi/backend.local.example.json` through the real `internal/localcfg` parser and backend admits two guests and refuses a third; the offline integration test derives its cap from the same file |
 | Data races | concurrent Get/List/SSHInfo against Stop/Commit/Delete with a delayed receipt under `-race` |
 | Durability, admission | marker-before-image publication, classification survives restart, aggregate memory/vCPU caps, profile vs unit-limit, storage-mount guard before any write |
 | Privilege boundary | one-line protocol validation, pool.conf parsing, idle-unit-only handler (fake `systemctl`), client refusal of anything but `start-slot N` |
 | Network script | collision logic against canned `ip` output: covering/more-specific routes, interface addresses, other slots, default route, bad pool/slot input, root requirement |
 | Units | static contracts (no network exec in the jail, Requires/After network unit, Assert*/RequiresMountsFor storage guard, socket mode/group) and `make verify-units` (real `systemd-analyze verify` on rendered copies) |
-| Integration script | offline sequence/admission test with fake `vmctl`/`ssh`: source is deleted before descendants under `max_vms=2` |
-| `vmd` | config validation; combined mode wiring over real mTLS with fake seams |
+| Integration script | offline sequence/admission test with fake HTTP `vmctl`/`ssh`: source is deleted before descendants under `max_vms=2` |
+| `vmapi` backend config | strict `backend` loading, stale `facade` rejection, `localcfg` validation and assembly of every policy field; in-process start/stop/restart with lifetime release counted |
 
 ## NOT proven by `make check`
 
@@ -40,18 +40,17 @@ fails if committed code differs).
   sub-directories (modes/owners) and `systemd-tmpfiles` are not exercised.
 * That the guest base honours `Guest.Configuration` (MAC-derived address) in practice.
 * Real cgroup budget enforcement and the shared 20 GiB storage bound.
-* The privilege path by which `vmd` may invoke the helper (operator-defined).
+* The privilege path by which `vmapi` may invoke the helper (operator-defined).
 * Multi-tenant isolation (a non-goal) or host-key pinning.
 
 ## Operator-run integration (requires approval)
 
-After the operator installs the proposed units/helper and starts `vmd`:
+After the operator installs the proposed units/helper and starts `vmapi` (stop any old `vmd` first):
 
 ```sh
 FC_INTEGRATION_CONFIRM=yes-run-on-real-host \
-FC_ADDR=vmd.example.com:19450 FC_SERVER_NAME=vmd.example.com \
-FC_CA=ca.crt FC_CERT=client.crt FC_KEY=client.key \
-FC_BASE_IMAGE_ID=ubuntu-base FC_PROFILE=small FC_SSH_KEY=$HOME/.ssh/id_ed25519 \
+FC_URL=https://api.example.com:8443 FC_TOKEN_FILE=$HOME/.config/vmctl/token \
+FC_BASE_IMAGE_ID=ubuntu-base FC_SSH_KEY=$HOME/.ssh/id_ed25519 \
 FC_BASE_IMAGE_PATH=/var/lib/firecracker-vms/images/ubuntu-base.ext4 \
 bash scripts/integration/multi-vm.sh
 ```
@@ -59,10 +58,15 @@ bash scripts/integration/multi-vm.sh
 It checks: boot -> SSH -> external mutation -> stop -> commit new image ->
 overwrite refused -> two independent VMs -> persisted marker in both -> breakage
 in one does not affect the other -> distinct addresses -> base hash unchanged.
-The real scenario has passed on the reference deployment. See
-[live verification report](verification-live.md) for the exercised configuration,
-evidence, deployment-discovered fixes and remaining boundaries. Other deployments
-still need their own run.
+The same lifecycle scenario passed on the historical gRPC reference deployment;
+that is not a live test of this rewritten HTTP harness or embedded backend. See
+[live verification report](verification-live.md) for the historical configuration,
+evidence and deployment-discovered fixes. The HTTP migration and every other
+deployment still need their own live run. This two-descendant script requires
+`max_vms_per_user >= 2` and two free global/backend slots for its principal; do not
+raise production policy or remove another user's VM just to run it. With the
+one-VM-per-user policy, use the sequential migration acceptance described in
+[deployment/multivm/README.md](../deployment/multivm/README.md).
 
 ## Also verify on the host before trusting resource limits
 

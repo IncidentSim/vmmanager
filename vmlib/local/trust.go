@@ -24,7 +24,7 @@ import (
 // opens it, it never creates it.
 
 // trustedUID is the owner the runtime tree must have: root. Config.TrustedOwnerUID
-// exists solely so unprivileged tests can use their own uid; vmd never sets it.
+// exists solely so unprivileged tests can use their own uid; vmapi never sets it.
 func (c *Config) trustedUID() uint32 {
 	if c.TrustedOwnerUID != nil {
 		return *c.TrustedOwnerUID

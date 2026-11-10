@@ -23,13 +23,14 @@ No CA key, server private key or shared SSH private key is ever returned.
 ## Commands (examples; run by you, not by this project)
 
 ```sh
-VMCTL="vmctl -addr vmd.example.com:19450 -server-name vmd.example.com \
-        -ca ca.crt -cert client.crt -key client.key"
+# vmctl talks to the HTTP control API. The bearer is read from a private (0600)
+# file or VMCTL_TOKEN, never from an argument; vmctl waits for the operation.
+VMCTL="vmctl -url https://api.example.com:8443 -token-file $HOME/.config/vmctl/token"
 
-$VMCTL create -image ubuntu-base -profile small -id demo1 -key-ref laptop-ed25519
-$VMCTL ssh-info demo1                     # JSON
+$VMCTL create -image ubuntu-base -name demo1   # prints the API-assigned vm_id
+$VMCTL ssh-info VM_ID                     # JSON
 $VMCTL ssh-info -format ssh -known-hosts ~/.ssh/fc-demo1.known_hosts \
-        -key ~/.ssh/id_ed25519 demo1      # args for ssh, shell-quoted
+        -key ~/.ssh/id_ed25519 VM_ID    # args for ssh, shell-quoted
 
 # Plain ssh through the bastion (ProxyJump) - equivalent to the printed args:
 ssh -J jump@bastion.example.com -i ~/.ssh/id_ed25519 \
@@ -98,13 +99,13 @@ through your bastion:
 
 ```go
 p := vmlib.SSHCommandProber{KeyFile: "/home/me/.ssh/id_ed25519", KnownHostsFile: "/home/me/.ssh/fc.known_hosts"}
-c, _ := remote.DialFacade(addr, tlsCfg, remote.WithSSHProber(p.Probe))
-info, err := c.WaitSSHReady(ctx, vm.ID) // ssh -J ... true succeeded
+svc, _ := vmlib.NewService(backend, vmlib.WithSSHProber(p.Probe))
+info, err := svc.WaitSSHReady(ctx, vm.ID) // ssh -J ... true succeeded
 ```
 
 ## Reconciling a failed Create
 
-Create over the facade takes a client-allocated ID (generated for you when empty).
-If the call fails or the response is lost, `Get(id)` tells you whether a VM exists
-and `Delete(id)` removes it. A failed call returns the partial VM (ID, state,
-retained flag) in the error metadata.
+At the `vmlib` level Create takes a caller ID (generated when empty). If the call
+fails or the response is lost, `Get(id)` tells you whether a VM exists and
+`Delete(id)` removes it. Over the HTTP API the VM ID is server-assigned and the
+`Idempotency-Key` makes a retried create return the same operation.

@@ -2,7 +2,7 @@
 # One VMM process per slot N (firecracker-vm@N.service), separate from the active
 # legacy firecracker-builder@main.service: different unit, runtime dir, jail, TAP
 # prefix (tap-vmN) and operator-chosen guest pool (/etc/firecracker-vms/pool.conf).
-# Replace @CLIENT_GROUP@ with the unprivileged vmd user's primary group.
+# Replace @CLIENT_GROUP@ with the unprivileged vmapi user's primary group.
 #
 # Networking is NOT done here. RootDirectory= applies to every Exec* line of this
 # unit (a "+" prefix is not relied on), so the jail deliberately contains no

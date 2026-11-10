@@ -13,6 +13,7 @@ import (
 
 	"github.com/petruekhin/vibe-firecracker/internal/identity"
 	"github.com/petruekhin/vibe-firecracker/internal/jwtauth"
+	"github.com/petruekhin/vibe-firecracker/internal/localcfg"
 	"github.com/petruekhin/vibe-firecracker/internal/vmbot"
 )
 
@@ -33,13 +34,13 @@ type Config struct {
 	MaxVMs              int          `json:"max_vms"`
 	MaxVMsPerUser       int          `json:"max_vms_per_user"`
 	DefaultProfile      string       `json:"default_profile"`
-	Facade              struct {
-		Addr       string `json:"addr"`
-		CAFile     string `json:"ca_file"`
-		CertFile   string `json:"cert_file"`
-		KeyFile    string `json:"key_file"`
-		ServerName string `json:"server_name"`
-	} `json:"facade"`
+	// Backend is the private single-host local backend policy: exactly the object
+	// that vmd called backend.local (see docs/control-api-backend.md). The API
+	// opens vmlib/local.Backend in-process; there is no VM transport.
+	Backend *localcfg.JSONConfig `json:"backend"`
+	// Facade only exists to reject stale gRPC-facade configurations with a clear
+	// error instead of silently ignoring them.
+	Facade   json.RawMessage `json:"facade,omitempty"`
 	Terminal struct {
 		ListenAddr    string `json:"listen_addr"`
 		PublicOrigin  string `json:"public_origin"`
@@ -120,6 +121,18 @@ func (c Config) Policy() vmbot.ControlPolicy {
 	return vmbot.ControlPolicy{AllowedUsers: c.AllowedUserIDs, SharedImages: c.SharedImageIDs, MaxVMs: c.MaxVMs, MaxVMsPerUser: c.MaxVMsPerUser}
 }
 func (c Config) Validate() error {
+	if len(c.Facade) != 0 {
+		return errors.New("facade gRPC configuration was removed: move the former vmd backend.local object to backend")
+	}
+	if c.Backend == nil {
+		return errors.New("backend (local backend policy) is required")
+	}
+	if e := c.Backend.Validate(); e != nil {
+		return e
+	}
+	if c.Backend.MaxVMs > 0 && c.MaxVMs > c.Backend.MaxVMs {
+		return errors.New("max_vms exceeds backend.max_vms")
+	}
 	if !filepath.IsAbs(c.StateDir) || c.LegacyOwnerUserID < 0 || c.MaxVMs <= 0 || c.MaxVMs > vmbot.MaxVMsLimit || c.MaxVMsPerUser <= 0 {
 		return errors.New("invalid API policy")
 	}

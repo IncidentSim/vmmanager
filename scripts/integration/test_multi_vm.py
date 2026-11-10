@@ -12,21 +12,21 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "multi-vm.sh"
-EXAMPLE = Path(__file__).resolve().parents[2] / "deployment" / "multivm" / "vmd.example.json"
+EXAMPLE = Path(__file__).resolve().parents[2] / "deployment" / "vmapi" / "backend.local.example.json"
 
 
 def shipped_cap():
-    """How many guests the SHIPPED vmd policy admits at once."""
-    cfg = json.loads(EXAMPLE.read_text())["backend"]["local"]
+    """How many guests the SHIPPED backend policy admits at once."""
+    cfg = json.loads(EXAMPLE.read_text())
     p = cfg["profiles"][0]
     return min(cfg["max_vms"], cfg["max_total_vcpu"] // p["vcpu"], cfg["max_total_mem_mib"] // p["mem_mib"])
 
 FAKE_VMCTL = r'''#!/usr/bin/env bash
 set -euo pipefail
 S="$FAKE_STATE"; MAX="${FAKE_MAX_VMS:-2}"
-# drop the global connection flags
-while [[ ${1:-} == -* && ${1:-} != -format && ${1:-} != -id ]]; do
-  case $1 in -addr|-server-name|-ca|-cert|-key) shift 2 ;; *) break ;; esac
+# drop the global connection flags (HTTP API client; the token is never an argv value)
+while [[ ${1:-} == -* ]]; do
+  case $1 in -url|-token-file|-auth|-ca-file|-user-id) shift 2 ;; *) break ;; esac
 done
 cmd=$1; shift
 echo "vmctl $cmd $*" >> "$S/calls"
@@ -34,27 +34,27 @@ live() { ls "$S/vm" 2>/dev/null | wc -l; }
 case $cmd in
   create)
     id=''; image=''
-    while [[ $# -gt 0 ]]; do case $1 in -id) id=$2; shift 2;; -image) image=$2; shift 2;; -profile) shift 2;; *) shift;; esac; done
+    while [[ $# -gt 0 ]]; do case $1 in -name) id=$2; shift 2;; -image) image=$2; shift 2;; *) shift;; esac; done
     mkdir -p "$S/vm"
     if [[ $(live) -ge $MAX ]]; then echo "resource exhausted: all $MAX slots leased" >&2; exit 1; fi
     echo running > "$S/vm/$id"
     n=$(( $(cat "$S/ipn" 2>/dev/null || echo 0) + 1 )); echo $n > "$S/ipn"
     echo "10.213.$n.2" > "$S/ip.$id"; echo "$id" > "$S/host.10.213.$n.2"
     if [[ -f "$S/image.$image" ]]; then cp "$S/image.$image" "$S/disk.$id"; else : > "$S/disk.$id"; fi
-    echo "{\"ID\":\"$id\"}" ;;
+    echo "{\"accepted\":{\"vm_id\":\"$id\"}}" ;;
   stop) echo stopped > "$S/vm/$1"; echo '{}' ;;
   commit)
     [[ $(cat "$S/vm/$1") == stopped ]] || { echo "not stopped" >&2; exit 1; }
     [[ ! -e "$S/image.$2" && $2 != base* && $2 != ubuntu-base ]] || { echo "already exists" >&2; exit 1; }
-    cp "$S/disk.$1" "$S/image.$2"; echo "{\"ID\":\"$2\"}" ;;
-  delete) rm -f "$S/vm/$1"; echo '{"Deleted": true}' ;;
+    cp "$S/disk.$1" "$S/image.$2"; echo "{\"accepted\":{\"image_id\":\"$2\"}}" ;;
+  delete) rm -f "$S/vm/$1"; echo '{"accepted":{"operation_id":"op"}}' ;;
   ssh-info)
     fmt=json; id=''
     while [[ $# -gt 0 ]]; do case $1 in -format) fmt=$2; shift 2;; -known-hosts|-key) shift 2;; *) id=$1; shift;; esac; done
     ip=$(cat "$S/ip.$id")
     if [[ $fmt == ssh ]]; then echo "-J jump@bastion.example.test -p 22 root@$ip";
     elif [[ $fmt == ansible ]]; then echo "$id ansible_host=$ip"
-    else printf '{\n  "Host": "%s",\n  "Bastion": {\n    "Host": "bastion.example.test"\n  }\n}\n' "$ip"; fi ;;
+    else printf '{\n  "host": "%s",\n  "bastion": {\n    "host": "bastion.example.test"\n  }\n}\n' "$ip"; fi ;;
   *) echo "unexpected $cmd" >&2; exit 2 ;;
 esac
 '''
@@ -101,8 +101,8 @@ class IntegrationScriptTests(unittest.TestCase):
             "FAKE_STATE": str(state),
             "FAKE_MAX_VMS": str(max_vms),
             "FC_VMCTL": str(bin_dir / "vmctl"),
-            "FC_ADDR": "x:1", "FC_SERVER_NAME": "x", "FC_CA": "ca", "FC_CERT": "c", "FC_KEY": "k",
-            "FC_BASE_IMAGE_ID": "ubuntu-base", "FC_PROFILE": "small", "FC_SSH_KEY": "/nonexistent-key",
+            "FC_URL": "http://127.0.0.1:1", "FC_TOKEN_FILE": "/nonexistent-token",
+            "FC_BASE_IMAGE_ID": "ubuntu-base", "FC_SSH_KEY": "/nonexistent-key",
             "HOME": d,
         }
         if confirm:

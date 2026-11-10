@@ -3,8 +3,8 @@
 // gracefully and committing their disks as NEW offline images.
 //
 // It contains no PostgreSQL, Ansible or Firecracker SDK code. Orchestration lives
-// in Service; host operations are behind Backend, which can be the local host
-// backend (vmlib/local) or a client of a remote mTLS backend (vmlib/remote).
+// in Service; host operations are behind Backend, implemented by the local host
+// backend (vmlib/local). Remote application clients use the HTTP control API.
 //
 // Contexts bound a single call, never a VM's lifetime. The library installs no
 // process-global signal handlers.
@@ -257,8 +257,8 @@ type DeleteResult struct {
 	Detail   string
 }
 
-// Lifecycle is the facade API implemented by Service (local or over a remote
-// backend) and by the generated-gRPC facade client.
+// Lifecycle is the in-process domain API implemented by Service. It remains
+// public for Go consumers; HTTP application clients use controlclient.
 type Lifecycle interface {
 	Create(ctx context.Context, req CreateRequest) (VM, error)
 	Get(ctx context.Context, id string) (VM, error)

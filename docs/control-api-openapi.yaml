@@ -116,14 +116,16 @@ components:
         image_id: {type: string}
     Image:
       type: object
-      required: [id, name, shared]
+      required: [id, name, shared, phase, can_delete]
       properties:
         id: {type: string}
         name: {type: string}
-        shared: {type: boolean}
+        shared: {type: boolean, description: "True for every catalog image: the registry is common to all admitted users."}
         phase:
           type: string
-          enum: [ready, publishing, deleting]
+          enum: [ready, deleting]
+          description: "A deleting image is listed only to its creator and is not bootable."
+        can_delete: {type: boolean, description: "Permission only (caller is the creator and the image is not a system image); delete may still return 409 while any VM references it."}
     SSH:
       type: object
       required: [host, port, user, host_key_fingerprint, ready]
@@ -272,7 +274,7 @@ paths:
   /v1/vms/{id}/commit:
     parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}, {$ref: "#/components/parameters/idempotency"}]
     post:
-      summary: Cold commit into a new owner-private image; the source VM stays stopped and occupied.
+      summary: Cold commit into a new common-registry image (name must be globally unused); the source VM stays stopped, occupied and private.
       requestBody:
         required: true
         content:
@@ -315,7 +317,7 @@ paths:
       parameters: [{$ref: "#/components/parameters/acting"}]
       responses:
         "200":
-          description: Configured shared images plus the caller's ready derived images.
+          description: Common registry - configured system images plus every ready committed image, and the caller's own deleting images.
           content:
             application/json:
               schema:
@@ -335,7 +337,7 @@ paths:
         default: {$ref: "#/components/responses/Error"}
     delete:
       parameters: [{$ref: "#/components/parameters/idempotency"}]
-      summary: Refused (409) for shared bases and images referenced by any VM.
+      summary: Creator-only. Refused 403 for another user's image, 409 for system base images and images referenced by any VM (any owner).
       responses:
         "202":
           description: Accepted.

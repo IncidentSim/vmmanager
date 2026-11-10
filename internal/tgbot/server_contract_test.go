@@ -126,16 +126,39 @@ func TestBotAgainstActualControlAPI(t *testing.T) {
 	}
 	imageID := ""
 	for _, i := range owned {
-		if !i.Shared {
+		if i.CanDelete {
 			imageID = i.ID
+			if !i.Shared || i.Phase != "ready" {
+				t.Fatalf("committed image projection %+v", i)
+			}
 		}
 	}
 	if imageID == "" {
-		t.Fatal("missing private image")
+		t.Fatal("missing creator-deletable image")
 	}
+	// Common registry: the other admitted user sees and may boot the image,
+	// but cannot delete it and never sees the source VM.
 	foreignImages, e := client.Images(ctx, 43)
-	if e != nil || len(foreignImages) != 1 {
-		t.Fatalf("image privacy %+v %v", foreignImages, e)
+	if e != nil || len(foreignImages) != 2 {
+		t.Fatalf("common registry %+v %v", foreignImages, e)
+	}
+	for _, i := range foreignImages {
+		if i.CanDelete || !i.Shared {
+			t.Fatalf("foreign projection %+v", i)
+		}
+	}
+	if _, e = client.DeleteImage(ctx, 43, imageID, "tg:foreign:deleteimage"); !errors.As(e, &api) || api.Status != 403 {
+		t.Fatalf("foreign image delete %v", e)
+	}
+	before = len(tg.messages)
+	bot.Handle(ctx, message(150, 43, "/images"))
+	if len(tg.messages) != before+1 || strings.Contains(tg.messages[before].Text, "/deleteimage "+imageID) || !strings.Contains(tg.messages[before].Text, imageID) {
+		t.Fatalf("foreign /images text %+v", tg.messages[before:])
+	}
+	before = len(tg.messages)
+	bot.Handle(ctx, message(151, 42, "/images"))
+	if len(tg.messages) != before+1 || !strings.Contains(tg.messages[before].Text, "/deleteimage "+imageID) {
+		t.Fatalf("creator /images text %+v", tg.messages[before:])
 	}
 	bot.Handle(ctx, message(105, 42, "/delete lab"))
 	all, e = client.ListVMs(ctx, 42)

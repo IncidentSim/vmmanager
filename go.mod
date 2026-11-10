@@ -5,11 +5,9 @@ go 1.25.0
 require (
 	github.com/dbos-inc/dbos-transact-golang v1.8.0
 	github.com/firecracker-microvm/firecracker-go-sdk v1.0.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/sirupsen/logrus v1.8.1
 	golang.org/x/sys v0.47.0
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20240521202816-d264139d666e
-	google.golang.org/grpc v1.64.1
-	google.golang.org/protobuf v1.34.2
 )
 
 require (
@@ -31,7 +29,6 @@ require (
 	github.com/go-openapi/swag v0.21.1 // indirect
 	github.com/go-openapi/validate v0.22.0 // indirect
 	github.com/go-stack/stack v1.8.1 // indirect
-	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect

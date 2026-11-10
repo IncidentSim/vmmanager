@@ -23,7 +23,7 @@ import (
 	"unicode/utf8"
 )
 
-const helpText = "Команды:\n/create [имя] [image_id] [vcpu memory_mib] — создать VM\n/list — все VM с кнопками\n/status [имя] — состояние VM\n/terminal [имя] — секретная ссылка\n/delete [имя] — удалить VM\n/stop [имя] — остановить VM\n/commit имя имя-образа — сохранить выключенный диск в новый образ\n/images — доступные образы\n/deleteimage image_id — удалить свой образ\n/ssh [имя] — публичные параметры SSH\n/capabilities — лимиты и профили\n/operation id — результат операции\n/token — личный токен для HTTP API и Swagger\n\nЕсли VM несколько, укажите имя или нажмите кнопку. Остановленные и сохранённые VM тоже занимают место."
+const helpText = "Команды:\n/create [имя] [image_id] [vcpu memory_mib] — создать VM\n/list — все VM с кнопками\n/status [имя] — состояние VM\n/terminal [имя] — секретная ссылка\n/delete [имя] — удалить VM\n/stop [имя] — остановить VM\n/commit имя имя-образа — сохранить выключенный диск в новый образ\n/images — общий реестр образов (доступен всем)\n/deleteimage image_id — удалить образ, который создали вы\n/ssh [имя] — публичные параметры SSH\n/capabilities — лимиты и профили\n/operation id — результат операции\n/token — личный токен для HTTP API и Swagger\n\nЕсли VM несколько, укажите имя или нажмите кнопку. Остановленные и сохранённые VM тоже занимают место."
 
 var labelPattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,18}[a-z0-9])?$`)
 
@@ -258,6 +258,23 @@ func buttonData(action, id string) string {
 	h := sha256.Sum256([]byte(id))
 	return action + ":" + base64.RawURLEncoding.EncodeToString(h[:])
 }
+// imageLine renders one common-registry entry. Every image is usable by every
+// admitted user; /deleteimage is advertised only where the server says the
+// caller may delete it (permission, not absence of references).
+func imageLine(im controlclient.Image) string {
+	kind := "личный"
+	if im.Shared {
+		kind = "общий"
+	}
+	line := fmt.Sprintf("%s (%s), %s", im.Name, im.ID, kind)
+	if im.Phase == "deleting" {
+		line += ", удаляется (недоступен для запуска)"
+	}
+	if im.CanDelete {
+		line += ", можно удалить: /deleteimage " + im.ID
+	}
+	return line
+}
 func buttons(v controlclient.VM) [][]Button {
 	return [][]Button{{{Text: "Статус " + v.Name, Data: buttonData("s", v.ID)}, {Text: "Терминал " + v.Name, Data: buttonData("t", v.ID)}, {Text: "Удалить " + v.Name, Data: buttonData("d", v.ID)}}}
 }
@@ -401,7 +418,7 @@ func (b *Bot) command(ctx context.Context, u, update int64, cmd string, args []s
 		}
 		lines := []string{}
 		for _, im := range all {
-			lines = append(lines, fmt.Sprintf("%s (%s), shared=%t", im.Name, im.ID, im.Shared))
+			lines = append(lines, imageLine(im))
 		}
 		b.lines(ctx, u, lines)
 		return

@@ -337,7 +337,7 @@ func TestConfigJWTAndUsernames(t *testing.T) {
 		return p
 	}
 	jw := `"jwt":{"public_key_file":"` + pub + `","issuer":"incident-sim-bot","audience":"incident-sim-api"}`
-	ok := `{"state_dir":"/unused","allowed_usernames":["@Alice_Example","bob_example"],"shared_image_ids":["ubuntu"],"credentials":[],` + jw + `}`
+	ok := `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["@Alice_Example","bob_example"],"shared_image_ids":["ubuntu"],"credentials":[],` + jw + `}`
 	c, err := LoadConfig(write(ok))
 	if err != nil {
 		t.Fatal(err)
@@ -352,15 +352,15 @@ func TestConfigJWTAndUsernames(t *testing.T) {
 		t.Fatalf("verifier: %v", err)
 	}
 	for name, body := range map[string]string{
-		"dup usernames":     `{"state_dir":"/unused","allowed_usernames":["alice_example","@ALICE_EXAMPLE"],"credentials":[],` + jw + `}`,
-		"bad username":      `{"state_dir":"/unused","allowed_usernames":["bad name"],"credentials":[],` + jw + `}`,
-		"no identity":       `{"state_dir":"/unused","credentials":[],` + jw + `}`,
-		"no creds no jwt":   `{"state_dir":"/unused","allowed_usernames":["alice_example"],"credentials":[]}`,
-		"relative key":      `{"state_dir":"/unused","allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"k.pem","issuer":"a","audience":"b"}}`,
-		"missing issuer":    `{"state_dir":"/unused","allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"` + pub + `","audience":"b"}}`,
-		"missing audience":  `{"state_dir":"/unused","allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"` + pub + `","issuer":"b"}}`,
-		"unknown jwt field": `{"state_dir":"/unused","allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"` + pub + `","issuer":"a","audience":"b","secret":"x"}}`,
-		"expose w/o origin": `{"state_dir":"/unused","allowed_usernames":["alice_example"],"credentials":[],"expose_api_on_terminal":true,` + jw + `}`,
+		"dup usernames":     `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["alice_example","@ALICE_EXAMPLE"],"credentials":[],` + jw + `}`,
+		"bad username":      `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["bad name"],"credentials":[],` + jw + `}`,
+		"no identity":       `{"state_dir":"/unused","backend":` + testBackend + `,"credentials":[],` + jw + `}`,
+		"no creds no jwt":   `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["alice_example"],"credentials":[]}`,
+		"relative key":      `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"k.pem","issuer":"a","audience":"b"}}`,
+		"missing issuer":    `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"` + pub + `","audience":"b"}}`,
+		"missing audience":  `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"` + pub + `","issuer":"b"}}`,
+		"unknown jwt field": `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"` + pub + `","issuer":"a","audience":"b","secret":"x"}}`,
+		"expose w/o origin": `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["alice_example"],"credentials":[],"expose_api_on_terminal":true,` + jw + `}`,
 	} {
 		if _, err := LoadConfig(write(body)); err == nil {
 			t.Errorf("%s: must be rejected", name)
@@ -368,14 +368,14 @@ func TestConfigJWTAndUsernames(t *testing.T) {
 	}
 	// A private key can never be configured as the API verification key.
 	priv := filepath.Join(dir, "private.pem")
-	bad := `{"state_dir":"/unused","allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"` + priv + `","issuer":"a","audience":"b"}}`
+	bad := `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_usernames":["alice_example"],"credentials":[],"jwt":{"public_key_file":"` + priv + `","issuer":"a","audience":"b"}}`
 	if c, err := LoadConfig(write(bad)); err == nil {
 		if _, err = c.Verifier(); err == nil {
 			t.Fatal("private key accepted as API verification key")
 		}
 	}
 	// legacy static-only config still loads unchanged
-	legacy := `{"state_dir":"/unused","allowed_user_ids":[11],"credentials":[{"sha256":"` + digest("x") + `","user_id":11}]}`
+	legacy := `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_user_ids":[11],"credentials":[{"sha256":"` + digest("x") + `","user_id":11}]}`
 	if c, err := LoadConfig(write(legacy)); err != nil || c.JWT != nil {
 		t.Fatalf("legacy config: %v", err)
 	}

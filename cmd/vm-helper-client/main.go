@@ -1,4 +1,4 @@
-// vm-helper-client is the unprivileged side: the program vmd's `helper` setting
+// vm-helper-client is the unprivileged side: the program vmapi's backend `helper` setting
 // points at. It speaks the one-line protocol over the fixed helper socket. It has
 // no sudo, no flags and no way to name a unit, path or command.
 //

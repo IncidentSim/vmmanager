@@ -32,10 +32,9 @@ child's coverage. Passing tests/coverage are not proof of all possible races.
 
 ## Executable smoke boundary
 
-`cmd/vmapi/TestExecutableControlFlow` builds and starts the actual API executable
-as a subprocess, connects it to a test-owned mTLS facade and drives its HTTP API
-using the public Go client. The facade uses the real Service over the
-`vmlibtest` backend. This is real process/HTTP/TLS/gRPC/DBOS/SQLite wiring, but the
+`cmd/vmapi/TestExecutableControlFlow` runs the actual API `run()` entry point
+in-process, injects the `vmlibtest` backend through the test-only opener seam and
+drives its HTTP API using the public Go client. This is real run()/HTTP/TLS/DBOS/SQLite wiring, but the
 VMM and guest resources are fakes: no KVM or production filesystem is involved.
 
 It checks:
@@ -72,10 +71,9 @@ be treated as deployment verification of these new components.
 - Stop, commit and terminal HTTP replay returns the original operation even
   after VM removal. A different owner cannot replay it; a fresh request still
   returns 404; changed commit input returns 409.
-- Capabilities are actual backend profile/resource policy forwarded through the
-  facade. API user/global quotas remain distinct from backend aggregate limits;
-  no fabricated empty catalog masks a missing RPC. Real mTLS transport and HTTP
-  response/Go-decoder tests cover both halves.
+- Capabilities are actual backend profile/resource policy read in-process from
+  `vmlib.Service`. API user/global quotas remain distinct from backend aggregate limits;
+  HTTP response/Go-decoder tests cover the HTTP half.
 
 ## Operational limits
 

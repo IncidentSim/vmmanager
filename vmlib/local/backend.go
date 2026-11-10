@@ -109,7 +109,7 @@ type Config struct {
 	GuestConfiguration string
 
 	// TrustedOwnerUID is a TEST SEAM: the uid that must own the runtime tree
-	// (default nil = root). Production code (vmd) never sets it.
+	// (default nil = root). Production code (vmapi) never sets it.
 	TrustedOwnerUID *uint32
 	// TrustedAncestorRoot is a TEST SEAM: ancestors ABOVE this directory are not
 	// inspected (the directory itself still is). Default "" = inspect up to "/".

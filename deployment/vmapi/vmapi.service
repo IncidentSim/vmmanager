@@ -1,9 +1,20 @@
 # Source-only systemd USER template for the standalone control API (vmapi).
-# NOT installed or enabled by anything in this repository. Install only after the
-# explicit handoff in docs/control-api.md ("Migration and handoff"): stop the
-# legacy vmbot first (it holds the state-directory lifetime lock), keep the old
-# binary/config/unit files for rollback, and never run legacy vmbot and vmapi on
-# the same state directory.
+# NOT installed or enabled by anything in this repository. vmapi embeds the VM
+# service directly (vmlib.Service over vmlib/local.Backend); there is no vmd and
+# no gRPC listener. Install only after the explicit handoff in docs/control-api.md
+# ("Migration and handoff"): stop the bot and any old vmapi/vmd first (the API
+# holds the state-directory lock and the backend holds exclusive flocks on the
+# work/run/images roots, so a second owner cannot start), keep the old
+# binary/config/unit files for rollback, and never run two owners on one state.
+#
+# Hardening honesty: this is a plain same-UID user service. On the reference host
+# unprivileged user namespaces were observed to be unavailable, so ProtectHome=,
+# BindPaths= and similar mount-namespace user-unit settings would NOT be enforced
+# and are deliberately not listed as protection. The API holds only the public
+# JWT key, but any process of the same OS user can read the private files that
+# user owns (SSH key, helper socket access, state). Proof-of-concept limitation;
+# no root/user isolation is claimed. Only NoNewPrivileges, UMask and the resource
+# ceilings below are relied upon.
 [Unit]
 Description=vmapi: authenticated VM control API (owns DBOS state and terminals)
 After=network-online.target

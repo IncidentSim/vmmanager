@@ -1,5 +1,5 @@
 # Install as /etc/firecracker-vms/pool.conf (root:root 0644). Shared, by value,
-# by the network script, the helper and vmd (vmd refuses to start on a mismatch).
+# by the network script, the helper and vmapi (vmapi refuses to start on a mismatch).
 #
 # GUEST_PREFIX is YOURS to choose: slot N uses PREFIX.N.0/30 (guest PREFIX.N.2).
 # Pick a range that overlaps nothing on this host. The network script re-checks

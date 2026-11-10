@@ -1,7 +1,7 @@
 // Package vmhelper is the narrow privilege boundary between the unprivileged
-// vmd and the root-owned systemd units of a slot. It defines a one-line
+// vmapi and the root-owned systemd units of a slot. It defines a one-line
 // protocol ("start-slot N"), the strict pool configuration shared by the helper,
-// the network script and vmd, and a handler that can only start an idle
+// the network script and vmapi, and a handler that can only start an idle
 // firecracker-vm@N.service. There is deliberately no stop, kill, restart, path,
 // unit-name or command verb.
 package vmhelper
@@ -26,7 +26,7 @@ const MaxSlots = 64
 const SocketPath = "/run/fc-vm-helper.sock"
 
 // Pool is the operator-chosen guest address pool shared by the helper, the
-// per-slot network script and vmd. Slot N uses Prefix.N.0/30 (guest .2).
+// per-slot network script and vmapi. Slot N uses Prefix.N.0/30 (guest .2).
 type Pool struct {
 	Prefix   string // "A.B"
 	MaxSlots int

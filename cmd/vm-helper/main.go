@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	poolFile  = "/etc/firecracker-vms/pool.conf" // root-owned, shared with fc-vm-network and vmd
+	poolFile  = "/etc/firecracker-vms/pool.conf" // root-owned, shared with fc-vm-network and vmapi
 	systemctl = "/usr/bin/systemctl"
 )
 

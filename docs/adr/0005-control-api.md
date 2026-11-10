@@ -1,5 +1,7 @@
 # ADR 0005: Standalone authenticated control API
 
+> **Superseded in part:** the API's mTLS gRPC facade connection described here was replaced by an in-process backend in [ADR 0007](0007-remove-grpc-vm-plane.md).
+
 Status: proposed (source only; not deployed or activated).
 
 ## Context

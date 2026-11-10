@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,53 +9,27 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"syscall"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/petruekhin/vibe-firecracker/controlclient"
-	"github.com/petruekhin/vibe-firecracker/vmlib"
-	"github.com/petruekhin/vibe-firecracker/vmlib/remote"
-	"github.com/petruekhin/vibe-firecracker/vmlib/remote/pkitest"
 	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 )
 
 func digestOf(s string) string { v := sha256.Sum256([]byte(s)); return hex.EncodeToString(v[:]) }
 
-// TestExecutableControlFlow runs the REAL vmapi binary as a child process.
-// Boundary (be honest): the VM backend behind the mTLS facade is the in-memory
-// vmlibtest fake - there is no Firecracker, KVM, guest, SSH login or real disk.
-// Real parts: the vmapi process, flags/config loading, mutual-TLS gRPC to the
-// facade (test CA), DBOS with SQLite in a test state dir, the HTTP API and the
-// public controlclient SDK.
+// TestExecutableControlFlow runs the REAL run() entry point of vmapi in-process.
+// Boundary (be honest): the VM backend is the in-memory vmlibtest fake injected
+// through the backendOpener seam - there is no Firecracker, KVM, guest, SSH login
+// or real disk. Real parts: config loading, vmlib.Service, DBOS with SQLite in a
+// test state dir, the HTTP API and the public controlclient SDK. The deployed
+// binary has no fake: openLocalBackend is the only production opener.
 func TestExecutableControlFlow(t *testing.T) {
 	dir := t.TempDir()
-	ca := pkitest.NewCA(t, "smoke")
-	server := ca.Server(t, "facade.test")
-	client := ca.Client(t, "api")
-	tlsCfg, e := remote.ServerTLSFromPEM(ca.CertPEM, server.CertPEM, server.KeyPEM)
-	if e != nil {
-		t.Fatal(e)
-	}
-	grpc := remote.NewGRPCServer(tlsCfg)
-	svc, e := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	remote.RegisterFacade(grpc, svc)
-	gl, e := net.Listen("tcp", "127.0.0.1:0")
-	if e != nil {
-		t.Fatal(e)
-	}
-	go grpc.Serve(gl)
-	defer grpc.Stop()
-	for name, b := range map[string][]byte{"ca": ca.CertPEM, "cert": client.CertPEM, "key": client.KeyPEM} {
-		if e = os.WriteFile(filepath.Join(dir, name), b, 0600); e != nil {
-			t.Fatal(e)
-		}
-	}
+	logs := captureLogs(t)
+	fb := &fakeOpener{b: vmlibtest.New(3, "ubuntu")}
 	l, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -70,34 +43,17 @@ func TestExecutableControlFlow(t *testing.T) {
 			map[string]any{"sha256": digestOf("test-only-user-11"), "user_id": 11},
 			map[string]any{"sha256": digestOf("test-only-service"), "service": true},
 		},
-		"facade": map[string]string{"addr": gl.Addr().String(), "ca_file": filepath.Join(dir, "ca"), "cert_file": filepath.Join(dir, "cert"), "key_file": filepath.Join(dir, "key"), "server_name": "facade.test"},
+		"backend": testBackendPolicy,
 	}
 	b, _ := json.Marshal(cfg)
 	path := filepath.Join(dir, "api.json")
 	if e = os.WriteFile(path, b, 0600); e != nil {
 		t.Fatal(e)
 	}
-	binary := filepath.Join(dir, "vmapi")
-	bctx, bcancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer bcancel()
-	if out, e := exec.CommandContext(bctx, "go", "build", "-o", binary, ".").CombinedOutput(); e != nil {
-		t.Fatalf("build %v %s", e, out)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, "-config", path)
-	var logs bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &logs, &logs
-	if e = cmd.Start(); e != nil {
-		t.Fatal(e)
-	}
-	exited := false
-	defer func() {
-		if !exited {
-			cmd.Process.Kill()
-			cmd.Wait()
-		}
-	}()
+	pr := startRun(path, fb.open)
+	defer pr.kill()
 	url := "http://" + addr
 	hc := &http.Client{Timeout: 2 * time.Second}
 	ready := false
@@ -175,22 +131,29 @@ func TestExecutableControlFlow(t *testing.T) {
 		t.Fatalf("ssh %v %+v", e, ssh)
 	}
 
-	// Cold commit publishes an owner-private image; the source stays occupied.
+	// Cold commit publishes to the common image catalog; the source stays occupied.
 	commit, e := user.Commit(ctx, 11, created.VMID, "smoke-commit", "derived")
 	if e != nil || commit.ImageID == "" {
 		t.Fatalf("commit %v %+v", e, commit)
 	}
 	wait(user, 11, commit.OperationID)
 	img, e := user.Image(ctx, 11, commit.ImageID)
-	if e != nil || img.Shared || img.Name != "derived" {
+	if e != nil || !img.Shared || !img.CanDelete || img.Name != "derived" {
 		t.Fatalf("image %v %+v", e, img)
 	}
-	if _, e = svcCli.Image(ctx, 22, commit.ImageID); !isAPI(e, 404) {
-		t.Fatalf("foreign image: %v", e)
+	if other, err := svcCli.Image(ctx, 22, commit.ImageID); err != nil || other.ID != img.ID || !other.Shared {
+		t.Fatalf("common image must be visible to another allowed user: %v %+v", err, other)
 	}
-	if _, e = svcCli.Create(ctx, 22, "foreign-boot", controlclient.CreateRequest{ImageID: commit.ImageID}); !isAPI(e, 404) {
-		t.Fatalf("foreign boot from private image: %v", e)
+	otherVM, e := svcCli.Create(ctx, 22, "common-boot", controlclient.CreateRequest{ImageID: commit.ImageID})
+	if e != nil {
+		t.Fatalf("boot from common image: %v", e)
 	}
+	wait(svcCli, 22, otherVM.OperationID)
+	otherDelete, e := svcCli.Delete(ctx, 22, otherVM.VMID, "common-boot-delete")
+	if e != nil {
+		t.Fatal(e)
+	}
+	wait(svcCli, 22, otherDelete.OperationID)
 	committed, _ := user.VM(ctx, 11, created.VMID)
 	if committed.Phase != "committed" {
 		t.Fatalf("source phase %q", committed.Phase)
@@ -235,27 +198,18 @@ func TestExecutableControlFlow(t *testing.T) {
 
 	// Graceful shutdown, then a restart on the same state proves durability and
 	// that the exclusive lifetime lock was released.
-	if e = cmd.Process.Signal(syscall.SIGTERM); e != nil {
-		t.Fatal(e)
+	pr.stop(t)
+	if o, c := fb.counts(); o != 1 || c != 1 {
+		t.Fatalf("backend lifetime must be released exactly once on shutdown: opens=%d closes=%d", o, c)
 	}
-	werr := cmd.Wait()
-	exited = true
-	if werr != nil {
-		t.Fatalf("shutdown %v %s", werr, logs.String())
-	}
-	if bytes.Contains(logs.Bytes(), []byte("test-only")) {
+	if strings.Contains(logs.String(), "test-only") {
 		t.Fatal("bearer leaked into logs")
 	}
 
 	// Restart on the same state: lifetime lock was released, old operations are
 	// still queryable, and deleted resources stay deleted.
-	cmd2 := exec.CommandContext(ctx, binary, "-config", path)
-	var logs2 bytes.Buffer
-	cmd2.Stdout, cmd2.Stderr = &logs2, &logs2
-	if e = cmd2.Start(); e != nil {
-		t.Fatal(e)
-	}
-	defer func() { cmd2.Process.Kill(); cmd2.Wait() }()
+	pr2 := startRun(path, fb.open)
+	defer pr2.kill()
 	ready = false
 	for until := time.Now().Add(10 * time.Second); time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
 		if p, e := hc.Get(url + "/healthz"); e == nil {
@@ -267,7 +221,7 @@ func TestExecutableControlFlow(t *testing.T) {
 		}
 	}
 	if !ready {
-		t.Fatalf("restart not healthy: %s", logs2.String())
+		t.Fatalf("restart not healthy: %s", logs.String())
 	}
 	if o, e := user.Operation(ctx, 11, created.OperationID); e != nil || o.Status != "succeeded" {
 		t.Fatalf("operation lost across restart: %v %+v", e, o)
@@ -275,11 +229,9 @@ func TestExecutableControlFlow(t *testing.T) {
 	if vms, e := user.ListVMs(ctx, 11); e != nil || len(vms) != 0 {
 		t.Fatalf("after restart %v %+v", e, vms)
 	}
-	if e = cmd2.Process.Signal(syscall.SIGTERM); e != nil {
-		t.Fatal(e)
-	}
-	if e = cmd2.Wait(); e != nil {
-		t.Fatalf("second shutdown %v %s", e, logs2.String())
+	pr2.stop(t)
+	if o, c := fb.counts(); o != 2 || c != 2 {
+		t.Fatalf("restart opens/closes: %d/%d", o, c)
 	}
 }
 

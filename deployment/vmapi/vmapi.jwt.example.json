@@ -15,12 +15,26 @@
   "max_vms": 2,
   "max_vms_per_user": 1,
   "default_profile": "small",
-  "facade": {
-    "addr": "vmd.example.com:19450",
-    "server_name": "vmd.example.com",
-    "ca_file": "/home/USER/.config/vmapi/pki/facade-ca.crt",
-    "cert_file": "/home/USER/.config/vmapi/pki/vmapi-client.crt",
-    "key_file": "/home/USER/.config/vmapi/pki/vmapi-client.key"
+  "backend": {
+    "work_root": "/var/lib/firecracker-builder/storage/vms/work",
+    "images_dir": "/var/lib/firecracker-builder/storage/vms/images",
+    "run_dir": "/run/firecracker-vms",
+    "storage_mount": "/var/lib/firecracker-builder/storage",
+    "max_vms": 2,
+    "helper": "/usr/local/libexec/fc-vm-helper-client",
+    "pool_conf": "/etc/firecracker-vms/pool.conf",
+    "guest_prefix": "10.213",
+    "guest_dns": ["1.1.1.1"],
+    "ssh_user": "root",
+    "min_free_mib": 1024,
+    "max_total_mem_mib": 1024,
+    "max_total_vcpu": 2,
+    "unit_mem_limit_mib": 768,
+    "vmm_overhead_mib": 64,
+    "profiles": [
+      {"name": "small", "vcpu": 1, "mem_mib": 512, "disk_mib": 2048}
+    ],
+    "bastion": {"host": "bastion.example.com", "port": 22, "user": "jump"}
   },
   "terminal": {
     "listen_addr": "0.0.0.0:8443",

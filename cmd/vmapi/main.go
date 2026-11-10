@@ -1,5 +1,8 @@
 // vmapi is the standalone authenticated control API. It alone owns durable
-// application state and DBOS execution. No Telegram credentials are read here.
+// application state and DBOS execution, and it embeds the single-host VM service
+// directly: vmlib.Service over vmlib/local.Backend, opened in-process from the
+// private "backend" policy. There is no VM RPC transport. No Telegram credentials
+// are read here.
 package main
 
 import (
@@ -19,8 +22,9 @@ import (
 
 	"github.com/petruekhin/vibe-firecracker/internal/controlapi"
 	"github.com/petruekhin/vibe-firecracker/internal/identity"
+	"github.com/petruekhin/vibe-firecracker/internal/localcfg"
 	"github.com/petruekhin/vibe-firecracker/internal/vmbot"
-	"github.com/petruekhin/vibe-firecracker/vmlib/remote"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
 func main() {
@@ -28,10 +32,24 @@ func main() {
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if e := run(ctx, *path); e != nil {
+	if e := run(ctx, *path, openLocalBackend); e != nil {
 		log.Print("vmapi: ", e)
 		os.Exit(1)
 	}
+}
+
+// backendOpener opens the VM backend for a validated private policy and returns
+// the function that releases it. Release only drops the filesystem lifetime
+// locks; it never stops or deletes a VM. Production uses openLocalBackend; tests
+// substitute an in-memory backend (the deployed binary never contains a fake).
+type backendOpener func(*localcfg.JSONConfig) (vmlib.Backend, func() error, error)
+
+func openLocalBackend(c *localcfg.JSONConfig) (vmlib.Backend, func() error, error) {
+	b, e := localcfg.Open(c, localcfg.Seams{})
+	if e != nil {
+		return nil, nil, e
+	}
+	return b, b.Close, nil
 }
 
 type unavailableTerminals struct{}
@@ -57,7 +75,7 @@ func recoverOrDegrade(recoverFn func() error, h degradeSetter, logs io.Writer) {
 	}
 	h.SetDegraded(false)
 }
-func run(ctx context.Context, path string) error {
+func run(ctx context.Context, path string, open backendOpener) error {
 	if path == "" {
 		return errors.New("-config is required")
 	}
@@ -65,15 +83,16 @@ func run(ctx context.Context, path string) error {
 	if e != nil {
 		return e
 	}
-	tlsConfig, e := remote.ClientTLSFromFiles(cfg.Facade.CAFile, cfg.Facade.CertFile, cfg.Facade.KeyFile, cfg.Facade.ServerName)
+	backend, closeBackend, e := open(cfg.Backend)
 	if e != nil {
-		return errors.New("invalid facade TLS configuration")
+		return errors.New("cannot open local backend (is a previous vmd or API still holding the VM roots?)")
 	}
-	facade, e := remote.DialFacade(cfg.Facade.Addr, tlsConfig)
+	// Closed last: the backend outlives the controller and its operations.
+	defer closeBackend()
+	svc, e := vmlib.NewService(backend)
 	if e != nil {
-		return errors.New("cannot connect to facade")
+		return errors.New("cannot start VM service")
 	}
-	defer facade.Close()
 	st, e := vmbot.OpenControlStore(cfg.StateDir, cfg.LegacyOwnerUserID)
 	if e != nil {
 		return e
@@ -90,7 +109,7 @@ func run(ctx context.Context, path string) error {
 		term = manager
 	}
 	defer term.Close()
-	ctl := vmbot.NewController(facade, st, term, vmbot.ControllerConfig{Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin, MaxVMs: cfg.MaxVMs})
+	ctl := vmbot.NewController(svc, st, term, vmbot.ControllerConfig{Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin, MaxVMs: cfg.MaxVMs})
 	ctl.ConfigureControl(cfg.Policy())
 	var jwtAuth *controlapi.JWTAuth
 	if cfg.JWT != nil {

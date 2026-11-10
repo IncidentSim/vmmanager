@@ -1,5 +1,7 @@
 # ADR 0001: Public VM lifecycle library with local and remote host backends
 
+> **Superseded in part:** gRPC remote backend/facade transports described here were removed by [ADR 0007](0007-remove-grpc-vm-plane.md).
+
 Status: Accepted
 Date: 2026-11-10
 Baseline: commit `d352ee4` (single-VM PostgreSQL image builder over one

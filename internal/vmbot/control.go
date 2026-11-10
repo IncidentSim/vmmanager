@@ -53,8 +53,15 @@ type ControlImage struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	OwnerUserID int64  `json:"owner_user_id,omitempty"`
-	Shared      bool   `json:"shared"`
-	Phase       string `json:"phase,omitempty"`
+	// Shared is stored false for every creator-owned image (validateControlState
+	// enforces it). In projections it is true for every catalog entry: the
+	// registry is common, so Shared means "visible to all admitted users", while
+	// OwnerUserID keeps the creator authority that only CanDelete exposes.
+	Shared bool   `json:"shared"`
+	Phase  string `json:"phase,omitempty"`
+	// CanDelete is a projection-only permission (creator and not a configured
+	// system image). It never means "currently unreferenced"; delete may still 409.
+	CanDelete bool `json:"can_delete,omitempty"`
 }
 type ControlVMView struct {
 	ID        string            `json:"id"`
@@ -205,28 +212,71 @@ func (c *Controller) ControlImages(u int64) []ControlImage {
 	if !c.ControlAllowed(u) {
 		return out
 	}
+	protected := make(map[string]bool, len(c.control.SharedImages))
+	state := c.st.Snapshot()
 	for _, id := range c.control.SharedImages {
-		out = append(out, ControlImage{ID: id, Name: id, Shared: true, Phase: "ready"})
+		if protected[id] {
+			continue
+		}
+		protected[id] = true
+		if i, ok := c.controlImage(state, u, id); ok {
+			out = append(out, i)
+		}
 	}
 	for _, i := range c.st.Snapshot().Images {
-		// Owner visibility is not boot eligibility: a deleting image stays listed
-		// (with its phase) so the owner can see and retry its removal.
-		if i.OwnerUserID == u && (i.Phase == "ready" || i.Phase == "deleting") {
-			out = append(out, i)
+		if protected[i.ID] {
+			continue
+		}
+		// The registry is common: every ready committed image is listed for every
+		// admitted user. A deleting image stays listed only for its creator, with
+		// its phase, so the creator can see and retry removal. Neither is bootable
+		// while deleting, and publishing images are never listed.
+		if i.Phase == "ready" || (i.Phase == "deleting" && i.OwnerUserID == u) {
+			out = append(out, commonImage(i, u))
 		}
 	}
 	return out
 }
 
-// ownedImage is the owner-visibility lookup (shared, or the owner's own ready or
-// deleting image). Never use it for boot eligibility; see controlImage.
+// commonImage projects a stored creator record into the common catalog.
+func commonImage(i ControlImage, u int64) ControlImage {
+	i.Shared = true
+	i.CanDelete = i.OwnerUserID == u
+	return i
+}
+
+// imageNameTaken reports a name reserved by a configured system image or any
+// publishing/ready/deleting record of any creator. Pre-existing duplicates are
+// never rewritten; this only gates new commits.
+func (c *Controller) imageNameTaken(s State, name string) bool {
+	for _, id := range c.control.SharedImages {
+		if id == name {
+			return true
+		}
+	}
+	for _, i := range s.Images {
+		if i.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ownedImage is the visibility lookup (system image, any ready image, or the
+// caller's own deleting image). Never use it for boot eligibility; see controlImage.
 func (c *Controller) ownedImage(s State, u int64, id string) (ControlImage, bool) {
 	if i, ok := c.controlImage(s, u, id); ok {
 		return i, true
 	}
 	for _, x := range s.Images {
 		if x.ID == id && x.OwnerUserID == u && x.Phase == "deleting" {
-			return x, true
+			view := commonImage(x, u)
+			for _, protected := range c.control.SharedImages {
+				if protected == id {
+					view.CanDelete = false
+				}
+			}
+			return view, true
 		}
 	}
 	return ControlImage{}, false
@@ -234,12 +284,17 @@ func (c *Controller) ownedImage(s State, u int64, id string) (ControlImage, bool
 func (c *Controller) controlImage(s State, u int64, id string) (ControlImage, bool) {
 	for _, x := range c.control.SharedImages {
 		if x == id {
+			for _, record := range s.Images {
+				if record.ID == id && record.Phase != "ready" {
+					return ControlImage{}, false
+				}
+			}
 			return ControlImage{ID: id, Name: id, Shared: true, Phase: "ready"}, true
 		}
 	}
 	for _, x := range s.Images {
-		if x.ID == id && x.OwnerUserID == u && x.Phase == "ready" {
-			return x, true
+		if x.ID == id && x.Phase == "ready" {
+			return commonImage(x, u), true
 		}
 	}
 	return ControlImage{}, false
@@ -375,10 +430,8 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 				if req.Name == "" {
 					return vmlib.ErrInvalidArgument
 				}
-				for _, i := range s.Images {
-					if i.OwnerUserID == u && i.Name == req.Name {
-						return ErrControlConflict
-					}
+				if c.imageNameTaken(*s, req.Name) {
+					return ErrControlConflict
 				}
 				phase = "committing"
 				out.ImageID = "img-" + strings.TrimPrefix(oid, "op-")
@@ -390,8 +443,13 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 			if !ok {
 				return ErrNoVM
 			}
-			if i.Shared {
+			// System base images are protected; ready common images are visible
+			// to everyone but only their creator may delete them.
+			if i.OwnerUserID == 0 {
 				return ErrControlConflict
+			}
+			if !i.CanDelete {
+				return ErrControlForbidden
 			}
 			// A fresh attempt on an already-deleting image is allowed only once
 			// every earlier delete operation for it is terminal.
@@ -496,6 +554,11 @@ func (c *Controller) RecoverControl() error {
 	return errors.Join(errs...)
 }
 func (c *Controller) deletableImage(s State, op ControlOperation) bool {
+	for _, id := range c.control.SharedImages {
+		if id == op.ImageID {
+			return false
+		}
+	}
 	found := false
 	for _, i := range s.Images {
 		if i.ID == op.ImageID && i.OwnerUserID == op.OwnerUserID && i.Phase == "deleting" {

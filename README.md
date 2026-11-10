@@ -4,9 +4,11 @@
 
 `vmapi` owns authenticated VM/image operations, per-user ownership and quotas,
 DBOS/SQLite recovery, and terminal access. The separate `vmbot` process is an
-HTTP client; it does not own VMs or connect to the infrastructure facade.
+HTTP client; it does not own VMs or connect to any VM backend.
 Create from an allowed image with CPU/RAM, obtain SSH/terminal access, cold-commit
-into a new private image, and boot derivatives through the same API.
+into a new common-catalog image, and boot derivatives through the same API.
+See [common image registry](docs/common-image-registry.md) for visibility,
+name uniqueness and managed-image deletion rules.
 
 Telegram users may be allowed by username with per-user RS256 tokens (`/token`)
 and a self-hosted Swagger UI on the HTTPS gateway: see
@@ -22,12 +24,13 @@ remains a separate consumer.
 
 > **New: `vmlib`, a public Go library for multi-VM lifecycle automation** (create VM
 > from an image, SSH metadata for `ssh -J`/Ansible, graceful stop, offline commit to
-> a new image, independent VMs from it), with a local host backend, a remote mTLS
-> backend and a facade gRPC API. See [`docs/architecture.md`](docs/architecture.md),
+> a new image, independent VMs from it), with a local host backend embedded in the HTTP control API
+> (no VM gRPC plane). See [`docs/architecture.md`](docs/architecture.md),
 > [`docs/ssh-automation.md`](docs/ssh-automation.md), [`docs/verification.md`](docs/verification.md)
-> and [ADR 0001](docs/adr/0001-vm-library-and-remote-backends.md). The multi-VM
-> deployment is **proposed source only** ([`deployment/multivm`](deployment/multivm/README.md))
-> and separate from the active single-VM service described below, which is unchanged.
+> and [ADR 0007](docs/adr/0007-remove-grpc-vm-plane.md). Deployment templates
+> ([`deployment/multivm`](deployment/multivm/README.md)) do not activate anything;
+> the embedded-backend migration requires the documented exclusive-owner handoff.
+> The separate single-VM service described below is unchanged.
 
 Local execution remains Unix-socket-only. An optional HTTPS/mTLS build manager
 runs that same local CLI as an unprivileged child, using server-owned paths.
