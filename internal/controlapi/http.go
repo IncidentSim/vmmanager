@@ -12,8 +12,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/petruekhin/vibe-firecracker/internal/identity"
+	"github.com/petruekhin/vibe-firecracker/internal/jwtauth"
 	"github.com/petruekhin/vibe-firecracker/internal/vmbot"
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
@@ -27,7 +31,49 @@ type Credential struct {
 type Server struct {
 	ctl         *vmbot.Controller
 	credentials []Credential
+	jwt         *JWTAuth
 	degraded    atomic.Bool
+}
+
+// JWTAuth verifies bot-signed user tokens with the PUBLIC key only. A token's
+// subject is the immutable numeric owner. The optional username claim (covered
+// by the signature) may bootstrap the matching configured username slot, which
+// is then pinned to that numeric ID in the durable binding store.
+type JWTAuth struct {
+	Verifier  *jwtauth.Verifier
+	Bindings  *identity.Bindings
+	Usernames []string // canonical configured allowlist
+	Now       func() time.Time
+
+	mu sync.RWMutex
+}
+
+func (j *JWTAuth) usernames() []string {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.Usernames
+}
+
+// SetUsernames replaces the configured allowlist (canonical names).
+func (j *JWTAuth) SetUsernames(n []string) {
+	j.mu.Lock()
+	j.Usernames = append([]string(nil), n...)
+	j.mu.Unlock()
+}
+func (j *JWTAuth) configured(name string) bool {
+	for _, n := range j.usernames() {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// UserAllowed reports whether id owns a pinned username slot that is still in
+// the configured allowlist. Revoking a username (config + restart) removes
+// access here, which also fences restart projection, without deleting any VM.
+func (j *JWTAuth) UserAllowed(id int64) bool {
+	return j.Bindings != nil && j.Bindings.BoundTo(id, j.usernames())
 }
 
 // SetDegraded marks that startup repair could not re-drive every durable
@@ -37,7 +83,19 @@ func (s *Server) SetDegraded(v bool) { s.degraded.Store(v) }
 func (s *Server) Degraded() bool     { return s.degraded.Load() }
 
 func New(c *vmbot.Controller, credentials []Credential) (*Server, error) {
-	if len(credentials) == 0 {
+	return NewWithJWT(c, credentials, nil)
+}
+
+// NewWithJWT is New plus optional JWT user authentication. With a verifier the
+// static credential list may be empty.
+func NewWithJWT(c *vmbot.Controller, credentials []Credential, j *JWTAuth) (*Server, error) {
+	if j != nil {
+		if j.Verifier == nil || j.Bindings == nil {
+			return nil, errors.New("jwt verifier and username bindings required")
+		}
+		c.SetControlAuthorizer(j.UserAllowed)
+	}
+	if len(credentials) == 0 && j == nil {
 		return nil, errors.New("credentials required")
 	}
 	seen := map[string]bool{}
@@ -49,7 +107,7 @@ func New(c *vmbot.Controller, credentials []Credential) (*Server, error) {
 		seen[x.SHA256] = true
 	}
 	p := c.ControlPolicy()
-	if p.MaxVMs <= 0 || p.MaxVMsPerUser <= 0 || len(p.AllowedUsers) == 0 {
+	if p.MaxVMs <= 0 || p.MaxVMsPerUser <= 0 || (len(p.AllowedUsers) == 0 && !c.HasControlAuthorizer()) {
 		return nil, errors.New("positive quotas and allowlist required")
 	}
 	seenUsers := map[int64]bool{}
@@ -64,7 +122,7 @@ func New(c *vmbot.Controller, credentials []Credential) (*Server, error) {
 			return nil, errors.New("invalid shared image")
 		}
 	}
-	return &Server{ctl: c, credentials: append([]Credential{}, credentials...)}, nil
+	return &Server{ctl: c, credentials: append([]Credential{}, credentials...), jwt: j}, nil
 }
 func respond(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -110,6 +168,9 @@ func (s *Server) authenticate(r *http.Request) (int64, int) {
 		}
 	}
 	if found == nil {
+		if s.jwt != nil {
+			return s.authenticateJWT(r, token)
+		}
 		return 0, 401
 	}
 	acting := r.Header.Values("X-Acting-User-ID")
@@ -131,6 +192,37 @@ func (s *Server) authenticate(r *http.Request) (int64, int) {
 	}
 	return u, 0
 }
+func (s *Server) authenticateJWT(r *http.Request, token string) (int64, int) {
+	now := time.Now()
+	if s.jwt.Now != nil {
+		now = s.jwt.Now()
+	}
+	claims, err := s.jwt.Verifier.Verify(token, now)
+	if err != nil {
+		return 0, 401
+	}
+	// A user token never selects another acting user.
+	if len(r.Header.Values("X-Acting-User-ID")) != 0 {
+		return 0, 403
+	}
+	id := claims.Subject
+	if claims.Username != "" && s.jwt.configured(claims.Username) {
+		// Bootstrap/verify the pinned slot from the signed claim.
+		if s.jwt.Bindings.Claim(claims.Username, id) != nil {
+			return 0, 403
+		}
+	} else if claims.Username != "" {
+		// An unlisted handle can never grant access, and must not contradict
+		// a pin held by someone else.
+		if owner, ok := s.jwt.Bindings.Owner(claims.Username); ok && owner != id {
+			return 0, 403
+		}
+	}
+	if !s.ctl.ControlAllowed(id) {
+		return 0, 403
+	}
+	return id, 0
+}
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 	d := json.NewDecoder(r.Body)
@@ -147,6 +239,9 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if serveDocs(w, r) {
+		return
+	}
 	if r.URL.Path == "/healthz" && r.Method == "GET" {
 		status := "ok"
 		if s.degraded.Load() {

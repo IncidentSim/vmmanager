@@ -11,22 +11,29 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/petruekhin/vibe-firecracker/internal/identity"
+	"github.com/petruekhin/vibe-firecracker/internal/jwtauth"
 	"github.com/petruekhin/vibe-firecracker/internal/vmbot"
 )
 
 type Config struct {
-	ListenAddr        string       `json:"listen_addr"`
-	TLSCertFile       string       `json:"tls_cert_file,omitempty"`
-	TLSKeyFile        string       `json:"tls_key_file,omitempty"`
-	StateDir          string       `json:"state_dir"`
-	AllowedUserIDs    []int64      `json:"allowed_user_ids"`
-	LegacyOwnerUserID int64        `json:"legacy_owner_user_id,omitempty"`
-	SharedImageIDs    []string     `json:"shared_image_ids"`
-	Credentials       []Credential `json:"credentials"`
-	MaxVMs            int          `json:"max_vms"`
-	MaxVMsPerUser     int          `json:"max_vms_per_user"`
-	DefaultProfile    string       `json:"default_profile"`
-	Facade            struct {
+	ListenAddr       string     `json:"listen_addr"`
+	TLSCertFile      string     `json:"tls_cert_file,omitempty"`
+	TLSKeyFile       string     `json:"tls_key_file,omitempty"`
+	StateDir         string     `json:"state_dir"`
+	AllowedUserIDs   []int64    `json:"allowed_user_ids"`
+	AllowedUsernames []string   `json:"allowed_usernames"`
+	JWT              *JWTConfig `json:"jwt,omitempty"`
+	// ExposeAPIOnTerminal serves the authenticated HTTP API and the public
+	// Swagger UI through the existing HTTPS terminal gateway (same origin).
+	ExposeAPIOnTerminal bool         `json:"expose_api_on_terminal,omitempty"`
+	LegacyOwnerUserID   int64        `json:"legacy_owner_user_id,omitempty"`
+	SharedImageIDs      []string     `json:"shared_image_ids"`
+	Credentials         []Credential `json:"credentials"`
+	MaxVMs              int          `json:"max_vms"`
+	MaxVMsPerUser       int          `json:"max_vms_per_user"`
+	DefaultProfile      string       `json:"default_profile"`
+	Facade              struct {
 		Addr       string `json:"addr"`
 		CAFile     string `json:"ca_file"`
 		CertFile   string `json:"cert_file"`
@@ -43,7 +50,32 @@ type Config struct {
 		SSHKeyFile    string `json:"ssh_key_file"`
 		MaxClients    int    `json:"max_clients"`
 		SSHUseBastion bool   `json:"ssh_use_bastion"`
+		// ExposeAPI is an accepted alias of the top-level expose_api_on_terminal.
+		ExposeAPI bool `json:"expose_api_on_terminal,omitempty"`
 	} `json:"terminal"`
+}
+
+// JWTConfig configures verification only: the API never gets a private key.
+type JWTConfig struct {
+	PublicKeyFile string `json:"public_key_file"`
+	Issuer        string `json:"issuer"`
+	Audience      string `json:"audience"`
+}
+
+// ExposesAPI reports whether the API and Swagger UI share the terminal gateway.
+func (c Config) ExposesAPI() bool { return c.ExposeAPIOnTerminal || c.Terminal.ExposeAPI }
+
+// CanonicalUsernames returns the validated, case-folded username allowlist.
+func (c Config) CanonicalUsernames() ([]string, error) {
+	return identity.CanonicalList(c.AllowedUsernames)
+}
+
+// Verifier loads the JWT public key (nil when JWT is not configured).
+func (c Config) Verifier() (*jwtauth.Verifier, error) {
+	if c.JWT == nil {
+		return nil, nil
+	}
+	return jwtauth.LoadVerifier(c.JWT.PublicKeyFile, c.JWT.Issuer, c.JWT.Audience)
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -88,8 +120,26 @@ func (c Config) Policy() vmbot.ControlPolicy {
 	return vmbot.ControlPolicy{AllowedUsers: c.AllowedUserIDs, SharedImages: c.SharedImageIDs, MaxVMs: c.MaxVMs, MaxVMsPerUser: c.MaxVMsPerUser}
 }
 func (c Config) Validate() error {
-	if !filepath.IsAbs(c.StateDir) || c.LegacyOwnerUserID < 0 || c.MaxVMs <= 0 || c.MaxVMs > vmbot.MaxVMsLimit || c.MaxVMsPerUser <= 0 || len(c.AllowedUserIDs) == 0 || len(c.Credentials) == 0 {
+	if !filepath.IsAbs(c.StateDir) || c.LegacyOwnerUserID < 0 || c.MaxVMs <= 0 || c.MaxVMs > vmbot.MaxVMsLimit || c.MaxVMsPerUser <= 0 {
 		return errors.New("invalid API policy")
+	}
+	if len(c.AllowedUserIDs) == 0 && len(c.AllowedUsernames) == 0 {
+		return errors.New("at least one allowed user ID or username is required")
+	}
+	if _, e := c.CanonicalUsernames(); e != nil {
+		return errors.New("invalid API username allowlist")
+	}
+	if c.JWT == nil && len(c.Credentials) == 0 {
+		return errors.New("credentials or jwt verification required")
+	}
+	if len(c.AllowedUsernames) > 0 && c.JWT == nil {
+		return errors.New("allowed_usernames require jwt verification")
+	}
+	if j := c.JWT; j != nil && (!filepath.IsAbs(j.PublicKeyFile) || j.Issuer == "" || j.Audience == "") {
+		return errors.New("invalid jwt configuration")
+	}
+	if c.ExposesAPI() && c.Terminal.PublicOrigin == "" {
+		return errors.New("expose_api_on_terminal requires the terminal gateway")
 	}
 	seen := map[int64]bool{}
 	for _, u := range c.AllowedUserIDs {

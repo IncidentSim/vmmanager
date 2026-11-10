@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/petruekhin/vibe-firecracker/internal/controlapi"
+	"github.com/petruekhin/vibe-firecracker/internal/identity"
 	"github.com/petruekhin/vibe-firecracker/internal/vmbot"
 	"github.com/petruekhin/vibe-firecracker/vmlib/remote"
 )
@@ -90,7 +92,24 @@ func run(ctx context.Context, path string) error {
 	defer term.Close()
 	ctl := vmbot.NewController(facade, st, term, vmbot.ControllerConfig{Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin, MaxVMs: cfg.MaxVMs})
 	ctl.ConfigureControl(cfg.Policy())
-	h, e := controlapi.New(ctl, cfg.Credentials)
+	var jwtAuth *controlapi.JWTAuth
+	if cfg.JWT != nil {
+		// Public key only: the API never receives signing material.
+		verifier, e := cfg.Verifier()
+		if e != nil {
+			return errors.New("invalid jwt public key")
+		}
+		names, e := cfg.CanonicalUsernames()
+		if e != nil {
+			return errors.New("invalid username allowlist")
+		}
+		bindings, e := identity.OpenBindings(filepath.Join(cfg.StateDir, "username-bindings.json"))
+		if e != nil {
+			return errors.New("cannot open username bindings")
+		}
+		jwtAuth = &controlapi.JWTAuth{Verifier: verifier, Bindings: bindings, Usernames: names}
+	}
+	h, e := controlapi.NewWithJWT(ctl, cfg.Credentials, jwtAuth)
 	if e != nil {
 		return e
 	}
@@ -114,7 +133,13 @@ func run(ctx context.Context, path string) error {
 		if e != nil {
 			return errors.New("cannot bind terminal listener")
 		}
-		go func() { done <- vmbot.ServeGateway(ctx, ln, tc.TLSCertFile, tc.TLSKeyFile, manager) }()
+		gateway := manager.Handler()
+		if cfg.ExposesAPI() {
+			// Same HTTPS origin, fixed in-process routes: /v1, /healthz, /docs,
+			// /openapi.yaml and Swagger assets go to the API; /t/ stays terminal.
+			gateway = vmbot.ComposeGateway(manager, h)
+		}
+		go func() { done <- vmbot.ServeGatewayHandler(ctx, ln, tc.TLSCertFile, tc.TLSKeyFile, manager, gateway) }()
 	}
 	go func() {
 		if cfg.TLSCertFile != "" {

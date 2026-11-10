@@ -158,6 +158,15 @@ func synthesizeLegacyDeletes(s *State) {
 }
 
 func (c *Controller) ConfigureControl(p ControlPolicy) { c.control = p }
+
+// SetControlAuthorizer installs an additional, dynamic allow decision (for
+// example durable username bindings that are still configured). It is consulted
+// by every ownership/projection fence through ControlAllowed, so removing access
+// also fences restart repair without touching any VM. Call before Start.
+func (c *Controller) SetControlAuthorizer(f func(int64) bool) { c.authorizer = f }
+
+// HasControlAuthorizer reports whether a dynamic authorizer is installed.
+func (c *Controller) HasControlAuthorizer() bool { return c.authorizer != nil }
 func (c *Controller) ControlAllowed(u int64) bool {
 	if u <= 0 {
 		return false
@@ -167,7 +176,7 @@ func (c *Controller) ControlAllowed(u int64) bool {
 			return true
 		}
 	}
-	return false
+	return c.authorizer != nil && c.authorizer(u)
 }
 func (c *Controller) ControlPolicy() ControlPolicy { return c.control }
 func (c *Controller) ControlVM(u int64, id string) (ControlVMView, error) {

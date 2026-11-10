@@ -7,8 +7,17 @@ info:
     they return 202 with an operation to poll. Foreign and unknown IDs return an
     identical 404. A user bearer is bound to one user; a service bearer must send
     X-Acting-User-ID.
+
+
+    **Authorization (Telegram users).** Send `/token` to the bot in a private chat
+    to receive a personal RS256 JWT (valid 28800 seconds = 8 hours; send `/token`
+    again to renew). Press Authorize and paste the token only (no `Bearer `
+    prefix). The owner is the immutable numeric Telegram ID in the signed `sub`
+    claim; the optional signed `tg_username` claim only bootstraps a configured
+    username slot, which the API pins permanently to that ID. A user token never
+    selects another user: `X-Acting-User-ID` is refused for it.
 servers:
-  - url: http://127.0.0.1:8090
+  - url: /
 security:
   - bearer: []
 components:
@@ -16,6 +25,12 @@ components:
     bearer:
       type: http
       scheme: bearer
+      bearerFormat: JWT
+      description: >
+        RS256 user token issued by the bot (claims iss, aud, sub, iat, nbf, exp and
+        optional tg_username; 28800 seconds by default), verified by the API with
+        its public key only. Static service/user bearers remain supported for
+        compatibility where configured.
   parameters:
     id:
       name: id

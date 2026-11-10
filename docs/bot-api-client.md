@@ -169,6 +169,17 @@ HTTP status via `*controlclient.APIError`, but discard server free text.
 Clients are reusable concurrently; caller contexts bound requests. No external
 library other than the Go standard library is required by `controlclient`.
 
+## Usernames, `/token` and per-user JWT
+
+With `allowed_usernames` and `jwt` (see
+[username-jwt-swagger.md](username-jwt-swagger.md)) the bot admits a sender only
+when Telegram's own `from.username` (case-insensitive) is listed, the chat is
+private with chat ID equal to the sender ID, and the slot is or becomes pinned to
+that numeric ID. Every API call is made with a short per-user RS256 token; there
+is no service credential or `X-Acting-User-ID`. `/token` returns a personal token
+(default 28800 s) as a protected code block without link preview; it is never
+logged. `controlclient.NewPerUser` is the SDK constructor for this mode.
+
 ## Verification scope
 
 Focused tests cover real HTTP envelopes and real control API/controller/DBOS

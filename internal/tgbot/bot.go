@@ -10,16 +10,20 @@ import (
 	"errors"
 	"fmt"
 	"github.com/petruekhin/vibe-firecracker/controlclient"
+	"github.com/petruekhin/vibe-firecracker/internal/identity"
+	"github.com/petruekhin/vibe-firecracker/internal/jwtauth"
 	"math"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
 
-const helpText = "Команды:\n/create [имя] [image_id] [vcpu memory_mib] — создать VM\n/list — все VM с кнопками\n/status [имя] — состояние VM\n/terminal [имя] — секретная ссылка\n/delete [имя] — удалить VM\n/stop [имя] — остановить VM\n/commit имя имя-образа — сохранить выключенный диск в новый образ\n/images — доступные образы\n/deleteimage image_id — удалить свой образ\n/ssh [имя] — публичные параметры SSH\n/capabilities — лимиты и профили\n/operation id — результат операции\n\nЕсли VM несколько, укажите имя или нажмите кнопку. Остановленные и сохранённые VM тоже занимают место."
+const helpText = "Команды:\n/create [имя] [image_id] [vcpu memory_mib] — создать VM\n/list — все VM с кнопками\n/status [имя] — состояние VM\n/terminal [имя] — секретная ссылка\n/delete [имя] — удалить VM\n/stop [имя] — остановить VM\n/commit имя имя-образа — сохранить выключенный диск в новый образ\n/images — доступные образы\n/deleteimage image_id — удалить свой образ\n/ssh [имя] — публичные параметры SSH\n/capabilities — лимиты и профили\n/operation id — результат операции\n/token — личный токен для HTTP API и Swagger\n\nЕсли VM несколько, укажите имя или нажмите кнопку. Остановленные и сохранённые VM тоже занимают место."
 
 var labelPattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,18}[a-z0-9])?$`)
 
@@ -32,23 +36,141 @@ type Bot struct {
 	allowed                              map[int64]bool
 	Delivery                             *Delivery
 	PollInterval, WaitBudget, RetryDelay time.Duration
+
+	// Username access (empty without allowed_usernames/jwt).
+	usernames map[string]bool
+	bindings  *identity.Bindings
+	signer    *jwtauth.Signer
+	tokenTTL  time.Duration
+	mu        sync.Mutex
+	names     map[int64]string // verified bootstrap username of users admitted by username
 }
 
+// apiCallTTL is the lifetime of the short per-request tokens the bot uses for
+// its own API calls; /token hands out the longer configured lifetime.
+const apiCallTTL = 5 * time.Minute
+
+// NewBot builds the bot. With a jwt config it loads the private signing key and
+// signs a token per user for every API call; client may then be nil (a per-user
+// client is created) and no service credential exists.
 func NewBot(c Config, tg Telegram, client *controlclient.Client, delivery *Delivery) (*Bot, error) {
-	if tg == nil || client == nil || len(c.AllowedUserIDs) == 0 || c.ImageID == "" {
+	if tg == nil || (client == nil && c.JWT == nil) || (len(c.AllowedUserIDs) == 0 && len(c.AllowedUsernames) == 0) || c.ImageID == "" {
 		return nil, errors.New("invalid bot configuration")
 	}
-	b := &Bot{config: c, tg: tg, client: client, Delivery: delivery, allowed: map[int64]bool{}, PollInterval: time.Second, WaitBudget: 40 * time.Second, RetryDelay: 3 * time.Second}
+	b := &Bot{config: c, tg: tg, client: client, Delivery: delivery, allowed: map[int64]bool{}, usernames: map[string]bool{}, names: map[int64]string{},
+		PollInterval: time.Second, WaitBudget: 40 * time.Second, RetryDelay: 3 * time.Second}
 	for _, u := range c.AllowedUserIDs {
 		if u <= 0 || b.allowed[u] {
 			return nil, errors.New("invalid user allowlist")
 		}
 		b.allowed[u] = true
 	}
+	canon, e := identity.CanonicalList(c.AllowedUsernames)
+	if e != nil {
+		return nil, errors.New("invalid username allowlist")
+	}
+	for _, n := range canon {
+		b.usernames[n] = true
+	}
+	if c.JWT != nil {
+		signer, e := jwtauth.LoadSigner(c.JWT.PrivateKeyFile, c.JWT.Issuer, c.JWT.Audience)
+		if e != nil {
+			return nil, errors.New("cannot load JWT signing key")
+		}
+		b.signer = signer
+		b.tokenTTL = jwtauth.DefaultTTL
+		if c.JWT.TTLSeconds > 0 {
+			b.tokenTTL = time.Duration(c.JWT.TTLSeconds) * time.Second
+		}
+		if len(canon) > 0 {
+			if c.DeliveryDir == "" {
+				return nil, errors.New("delivery directory required for username bindings")
+			}
+			if b.bindings, e = identity.OpenBindings(filepath.Join(c.DeliveryDir, "username-bindings.json")); e != nil {
+				return nil, errors.New("cannot open username bindings")
+			}
+		}
+		if client == nil {
+			if b.client, e = controlclient.NewPerUser(c.APIURL, b.apiToken, nil); e != nil {
+				return nil, e
+			}
+		}
+	}
 	return b, nil
 }
+
+// apiToken signs a short-lived token for one verified user. Only users that
+// passed allowedMessage in this process can obtain one.
+func (b *Bot) apiToken(userID int64) (string, error) {
+	b.mu.Lock()
+	name, ok := b.names[userID]
+	b.mu.Unlock()
+	if !ok && !b.allowed[userID] {
+		return "", errors.New("user not verified")
+	}
+	tok, _, err := b.signer.Issue(userID, name, apiCallTTL, time.Now())
+	return tok, err
+}
+
+// allowedMessage admits only a verified private-chat sender: Telegram's own
+// sender ID equal to the chat ID, and either a configured numeric ID or a
+// configured username (case-insensitive) whose slot is, or can now be, pinned to
+// this exact ID. Display names, message text and callback data never count.
 func (b *Bot) allowedMessage(from *User, chat Chat) bool {
-	return from != nil && from.ID > 0 && b.allowed[from.ID] && chat.Type == "private" && chat.ID == from.ID
+	if from == nil || from.ID <= 0 || chat.Type != "private" || chat.ID != from.ID {
+		return false
+	}
+	if b.allowed[from.ID] {
+		b.mu.Lock()
+		delete(b.names, from.ID)
+		b.mu.Unlock()
+		return true
+	}
+	if b.bindings == nil || from.Username == "" || strings.HasPrefix(from.Username, "@") {
+		return false
+	}
+	name, e := identity.CanonicalUsername(from.Username)
+	if e != nil || !b.usernames[name] || b.bindings.Claim(name, from.ID) != nil {
+		return false
+	}
+	b.mu.Lock()
+	b.names[from.ID] = name
+	b.mu.Unlock()
+	return true
+}
+
+var markdownV2Special = strings.NewReplacer("\\", "\\\\", "_", "\\_", "*", "\\*", "[", "\\[", "]", "\\]", "(", "\\(", ")", "\\)", "~", "\\~", "`", "\\`",
+	">", "\\>", "#", "\\#", "+", "\\+", "-", "\\-", "=", "\\=", "|", "\\|", "{", "\\{", "}", "\\}", ".", "\\.", "!", "\\!")
+
+func escapeMarkdownV2(s string) string { return markdownV2Special.Replace(s) }
+
+func lifetimeText(d time.Duration) string {
+	if d%time.Hour == 0 {
+		return strconv.Itoa(int(d/time.Hour)) + " ч"
+	}
+	if d%time.Minute == 0 {
+		return strconv.Itoa(int(d/time.Minute)) + " мин"
+	}
+	return strconv.Itoa(int(d/time.Second)) + " с"
+}
+
+// sendToken signs a user token and sends it as a protected code block without a
+// link preview. The token is never logged and never stored.
+func (b *Bot) sendToken(ctx context.Context, user int64) {
+	if b.signer == nil {
+		b.send(ctx, user, "Выпуск токенов не настроен.")
+		return
+	}
+	b.mu.Lock()
+	name := b.names[user]
+	b.mu.Unlock()
+	tok, _, err := b.signer.Issue(user, name, b.tokenTTL, time.Now())
+	if err != nil {
+		b.send(ctx, user, "Не удалось выпустить токен.")
+		return
+	}
+	text := escapeMarkdownV2("Токен API, действует "+lifetimeText(b.tokenTTL)+". Вставьте его в Authorize в Swagger или в заголовок Authorization: Bearer. Обновить: снова /token.") + "\n```\n" + tok + "\n```"
+	_ = b.tg.SendMessage(ctx, OutMessage{ChatID: user, Text: text, Secret: true, Markdown: true})
 }
 func (b *Bot) send(ctx context.Context, user int64, text string) {
 	_ = b.tg.SendMessage(ctx, OutMessage{ChatID: user, Text: text})
@@ -200,6 +322,13 @@ func (b *Bot) command(ctx context.Context, u, update int64, cmd string, args []s
 	switch cmd {
 	case "/start", "/help":
 		_ = b.tg.SendMessage(ctx, OutMessage{ChatID: u, Text: helpText, MainKeyboard: true})
+		return
+	case "/token":
+		if len(args) != 0 {
+			b.send(ctx, u, "Использование: /token")
+			return
+		}
+		b.sendToken(ctx, u)
 		return
 	case "/list":
 		if len(args) != 0 {

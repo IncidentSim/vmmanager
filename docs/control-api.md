@@ -33,8 +33,15 @@ Strict JSON (unknown/duplicate-trailing data rejected, max 128 KiB); one flag,
 
 ## Authentication and authorization
 
-* `GET /healthz` is the only unauthenticated route. It returns `{"status":"ok"}`
-  or `{"status":"degraded"}` and nothing else (see Startup repair).
+* `GET /healthz` and the read-only documentation routes (`/docs`,
+  `/docs/assets/*`, `/openapi.yaml`, a self-hosted Swagger UI) are the only
+  unauthenticated routes. Health returns `{"status":"ok"}` or
+  `{"status":"degraded"}` and nothing else (see Startup repair).
+* **JWT user tokens** (config `jwt`, `allowed_usernames`): an RS256 bearer signed
+  by the bot and verified with the public key only; `sub` is the numeric owner,
+  the signed `tg_username` claim may bootstrap a configured username slot which
+  is pinned durably to that ID; mismatch → 403, invalid/expired/wrong
+  key/alg/iss/aud → 401. See [username-jwt-swagger.md](username-jwt-swagger.md).
 * Everything else needs exactly one `Authorization: Bearer <token>`.
   Missing/unknown/oversized → **401** (`WWW-Authenticate: Bearer`).
 * A **user** credential binds one user ID on the server. Sending

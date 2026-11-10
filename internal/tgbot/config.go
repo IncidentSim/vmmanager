@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/petruekhin/vibe-firecracker/controlclient"
+	"github.com/petruekhin/vibe-firecracker/internal/identity"
+	"github.com/petruekhin/vibe-firecracker/internal/jwtauth"
 	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -18,9 +21,21 @@ type Config struct {
 	APIURL            string                   `json:"api_url"`
 	APITokenFile      string                   `json:"api_token_file"`
 	AllowedUserIDs    []int64                  `json:"allowed_user_ids"`
+	AllowedUsernames  []string                 `json:"allowed_usernames"`
+	JWT               *JWTConfig               `json:"jwt,omitempty"`
 	DeliveryDir       string                   `json:"delivery_dir"`
 	ImageID           string                   `json:"image_id"`
 	Resources         *controlclient.Resources `json:"resources,omitempty"`
+}
+
+// JWTConfig makes the bot the RS256 issuer: it signs per-user API tokens with a
+// private key that only this process (and its 0600 file) holds.
+type JWTConfig struct {
+	PrivateKeyFile string `json:"private_key_file"`
+	Issuer         string `json:"issuer"`
+	Audience       string `json:"audience"`
+	// TTLSeconds is the lifetime of tokens handed out by /token (default 28800).
+	TTLSeconds int `json:"ttl_seconds"`
 }
 
 // uniqueObject rejects duplicate top-level keys before decoding a security
@@ -104,8 +119,22 @@ func LoadConfig(path string) (Config, error) {
 	if strict(b, &c) != nil {
 		return c, errors.New("invalid frontend config; legacy config is unsupported")
 	}
-	if c.Version != 1 || c.DeliveryDir == "" || !filepath.IsAbs(c.DeliveryDir) || c.ImageID == "" || c.TelegramTokenFile == "" || c.APITokenFile == "" || len(c.AllowedUserIDs) == 0 {
+	if c.Version != 1 || c.DeliveryDir == "" || !filepath.IsAbs(c.DeliveryDir) || c.ImageID == "" || c.TelegramTokenFile == "" || (c.APITokenFile == "" && c.JWT == nil) || (len(c.AllowedUserIDs) == 0 && len(c.AllowedUsernames) == 0) {
 		return c, errors.New("frontend config requires version 1, API, private files, delivery directory, image and users")
+	}
+	if _, e = identity.CanonicalList(c.AllowedUsernames); e != nil {
+		return c, errors.New("invalid username allowlist")
+	}
+	if len(c.AllowedUsernames) > 0 && c.JWT == nil {
+		return c, errors.New("allowed_usernames require jwt signing")
+	}
+	if j := c.JWT; j != nil {
+		if !filepath.IsAbs(j.PrivateKeyFile) || j.Issuer == "" || j.Audience == "" || j.TTLSeconds < 0 || time.Duration(j.TTLSeconds)*time.Second > jwtauth.MaxTTL {
+			return c, errors.New("invalid jwt configuration")
+		}
+		if j.TTLSeconds == 0 {
+			j.TTLSeconds = int(jwtauth.DefaultTTL / time.Second)
+		}
 	}
 	seen := map[int64]bool{}
 	for _, u := range c.AllowedUserIDs {
@@ -127,12 +156,20 @@ func (c Config) Secrets() (string, string, error) {
 	if e != nil {
 		return "", "", errors.New("cannot read private Telegram token")
 	}
-	b, e := privateRead(c.APITokenFile)
-	if e != nil {
-		return "", "", errors.New("cannot read private API token")
+	tg, api := strings.TrimSpace(string(a)), ""
+	if c.JWT == nil {
+		// Without JWT signing the legacy service credential is required. With
+		// it, no service/delegation credential is ever read or used.
+		b, e := privateRead(c.APITokenFile)
+		if e != nil {
+			return "", "", errors.New("cannot read private API token")
+		}
+		api = strings.TrimSpace(string(b))
+		if api == "" {
+			return "", "", errors.New("invalid private credentials")
+		}
 	}
-	tg, api := strings.TrimSpace(string(a)), strings.TrimSpace(string(b))
-	if tg == "" || api == "" || strings.ContainsAny(tg+api, "\r\n\t ") {
+	if tg == "" || strings.ContainsAny(tg+api, "\r\n\t ") {
 		return "", "", errors.New("invalid private credentials")
 	}
 	return tg, api, nil

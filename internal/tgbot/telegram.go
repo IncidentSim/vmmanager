@@ -14,6 +14,8 @@ import (
 
 type User struct {
 	ID int64 `json:"id"`
+	// Username is Telegram's own (verified) handle for the sender, without "@".
+	Username string `json:"username,omitempty"`
 }
 type Chat struct {
 	ID   int64  `json:"id"`
@@ -42,6 +44,8 @@ type OutMessage struct {
 	Text                 string
 	Inline               [][]Button
 	MainKeyboard, Secret bool
+	// Markdown sends Text as MarkdownV2; the caller must have escaped it.
+	Markdown bool
 }
 type Telegram interface {
 	GetUpdates(context.Context, int64, int) ([]Update, error)
@@ -107,6 +111,9 @@ func (c *TelegramClient) SendMessage(ctx context.Context, m OutMessage) error {
 	body := map[string]any{"chat_id": m.ChatID, "text": m.Text, "link_preview_options": map[string]bool{"is_disabled": true}, "disable_web_page_preview": true}
 	if m.Secret {
 		body["protect_content"] = true
+	}
+	if m.Markdown {
+		body["parse_mode"] = "MarkdownV2"
 	}
 	if len(m.Inline) > 0 {
 		rows := [][]map[string]string{}

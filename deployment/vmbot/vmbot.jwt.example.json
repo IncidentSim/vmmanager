@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "telegram_token_file": "/home/USER/.config/vmbot-http/telegram-token",
+  "api_url": "http://127.0.0.1:8090",
+  "allowed_usernames": ["@example_user_one", "example_user_two"],
+  "allowed_user_ids": [],
+  "jwt": {
+    "private_key_file": "/home/USER/.config/vmbot-http/jwt-private.pem",
+    "issuer": "incident-sim-bot",
+    "audience": "incident-sim-api",
+    "ttl_seconds": 28800
+  },
+  "delivery_dir": "/home/USER/.local/state/vmbot-http-delivery",
+  "image_id": "base-image-id",
+  "resources": {"vcpu": 1, "memory_mib": 512}
+}

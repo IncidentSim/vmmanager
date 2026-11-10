@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/petruekhin/vibe-firecracker/controlclient"
+	"github.com/petruekhin/vibe-firecracker/internal/jwtauth"
 	"github.com/petruekhin/vibe-firecracker/internal/tgbot"
 )
 
@@ -61,8 +62,14 @@ func run(ctx context.Context, args []string, logger *log.Logger) error {
 	if e != nil {
 		return e
 	}
-	client, e := controlclient.New(cfg.APIURL, credential, nil)
-	if e != nil {
+	// JWT mode: no service credential exists; NewBot signs a per-user token for
+	// every API call (client stays nil and is built per user).
+	var client *controlclient.Client
+	if cfg.JWT != nil {
+		if _, e = jwtauth.LoadSigner(cfg.JWT.PrivateKeyFile, cfg.JWT.Issuer, cfg.JWT.Audience); e != nil {
+			return errors.New("invalid JWT signing key")
+		}
+	} else if client, e = controlclient.New(cfg.APIURL, credential, nil); e != nil {
 		return e
 	}
 	if *check {

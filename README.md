@@ -8,6 +8,10 @@ HTTP client; it does not own VMs or connect to the infrastructure facade.
 Create from an allowed image with CPU/RAM, obtain SSH/terminal access, cold-commit
 into a new private image, and boot derivatives through the same API.
 
+Telegram users may be allowed by username with per-user RS256 tokens (`/token`)
+and a self-hosted Swagger UI on the HTTPS gateway: see
+[username/JWT/Swagger guide](docs/username-jwt-swagger.md).
+
 See [API and migration guide](docs/control-api.md),
 [OpenAPI](docs/control-api-openapi.yaml), [bot-client configuration](docs/bot-api-client.md)
 and [verification evidence and limits](docs/control-api-verification.md).

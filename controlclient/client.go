@@ -102,6 +102,24 @@ type Client struct {
 	base, token string
 	http        *http.Client
 	boundUser   int64
+	// tokenFor, when set, supplies a user-specific bearer for every request; the
+	// client then never sends X-Acting-User-ID (no delegation).
+	tokenFor func(userID int64) (string, error)
+}
+
+// NewPerUser is for a frontend that signs a separate bearer per user (the API
+// derives the principal from the verified token). There is no service
+// credential and no X-Acting-User-ID.
+func NewPerUser(base string, tokenFor func(userID int64) (string, error), hc *http.Client) (*Client, error) {
+	if tokenFor == nil {
+		return nil, errors.New("per-user token source required")
+	}
+	c, err := New(base, "per-user", hc)
+	if err != nil {
+		return nil, err
+	}
+	c.token, c.tokenFor = "", tokenFor
+	return c, nil
 }
 
 // NewUser binds an ordinary user bearer to its configured identity. Unlike New
@@ -179,8 +197,15 @@ func (c *Client) request(ctx context.Context, user int64, method, path, key stri
 	if e != nil {
 		return errors.New("control API: invalid request")
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	if c.boundUser == 0 {
+	token := c.token
+	if c.tokenFor != nil {
+		var terr error
+		if token, terr = c.tokenFor(user); terr != nil || token == "" || strings.ContainsAny(token, "\r\n ") {
+			return errors.New("control API: no user credential")
+		}
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if c.boundUser == 0 && c.tokenFor == nil {
 		req.Header.Set("X-Acting-User-ID", strconv.FormatInt(user, 10))
 	}
 	req.Header.Set("Accept", "application/json")

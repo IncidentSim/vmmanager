@@ -1,0 +1,36 @@
+{
+  "listen_addr": "127.0.0.1:8090",
+  "state_dir": "/home/USER/.local/state/vmapi",
+  "allowed_usernames": ["@example_user_one", "example_user_two"],
+  "allowed_user_ids": [],
+  "legacy_owner_user_id": 0,
+  "jwt": {
+    "public_key_file": "/home/USER/.config/vmapi/jwt-public.pem",
+    "issuer": "incident-sim-bot",
+    "audience": "incident-sim-api"
+  },
+  "credentials": [],
+  "expose_api_on_terminal": true,
+  "shared_image_ids": ["base-image-id"],
+  "max_vms": 2,
+  "max_vms_per_user": 1,
+  "default_profile": "small",
+  "facade": {
+    "addr": "vmd.example.com:19450",
+    "server_name": "vmd.example.com",
+    "ca_file": "/home/USER/.config/vmapi/pki/facade-ca.crt",
+    "cert_file": "/home/USER/.config/vmapi/pki/vmapi-client.crt",
+    "key_file": "/home/USER/.config/vmapi/pki/vmapi-client.key"
+  },
+  "terminal": {
+    "listen_addr": "0.0.0.0:8443",
+    "public_origin": "https://bot.example.com:8443",
+    "tls_cert_file": "/path/to/your/fullchain.pem",
+    "tls_key_file": "/path/to/your/privkey.pem",
+    "ttyd_path": "ttyd",
+    "ssh_path": "ssh",
+    "ssh_key_file": "/home/USER/.config/vmapi/guest-ssh-key",
+    "ssh_use_bastion": false,
+    "max_clients": 2
+  }
+}

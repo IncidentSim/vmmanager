@@ -87,10 +87,12 @@ type Status struct {
 // partition per VM is the only per-VM serializer.
 type Controller struct {
 	control ControlPolicy
-	lc      vmlib.Lifecycle
-	st      *Store
-	term    Terminals
-	cfg     ControllerConfig
+	// authorizer is an optional extra allow decision (durable username bindings).
+	authorizer func(int64) bool
+	lc         vmlib.Lifecycle
+	st         *Store
+	term       Terminals
+	cfg        ControllerConfig
 
 	eng      *engine
 	engMu    sync.RWMutex
