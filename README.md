@@ -1,5 +1,14 @@
 # Ubuntu + PostgreSQL image builder
 
+> **New: `vmlib`, a public Go library for multi-VM lifecycle automation** (create VM
+> from an image, SSH metadata for `ssh -J`/Ansible, graceful stop, offline commit to
+> a new image, independent VMs from it), with a local host backend, a remote mTLS
+> backend and a facade gRPC API. See [`docs/architecture.md`](docs/architecture.md),
+> [`docs/ssh-automation.md`](docs/ssh-automation.md), [`docs/verification.md`](docs/verification.md)
+> and [ADR 0001](docs/adr/0001-vm-library-and-remote-backends.md). The multi-VM
+> deployment is **proposed source only** ([`deployment/multivm`](deployment/multivm/README.md))
+> and separate from the active single-VM service described below, which is unchanged.
+
 Local execution remains Unix-socket-only. An optional HTTPS/mTLS build manager
 runs that same local CLI as an unprivileged child, using server-owned paths.
 The portable remote client never accesses the VMM socket or runs host commands.

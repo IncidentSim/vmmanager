@@ -14,10 +14,11 @@ vmlib/vmlibtest/                          fake narrow backend for tests/consumer
 vmlib/local/                              local host backend (linux)
 vmlib/remote/                             mTLS helpers, backend+facade gRPC servers/clients
 cmd/vmd/                                  app: backend-only | facade-only | combined
-cmd/service-launcher, cmd/vm-helper/      launcher contract / narrow privileged helper (source only)
+cmd/vm-launcher/, cmd/vmctl/              per-slot launcher (source only); facade CLI client
+examples/pgprovision/                     PostgreSQL provisioning as an application over vmlib
 scripts/gen-proto.sh                      pinned generation + `--check`
 scripts/integration/multi-vm.sh           operator-run real verification (not run by make check)
-deployment/multi-vm/                      proposed unit templates + install notes
+deployment/multivm/                       proposed unit/helper/network sources + install notes
 docs/                                     architecture, ssh, migration, verification
 ```
 

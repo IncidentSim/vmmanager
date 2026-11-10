@@ -139,9 +139,10 @@ process state.
   externally installed launcher/service contract (new template unit
   `firecracker-vm@.service` driven by a new narrow privileged helper; see below).
   Separate processes are inherent and differ from the legacy per-build self-exec.
-* Per-VM unique socket directory, TAP, IP (from `172.16.x.x` pool via
-  host-private /30s), MAC, jail disk path, all derived from a server-allocated
-  slot number, never from user input.
+* Per-slot unique socket directory, TAP (`tap-vmN`), IP (`172.17.N.2` in a
+  host-private /30), MAC (`06:00:AC:11:NN:02`, which the CI Ubuntu rootfs maps to
+  that IP) and jail disk path, all derived from a server-allocated slot number,
+  never from user input.
 * The lease spans configuration, guest lifetime, exit proof and publication or
   deletion. A responding socket does **not** prove an old VMM exited; only the
   invocation-ID receipt does (same scheme as `cmd/service-launcher`).
@@ -161,12 +162,14 @@ process state.
 ### 6. Privileged helper (proposed, narrow)
 
 A new root helper (separate from the legacy launcher and the active
-`firecracker-builder@main.service`) with **fixed operations only**:
-`create-slot N`, `start-slot N`, `stop-slot N` (systemd instance
-`firecracker-vm@N`), and `release-slot N`, where `N` is a bounded integer. It
-accepts no paths, commands, interface names or IPs; TAP/route/NAT setup is
-derived from `N`; it refuses to touch an interface it did not create (no blind
-deletion). Delivered as **source templates/scripts only**; operator approval is
+`firecracker-builder@main.service`) with **one fixed operation**:
+`start-slot N` (starts systemd instance `firecracker-vm@N`), where `N` is a
+bounded decimal. There is intentionally no stop, restart or release verb: a guest
+ends by graceful shutdown and the library waits for the launcher's exit receipt,
+so no kill path exists. It accepts no paths, commands, interface names or IPs and
+refuses a slot whose unit is not `inactive`/`failed`. TAP/route/NAT setup runs
+from the unit (`fc-vm-network up|down N`), is derived from `N` alone, and refuses
+to touch an interface it did not create (no blind deletion). Delivered as **source templates/scripts only**; operator approval is
 required to install or activate. Nothing here runs sudo or systemctl. The
 legacy CLI is **never** turned into a root systemctl caller.
 
