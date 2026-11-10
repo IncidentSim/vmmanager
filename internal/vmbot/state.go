@@ -60,15 +60,23 @@ type VMRecord struct {
 	// Seq is the delete-attempt sequence (ADR 0004): the durable part of the
 	// delete workflow ID. 0 = no delete intent yet. A retry after a finished,
 	// unsuccessful attempt persists Seq+1 before a new workflow is submitted.
-	Seq uint64 `json:"seq,omitempty"`
+	Seq          uint64            `json:"seq,omitempty"`
+	OwnerUserID  int64             `json:"owner_user_id,omitempty"`
+	ImageID      string            `json:"image_id,omitempty"`
+	Resources    *ControlResources `json:"resources,omitempty"`
+	SSHPublicKey string            `json:"ssh_public_key,omitempty"`
+	RemoteState  string            `json:"remote_state,omitempty"`
 }
 
 // State is persisted as state.json (schema v2).
 type State struct {
-	Version    int        `json:"version"`
-	Generation uint64     `json:"generation"` // monotonic high-water mark; never reused
-	VMs        []VMRecord `json:"vms"`        // ascending Generation
-	Offset     int64      `json:"offset"`     // next Telegram update_id to request
+	Control    bool               `json:"control,omitempty"`
+	Operations []ControlOperation `json:"operations,omitempty"`
+	Images     []ControlImage     `json:"images,omitempty"`
+	Version    int                `json:"version"`
+	Generation uint64             `json:"generation"` // monotonic high-water mark; never reused
+	VMs        []VMRecord         `json:"vms"`        // ascending Generation
+	Offset     int64              `json:"offset"`     // next Telegram update_id to request
 }
 
 // stateV1 is the previous single-VM schema, read only for migration.
@@ -140,6 +148,11 @@ func (s State) validate() error {
 		return errors.New("invalid state: negative update offset")
 	}
 	ids, toks, labels := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	if s.Control {
+		if err := validateControlState(s); err != nil {
+			return err
+		}
+	}
 	var prev uint64
 	for _, r := range s.VMs {
 		if err := vmlib.ValidateID("vm", r.ID); err != nil {
@@ -149,7 +162,7 @@ func (s State) validate() error {
 			return errors.New("invalid state: malformed capability token")
 		}
 		switch r.Phase {
-		case PhaseCreating, PhaseActive, PhaseDeleting:
+		case PhaseCreating, PhaseActive, PhaseDeleting, "stopping", "stopped", "committing", "committed":
 		default:
 			return fmt.Errorf("invalid state: unknown phase %q", r.Phase)
 		}
@@ -164,10 +177,14 @@ func (s State) validate() error {
 			if err := ValidateLabel(r.Label); err != nil {
 				return errors.New("invalid state: bad label")
 			}
-			if labels[r.Label] {
+			labelKey := r.Label
+			if s.Control {
+				labelKey = fmt.Sprintf("%d:%s", r.OwnerUserID, r.Label)
+			}
+			if labels[labelKey] {
 				return errors.New("invalid state: duplicate label")
 			}
-			labels[r.Label] = true
+			labels[labelKey] = true
 		}
 		if ids[r.ID] || toks[r.Token] {
 			return errors.New("invalid state: duplicate VM id or token")
@@ -190,12 +207,15 @@ type Store struct {
 	engineOwner *Controller // keeps the flock alive while DBOS may execute work
 	st          State
 	migration   *MigrationInfo
+	controlOpen bool
+	legacyOwner int64
 }
 
 // OpenStore creates dir (0700) if needed, takes the exclusive lock and loads
 // state, migrating a v1 file to v2. It fails closed on loose permissions,
 // corrupt, invalid or future-version data.
-func OpenStore(dir string) (*Store, error) {
+func OpenStore(dir string) (*Store, error) { return openStore(dir, false, 0) }
+func openStore(dir string, control bool, owner int64) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("state dir: %w", err)
 	}
@@ -217,7 +237,7 @@ func OpenStore(dir string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("state lock: %w", err)
 	}
-	s := &Store{dir: dir, lock: lf}
+	s := &Store{dir: dir, lock: lf, controlOpen: control, legacyOwner: owner}
 	if err := s.load(); err != nil {
 		lf.Close()
 		return nil, err
@@ -273,6 +293,9 @@ func (s *Store) load() error {
 		if err := st.validate(); err != nil {
 			return fmt.Errorf("state file: %w", err)
 		}
+		if s.controlOpen && !st.Control && len(st.VMs) > 0 && s.legacyOwner <= 0 {
+			return errors.New("legacy_owner_user_id required")
+		}
 		s.st = st
 		return nil
 	case stateVersionV1:
@@ -290,6 +313,9 @@ func (s *Store) migrateV1(raw []byte) error {
 		return fmt.Errorf("state file is corrupt; refusing to continue: %w", err)
 	}
 	next := State{Version: stateVersion, Generation: v1.Generation, Offset: v1.Offset, VMs: []VMRecord{}}
+	if s.controlOpen && v1.VM != nil && s.legacyOwner <= 0 {
+		return errors.New("legacy_owner_user_id required")
+	}
 	if v1.VM != nil {
 		r := *v1.VM
 		if r.Label != "" {
@@ -371,7 +397,15 @@ func (s *Store) Snapshot() State {
 }
 
 func clone(st State) State {
+	st.Operations = append([]ControlOperation{}, st.Operations...)
+	st.Images = append([]ControlImage{}, st.Images...)
 	st.VMs = append([]VMRecord{}, st.VMs...)
+	for n := range st.VMs {
+		if st.VMs[n].Resources != nil {
+			r := *st.VMs[n].Resources
+			st.VMs[n].Resources = &r
+		}
+	}
 	return st
 }
 
@@ -390,6 +424,27 @@ func (s *Store) UpdateErr(mutate func(*State) error) error {
 	if err := mutate(&next); err != nil {
 		return err
 	}
+	if s.st.Control {
+		for _, old := range s.st.VMs {
+			if cur, ok := next.ByID(old.ID); ok && cur.OwnerUserID != old.OwnerUserID {
+				return errors.New("VM owner is immutable")
+			}
+		}
+		for _, old := range s.st.Images {
+			for _, cur := range next.Images {
+				if cur.ID == old.ID && cur.OwnerUserID != old.OwnerUserID {
+					return errors.New("image owner is immutable")
+				}
+			}
+		}
+		for _, old := range s.st.Operations {
+			for _, cur := range next.Operations {
+				if cur.ID == old.ID && cur.OwnerUserID != old.OwnerUserID {
+					return errors.New("operation owner is immutable")
+				}
+			}
+		}
+	}
 	next.Version = stateVersion
 	sort.Slice(next.VMs, func(i, j int) bool { return next.VMs[i].Generation < next.VMs[j].Generation })
 	if err := next.validate(); err != nil {
@@ -398,7 +453,7 @@ func (s *Store) UpdateErr(mutate func(*State) error) error {
 	if err := s.write(next); err != nil {
 		return err
 	}
-	s.st = next
+	s.st = clone(next)
 	return nil
 }
 

@@ -1,0 +1,340 @@
+openapi: 3.0.3
+info:
+  title: vmapi control API
+  version: "1"
+  description: >
+    Authenticated VM control API (see control-api.md). Mutations are asynchronous:
+    they return 202 with an operation to poll. Foreign and unknown IDs return an
+    identical 404. A user bearer is bound to one user; a service bearer must send
+    X-Acting-User-ID.
+servers:
+  - url: http://127.0.0.1:8090
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    idempotency:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 1-128 printable ASCII characters without spaces; scoped to the principal.
+      schema: {type: string, minLength: 1, maxLength: 128}
+    acting:
+      name: X-Acting-User-ID
+      in: header
+      required: false
+      description: Required (canonical positive decimal) for service credentials; forbidden for user credentials.
+      schema: {type: string, pattern: "^[1-9][0-9]*$"}
+  responses:
+    Error:
+      description: Error envelope.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [not_found, unauthorized, forbidden, invalid_argument, conflict, capacity, unavailable, internal]
+            message: {type: string}
+    Resources:
+      type: object
+      nullable: true
+      required: [vcpu, memory_mib]
+      properties:
+        vcpu: {type: integer, minimum: 1}
+        memory_mib: {type: integer, minimum: 1}
+    VM:
+      type: object
+      required: [id, name, image_id, state, phase, resources]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        image_id: {type: string}
+        state: {type: string}
+        phase:
+          type: string
+          enum: [creating, active, stopping, stopped, committing, committed, deleting]
+        resources: {$ref: "#/components/schemas/Resources"}
+    CreateVM:
+      type: object
+      additionalProperties: false
+      required: [image_id]
+      properties:
+        name: {type: string}
+        image_id: {type: string}
+        resources: {$ref: "#/components/schemas/Resources"}
+        ssh_public_key:
+          type: string
+          description: Currently always rejected with 422 (unsupported by the local backend).
+    Name:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string}
+    Empty:
+      type: object
+      additionalProperties: false
+    Accepted:
+      type: object
+      required: [operation_id]
+      properties:
+        operation_id: {type: string}
+        vm_id: {type: string}
+        image_id: {type: string}
+    Image:
+      type: object
+      required: [id, name, shared]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        shared: {type: boolean}
+        phase:
+          type: string
+          enum: [ready, publishing, deleting]
+    SSH:
+      type: object
+      required: [host, port, user, host_key_fingerprint, ready]
+      properties:
+        host: {type: string}
+        port: {type: integer}
+        user: {type: string}
+        bastion:
+          type: object
+          properties:
+            host: {type: string}
+            port: {type: integer}
+            user: {type: string}
+        host_key_fingerprint: {type: string}
+        ready: {type: boolean}
+        auth_mode: {type: string}
+        key_reference: {type: string}
+    Operation:
+      type: object
+      required: [id, status, kind]
+      properties:
+        id: {type: string}
+        status: {type: string, enum: [pending, running, succeeded, failed]}
+        kind: {type: string}
+        vm_id: {type: string}
+        image_id: {type: string}
+        result:
+          type: object
+          description: >
+            For a succeeded terminal operation, the result contains a URL
+            granting bearer access to the terminal.
+          properties:
+            url: {type: string}
+        error:
+          type: object
+          properties:
+            code: {type: string, enum: [unavailable, conflict, capacity, invalid_argument]}
+            message: {type: string}
+paths:
+  /healthz:
+    get:
+      security: []
+      summary: Unauthenticated minimal health.
+      responses:
+        "200":
+          description: ok or degraded (startup repair incomplete; API still serving).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [ok, degraded]}
+  /v1/capabilities:
+    get:
+      parameters: [{$ref: "#/components/parameters/acting"}]
+      responses:
+        "200":
+          description: API quotas and live resource policy forwarded from the backend facade.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  max_vms: {type: integer}
+                  max_vms_per_user: {type: integer}
+                  backend_max_vms: {type: integer}
+                  max_total_memory_mib:
+                    type: integer
+                    description: Omitted when no aggregate memory cap is advertised.
+                  max_total_vcpu:
+                    type: integer
+                    description: Omitted when no aggregate CPU cap is advertised.
+                  profiles:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, vcpu, memory_mib, disk_mib]
+                      properties:
+                        name: {type: string}
+                        vcpu: {type: integer}
+                        memory_mib: {type: integer}
+                        disk_mib: {type: integer}
+                  ssh_public_key_supported: {type: boolean}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/vms:
+    get:
+      parameters: [{$ref: "#/components/parameters/acting"}]
+      responses:
+        "200":
+          description: Caller's VMs.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vms: {type: array, items: {$ref: "#/components/schemas/VM"}}
+        default: {$ref: "#/components/responses/Error"}
+    post:
+      parameters: [{$ref: "#/components/parameters/acting"}, {$ref: "#/components/parameters/idempotency"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateVM"}
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/vms/{id}:
+    parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}]
+    get:
+      responses:
+        "200":
+          description: VM.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VM"}
+        default: {$ref: "#/components/responses/Error"}
+    delete:
+      parameters: [{$ref: "#/components/parameters/idempotency"}]
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/vms/{id}/stop:
+    parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}, {$ref: "#/components/parameters/idempotency"}]
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Empty"}
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/vms/{id}/commit:
+    parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}, {$ref: "#/components/parameters/idempotency"}]
+    post:
+      summary: Cold commit into a new owner-private image; the source VM stays stopped and occupied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Name"}
+      responses:
+        "202":
+          description: Accepted (includes the new image_id).
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/vms/{id}/terminal:
+    parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}, {$ref: "#/components/parameters/idempotency"}]
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Empty"}
+      responses:
+        "202":
+          description: Accepted; read the URL from the operation result.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/vms/{id}/ssh:
+    parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}]
+    get:
+      responses:
+        "200":
+          description: Public connection metadata only.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SSH"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/images:
+    get:
+      parameters: [{$ref: "#/components/parameters/acting"}]
+      responses:
+        "200":
+          description: Configured shared images plus the caller's ready derived images.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  images: {type: array, items: {$ref: "#/components/schemas/Image"}}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/images/{id}:
+    parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}]
+    get:
+      responses:
+        "200":
+          description: Image.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Image"}
+        default: {$ref: "#/components/responses/Error"}
+    delete:
+      parameters: [{$ref: "#/components/parameters/idempotency"}]
+      summary: Refused (409) for shared bases and images referenced by any VM.
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/operations/{id}:
+    parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}]
+    get:
+      responses:
+        "200":
+          description: Operation state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Operation"}
+        default: {$ref: "#/components/responses/Error"}

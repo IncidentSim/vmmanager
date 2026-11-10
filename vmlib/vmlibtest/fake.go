@@ -101,6 +101,28 @@ func (b *Backend) GetImage(_ context.Context, id string) (vmlib.Image, error) {
 	return i, nil
 }
 
+func (b *Backend) DeleteImage(_ context.Context, id string) error {
+	if err := vmlib.ValidateID("image", id); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	img, ok := b.images[id]
+	if !ok {
+		return nil
+	}
+	if img.Base {
+		return vmlib.ErrNotStopped
+	}
+	for _, v := range b.vms {
+		if v.host.ImageID == id {
+			return vmlib.ErrNotStopped
+		}
+	}
+	delete(b.images, id)
+	return nil
+}
+
 func (b *Backend) Prepare(_ context.Context, r vmlib.PrepareRequest) (vmlib.HostVM, error) {
 	if err := vmlib.ValidateID("vm", r.VMID); err != nil {
 		return vmlib.HostVM{}, err
@@ -114,7 +136,7 @@ func (b *Backend) Prepare(_ context.Context, r vmlib.PrepareRequest) (vmlib.Host
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if v, ok := b.vms[r.VMID]; ok {
-		if v.host.ImageID == r.ImageID && v.host.Profile == r.Profile {
+		if v.host.ImageID == r.ImageID && v.host.Profile == r.Profile && (r.Resources == nil || v.host.Resources == *r.Resources) {
 			return v.host, nil
 		}
 		return vmlib.HostVM{}, vmlib.ErrAlreadyExists
@@ -122,12 +144,35 @@ func (b *Backend) Prepare(_ context.Context, r vmlib.PrepareRequest) (vmlib.Host
 	if _, ok := b.images[r.ImageID]; !ok {
 		return vmlib.HostVM{}, vmlib.ErrNotFound
 	}
-	known := false
-	for _, p := range b.caps.Profiles {
-		known = known || p.Name == r.Profile
+	if err := vmlib.ValidateResourceSelection(r.Profile, r.Resources); err != nil {
+		return vmlib.HostVM{}, err
 	}
-	if !known {
-		return vmlib.HostVM{}, fmt.Errorf("%w: unknown profile %q", vmlib.ErrInvalidArgument, r.Profile)
+	var resources vmlib.VMResources
+	var max vmlib.VMResources
+	for _, p := range b.caps.Profiles {
+		if p.VCPU > max.VCPU {
+			max.VCPU = p.VCPU
+		}
+		if p.MemMiB > max.MemMiB {
+			max.MemMiB = p.MemMiB
+		}
+		if p.Name == r.Profile {
+			resources = vmlib.VMResources{VCPU: p.VCPU, MemMiB: p.MemMiB}
+		}
+	}
+	if r.Resources != nil {
+		resources = *r.Resources
+	}
+	if resources.VCPU == 0 || resources.MemMiB == 0 || resources.VCPU > max.VCPU || resources.MemMiB > max.MemMiB {
+		return vmlib.HostVM{}, vmlib.ErrInvalidArgument
+	}
+	var mem, cpu uint64
+	for _, v := range b.vms {
+		mem += uint64(v.host.Resources.MemMiB)
+		cpu += uint64(v.host.Resources.VCPU)
+	}
+	if (b.caps.MaxTotalMemMiB > 0 && mem+uint64(resources.MemMiB) > uint64(b.caps.MaxTotalMemMiB)) || (b.caps.MaxTotalVCPU > 0 && cpu+uint64(resources.VCPU) > uint64(b.caps.MaxTotalVCPU)) {
+		return vmlib.HostVM{}, vmlib.ErrResourceExhausted
 	}
 	if len(b.vms) >= b.caps.MaxVMs {
 		return vmlib.HostVM{}, vmlib.ErrResourceExhausted
@@ -139,7 +184,7 @@ func (b *Backend) Prepare(_ context.Context, r vmlib.PrepareRequest) (vmlib.Host
 	b.ips[slot] = true
 	b.Prepared++
 	v := &fakeVM{slot: slot, exit: make(chan struct{})}
-	v.host = vmlib.HostVM{ID: r.VMID, ImageID: r.ImageID, Profile: r.Profile, State: vmlib.HostPrepared,
+	v.host = vmlib.HostVM{Resources: resources, ID: r.VMID, ImageID: r.ImageID, Profile: r.Profile, State: vmlib.HostPrepared,
 		GuestIP: fmt.Sprintf("172.16.%d.2", slot+1), PublicKeyProvisioned: r.SSHPublicKey != "",
 		Guest: &vmlib.GuestNetwork{Address: fmt.Sprintf("172.16.%d.2/30", slot+1), Gateway: fmt.Sprintf("172.16.%d.1", slot+1),
 			DNS: append([]string(nil), b.GuestDNS...), Configuration: "mac-derived"}}

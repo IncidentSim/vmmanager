@@ -86,10 +86,11 @@ type Status struct {
 // lifecycle work runs as DBOS workflows (orch.go, ADR 0004): the queue
 // partition per VM is the only per-VM serializer.
 type Controller struct {
-	lc   vmlib.Lifecycle
-	st   *Store
-	term Terminals
-	cfg  ControllerConfig
+	control ControlPolicy
+	lc      vmlib.Lifecycle
+	st      *Store
+	term    Terminals
+	cfg     ControllerConfig
 
 	eng      *engine
 	engMu    sync.RWMutex
@@ -273,7 +274,7 @@ func (c *Controller) ensureTerminalLocked(ctx context.Context, rec VMRecord) err
 	}
 	authorized := func() bool {
 		r, ok := c.st.Snapshot().ByID(cur.ID)
-		return ok && r.Phase == PhaseActive && r.Generation == cur.Generation && r.Token == cur.Token
+		return ok && (!c.st.Snapshot().Control || (r.OwnerUserID == cur.OwnerUserID && c.ControlAllowed(r.OwnerUserID))) && r.Phase == PhaseActive && r.Generation == cur.Generation && r.Token == cur.Token
 	}
 	if err := c.term.Start(ctx, TerminalTarget{VMID: cur.ID, Token: cur.Token, Host: info.Host, User: info.User, ProxyJump: info.ProxyJump(), authorize: authorized}); err != nil {
 		return err

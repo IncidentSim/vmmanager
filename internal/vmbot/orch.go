@@ -46,9 +46,10 @@ const (
 
 // OpInput is the workflow input: identifiers only, never a token or a link.
 type OpInput struct {
-	Kind string
-	VMID string
-	Seq  uint64
+	Kind        string
+	VMID        string
+	Seq         uint64
+	OperationID string
 }
 
 // Result codes carried in OpResult (an outcome is a value, not a workflow error:
@@ -181,7 +182,12 @@ func vmbotOp(ctx dbos.Context, in OpInput) (OpResult, error) {
 	if c == nil {
 		return OpResult{Code: codeFailed, Msg: "no controller"}, nil
 	}
+	if c.st.Snapshot().Control && in.Kind != "control" {
+		return OpResult{Code: codeFailed, Msg: "legacy workflow retired by control migration"}, nil
+	}
 	switch in.Kind {
+	case "control":
+		return c.controlFlow(ctx, in)
 	case opCreate:
 		return c.createFlow(ctx, in)
 	case opDelete:

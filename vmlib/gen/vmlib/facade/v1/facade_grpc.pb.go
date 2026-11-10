@@ -19,14 +19,16 @@ import (
 const _ = grpc.SupportPackageIsVersion8
 
 const (
-	VMService_CreateVM_FullMethodName   = "/vmlib.facade.v1.VMService/CreateVM"
-	VMService_GetVM_FullMethodName      = "/vmlib.facade.v1.VMService/GetVM"
-	VMService_ListVMs_FullMethodName    = "/vmlib.facade.v1.VMService/ListVMs"
-	VMService_GetSSHInfo_FullMethodName = "/vmlib.facade.v1.VMService/GetSSHInfo"
-	VMService_StopVM_FullMethodName     = "/vmlib.facade.v1.VMService/StopVM"
-	VMService_CommitVM_FullMethodName   = "/vmlib.facade.v1.VMService/CommitVM"
-	VMService_DeleteVM_FullMethodName   = "/vmlib.facade.v1.VMService/DeleteVM"
-	VMService_ListImages_FullMethodName = "/vmlib.facade.v1.VMService/ListImages"
+	VMService_CreateVM_FullMethodName        = "/vmlib.facade.v1.VMService/CreateVM"
+	VMService_GetVM_FullMethodName           = "/vmlib.facade.v1.VMService/GetVM"
+	VMService_ListVMs_FullMethodName         = "/vmlib.facade.v1.VMService/ListVMs"
+	VMService_GetSSHInfo_FullMethodName      = "/vmlib.facade.v1.VMService/GetSSHInfo"
+	VMService_StopVM_FullMethodName          = "/vmlib.facade.v1.VMService/StopVM"
+	VMService_CommitVM_FullMethodName        = "/vmlib.facade.v1.VMService/CommitVM"
+	VMService_DeleteVM_FullMethodName        = "/vmlib.facade.v1.VMService/DeleteVM"
+	VMService_ListImages_FullMethodName      = "/vmlib.facade.v1.VMService/ListImages"
+	VMService_DeleteImage_FullMethodName     = "/vmlib.facade.v1.VMService/DeleteImage"
+	VMService_GetCapabilities_FullMethodName = "/vmlib.facade.v1.VMService/GetCapabilities"
 )
 
 // VMServiceClient is the client API for VMService service.
@@ -44,6 +46,10 @@ type VMServiceClient interface {
 	CommitVM(ctx context.Context, in *CommitVMRequest, opts ...grpc.CallOption) (*Image, error)
 	DeleteVM(ctx context.Context, in *VMRef, opts ...grpc.CallOption) (*DeleteVMResponse, error)
 	ListImages(ctx context.Context, in *ListImagesRequest, opts ...grpc.CallOption) (*ListImagesResponse, error)
+	DeleteImage(ctx context.Context, in *DeleteImageRequest, opts ...grpc.CallOption) (*DeleteImageResponse, error)
+	// GetCapabilities returns the backend's resource policy as advertised by the
+	// backend. It carries no SSH/bastion metadata (see GetSSHInfo).
+	GetCapabilities(ctx context.Context, in *GetCapabilitiesRequest, opts ...grpc.CallOption) (*GetCapabilitiesResponse, error)
 }
 
 type vMServiceClient struct {
@@ -134,6 +140,26 @@ func (c *vMServiceClient) ListImages(ctx context.Context, in *ListImagesRequest,
 	return out, nil
 }
 
+func (c *vMServiceClient) DeleteImage(ctx context.Context, in *DeleteImageRequest, opts ...grpc.CallOption) (*DeleteImageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteImageResponse)
+	err := c.cc.Invoke(ctx, VMService_DeleteImage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vMServiceClient) GetCapabilities(ctx context.Context, in *GetCapabilitiesRequest, opts ...grpc.CallOption) (*GetCapabilitiesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetCapabilitiesResponse)
+	err := c.cc.Invoke(ctx, VMService_GetCapabilities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VMServiceServer is the server API for VMService service.
 // All implementations must embed UnimplementedVMServiceServer
 // for forward compatibility
@@ -149,6 +175,10 @@ type VMServiceServer interface {
 	CommitVM(context.Context, *CommitVMRequest) (*Image, error)
 	DeleteVM(context.Context, *VMRef) (*DeleteVMResponse, error)
 	ListImages(context.Context, *ListImagesRequest) (*ListImagesResponse, error)
+	DeleteImage(context.Context, *DeleteImageRequest) (*DeleteImageResponse, error)
+	// GetCapabilities returns the backend's resource policy as advertised by the
+	// backend. It carries no SSH/bastion metadata (see GetSSHInfo).
+	GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error)
 	mustEmbedUnimplementedVMServiceServer()
 }
 
@@ -179,6 +209,12 @@ func (UnimplementedVMServiceServer) DeleteVM(context.Context, *VMRef) (*DeleteVM
 }
 func (UnimplementedVMServiceServer) ListImages(context.Context, *ListImagesRequest) (*ListImagesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListImages not implemented")
+}
+func (UnimplementedVMServiceServer) DeleteImage(context.Context, *DeleteImageRequest) (*DeleteImageResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteImage not implemented")
+}
+func (UnimplementedVMServiceServer) GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetCapabilities not implemented")
 }
 func (UnimplementedVMServiceServer) mustEmbedUnimplementedVMServiceServer() {}
 
@@ -337,6 +373,42 @@ func _VMService_ListImages_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMService_DeleteImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteImageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMServiceServer).DeleteImage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMService_DeleteImage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMServiceServer).DeleteImage(ctx, req.(*DeleteImageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VMService_GetCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCapabilitiesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMServiceServer).GetCapabilities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMService_GetCapabilities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMServiceServer).GetCapabilities(ctx, req.(*GetCapabilitiesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VMService_ServiceDesc is the grpc.ServiceDesc for VMService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -375,6 +447,14 @@ var VMService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListImages",
 			Handler:    _VMService_ListImages_Handler,
+		},
+		{
+			MethodName: "DeleteImage",
+			Handler:    _VMService_DeleteImage_Handler,
+		},
+		{
+			MethodName: "GetCapabilities",
+			Handler:    _VMService_GetCapabilities_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

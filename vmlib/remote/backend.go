@@ -42,6 +42,22 @@ func (s *backendServer) Capabilities(ctx context.Context, _ *pb.CapabilitiesRequ
 	return out, nil
 }
 
+func backendResourcesToPB(r *vmlib.VMResources) *pb.VMResources {
+	if r == nil {
+		return nil
+	}
+	return &pb.VMResources{Vcpu: r.VCPU, MemMib: r.MemMiB}
+}
+func backendResourcesFromPB(r *pb.VMResources) *vmlib.VMResources {
+	if r == nil {
+		return nil
+	}
+	return &vmlib.VMResources{VCPU: r.GetVcpu(), MemMiB: r.GetMemMib()}
+}
+func backendResourceValue(r *pb.VMResources) vmlib.VMResources {
+	return vmlib.VMResources{VCPU: r.GetVcpu(), MemMiB: r.GetMemMib()}
+}
+
 func imageToPB(i vmlib.Image) *pb.Image {
 	return &pb.Image{Id: i.ID, SizeBytes: i.SizeBytes, Sha256: i.SHA256, Base: i.Base}
 }
@@ -65,13 +81,13 @@ func guestFromPB(g *pb.GuestNetwork) *vmlib.GuestNetwork {
 }
 
 func hostToPB(h vmlib.HostVM) *pb.HostVM {
-	return &pb.HostVM{Guest: guestToPB(h.Guest), VmId: h.ID, ImageId: h.ImageID, Profile: h.Profile, State: h.State, GuestIp: h.GuestIP,
+	return &pb.HostVM{Resources: backendResourcesToPB(&h.Resources), Guest: guestToPB(h.Guest), VmId: h.ID, ImageId: h.ImageID, Profile: h.Profile, State: h.State, GuestIp: h.GuestIP,
 		Retained: h.Retained, RetainedReason: h.RetainedReason, SshHostKeyFingerprint: h.HostKeyFingerprint,
 		PublicKeyProvisioned: h.PublicKeyProvisioned}
 }
 
 func hostFromPB(h *pb.HostVM) vmlib.HostVM {
-	return vmlib.HostVM{Guest: guestFromPB(h.GetGuest()), ID: h.GetVmId(), ImageID: h.GetImageId(), Profile: h.GetProfile(), State: h.GetState(),
+	return vmlib.HostVM{Resources: backendResourceValue(h.GetResources()), Guest: guestFromPB(h.GetGuest()), ID: h.GetVmId(), ImageID: h.GetImageId(), Profile: h.GetProfile(), State: h.GetState(),
 		GuestIP: h.GetGuestIp(), Retained: h.GetRetained(), RetainedReason: h.GetRetainedReason(),
 		HostKeyFingerprint: h.GetSshHostKeyFingerprint(), PublicKeyProvisioned: h.GetPublicKeyProvisioned()}
 }
@@ -88,6 +104,20 @@ func (s *backendServer) ListImages(ctx context.Context, _ *pb.ListImagesRequest)
 	return out, nil
 }
 
+func (s *backendServer) DeleteImage(ctx context.Context, r *pb.DeleteImageRequest) (*pb.DeleteImageResponse, error) {
+	if err := vmlib.ValidateID("image", r.GetId()); err != nil {
+		return nil, toStatus(err)
+	}
+	if err := s.b.DeleteImage(ctx, r.GetId()); err != nil {
+		return nil, toStatus(err)
+	}
+	return &pb.DeleteImageResponse{}, nil
+}
+func (c *BackendClient) DeleteImage(ctx context.Context, id string) error {
+	_, err := c.c.DeleteImage(ctx, &pb.DeleteImageRequest{Id: id})
+	return fromStatus(err)
+}
+
 func (s *backendServer) GetImage(ctx context.Context, r *pb.GetImageRequest) (*pb.Image, error) {
 	if err := vmlib.ValidateID("image", r.GetId()); err != nil {
 		return nil, toStatus(err)
@@ -100,15 +130,18 @@ func (s *backendServer) GetImage(ctx context.Context, r *pb.GetImageRequest) (*p
 }
 
 func (s *backendServer) Prepare(ctx context.Context, r *pb.PrepareRequest) (*pb.HostVM, error) {
-	for _, c := range [][2]string{{"vm", r.GetVmId()}, {"image", r.GetImageId()}, {"profile", r.GetProfile()}} {
+	for _, c := range [][2]string{{"vm", r.GetVmId()}, {"image", r.GetImageId()}} {
 		if err := vmlib.ValidateID(c[0], c[1]); err != nil {
 			return nil, toStatus(err)
 		}
 	}
+	if err := vmlib.ValidateResourceSelection(r.GetProfile(), backendResourcesFromPB(r.GetResources())); err != nil {
+		return nil, toStatus(err)
+	}
 	if err := vmlib.ValidatePublicKey(r.GetSshPublicKey()); err != nil {
 		return nil, toStatus(err)
 	}
-	h, err := s.b.Prepare(ctx, vmlib.PrepareRequest{VMID: r.GetVmId(), ImageID: r.GetImageId(), Profile: r.GetProfile(), SSHPublicKey: r.GetSshPublicKey()})
+	h, err := s.b.Prepare(ctx, vmlib.PrepareRequest{Resources: backendResourcesFromPB(r.GetResources()), VMID: r.GetVmId(), ImageID: r.GetImageId(), Profile: r.GetProfile(), SSHPublicKey: r.GetSshPublicKey()})
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -246,7 +279,7 @@ func (c *BackendClient) GetImage(ctx context.Context, id string) (vmlib.Image, e
 }
 
 func (c *BackendClient) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.HostVM, error) {
-	r, err := c.c.Prepare(ctx, &pb.PrepareRequest{VmId: req.VMID, ImageId: req.ImageID, Profile: req.Profile, SshPublicKey: req.SSHPublicKey})
+	r, err := c.c.Prepare(ctx, &pb.PrepareRequest{Resources: backendResourcesToPB(req.Resources), VmId: req.VMID, ImageId: req.ImageID, Profile: req.Profile, SshPublicKey: req.SSHPublicKey})
 	if err != nil {
 		return vmlib.HostVM{}, fromStatus(err)
 	}

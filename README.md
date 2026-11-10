@@ -1,5 +1,21 @@
 # Ubuntu + PostgreSQL image builder
 
+## Standalone VM control API
+
+`vmapi` owns authenticated VM/image operations, per-user ownership and quotas,
+DBOS/SQLite recovery, and terminal access. The separate `vmbot` process is an
+HTTP client; it does not own VMs or connect to the infrastructure facade.
+Create from an allowed image with CPU/RAM, obtain SSH/terminal access, cold-commit
+into a new private image, and boot derivatives through the same API.
+
+See [API and migration guide](docs/control-api.md),
+[OpenAPI](docs/control-api-openapi.yaml), [bot-client configuration](docs/bot-api-client.md)
+and [verification evidence and limits](docs/control-api-verification.md).
+Build with `make vmapi vmbot`; run the root/KVM-free executable smoke with
+`make control-smoke`. Source templates are in `deployment/vmapi/` and
+`deployment/vmbot/`; they do not activate services. The legacy builder below
+remains a separate consumer.
+
 > **New: `vmlib`, a public Go library for multi-VM lifecycle automation** (create VM
 > from an image, SSH metadata for `ssh -J`/Ansible, graceful stop, offline commit to
 > a new image, independent VMs from it), with a local host backend, a remote mTLS

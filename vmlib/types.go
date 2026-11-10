@@ -100,6 +100,23 @@ type Image struct {
 	Base      bool
 }
 
+// VMResources is the exact immutable CPU/RAM reservation of a VM.
+type VMResources struct {
+	VCPU   uint32
+	MemMiB uint32
+}
+
+// ValidateResourceSelection rejects ambiguous modes and zero explicit resources.
+func ValidateResourceSelection(profile string, resources *VMResources) error {
+	if resources != nil {
+		if profile != "" || resources.VCPU == 0 || resources.MemMiB == 0 {
+			return fmt.Errorf("%w: choose a profile or positive explicit CPU/RAM", ErrInvalidArgument)
+		}
+		return nil
+	}
+	return ValidateID("profile", profile)
+}
+
 type Profile struct {
 	Name                  string
 	VCPU, MemMiB, DiskMiB uint32
@@ -135,8 +152,20 @@ type Capabilities struct {
 	MaxTotalVCPU   uint32
 }
 
+// ResourceCapabilities is the subset of backend policy exposed through the
+// facade: VM-count, advertised profiles and aggregate caps. It deliberately
+// excludes SSH/bastion metadata, which is only available per VM via SSHInfo.
+type ResourceCapabilities struct {
+	MaxVMs   int
+	Profiles []Profile
+	// 0 = not enforced by the backend.
+	MaxTotalMemMiB uint32
+	MaxTotalVCPU   uint32
+}
+
 // HostVM is a backend's view of one VM.
 type HostVM struct {
+	Resources                   VMResources
 	ID, ImageID, Profile, State string
 	GuestIP                     string
 	Retained                    bool
@@ -158,6 +187,7 @@ type ReleaseResult struct {
 }
 
 type PrepareRequest struct {
+	Resources              *VMResources
 	VMID, ImageID, Profile string
 	SSHPublicKey           string
 }
@@ -168,6 +198,8 @@ type Backend interface {
 	Capabilities(ctx context.Context) (Capabilities, error)
 	ListImages(ctx context.Context) ([]Image, error)
 	GetImage(ctx context.Context, id string) (Image, error)
+	// DeleteImage removes only unreferenced managed derived images; missing is success.
+	DeleteImage(ctx context.Context, id string) error
 	// Prepare is idempotent by VMID and must atomically enforce admission caps.
 	Prepare(ctx context.Context, req PrepareRequest) (HostVM, error)
 	Start(ctx context.Context, vmID string) (HostVM, error)
@@ -186,6 +218,7 @@ type Backend interface {
 
 // VM is the facade view of a VM.
 type VM struct {
+	Resources            VMResources
 	ID, ImageID, Profile string
 	State                VMState
 	Labels               map[string]string
@@ -194,6 +227,7 @@ type VM struct {
 }
 
 type CreateRequest struct {
+	Resources *VMResources
 	// ID is optional; a unique ID is generated when empty.
 	ID, ImageID, Profile string
 	Labels               map[string]string
@@ -237,7 +271,10 @@ type Lifecycle interface {
 	Stop(ctx context.Context, id string) (VM, error)
 	Commit(ctx context.Context, id, newImageID string) (Image, error)
 	Delete(ctx context.Context, id string) (DeleteResult, error)
+	DeleteImage(ctx context.Context, id string) error
 	ListImages(ctx context.Context) ([]Image, error)
+	// Capabilities reports the backend's current resource policy (never cached).
+	Capabilities(ctx context.Context) (ResourceCapabilities, error)
 }
 
 // ProxyJump renders the value for `ssh -J`, or "" without a bastion.

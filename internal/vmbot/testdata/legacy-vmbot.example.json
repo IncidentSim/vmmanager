@@ -1,0 +1,29 @@
+{
+  "telegram_token_file": "/home/USER/.config/vmbot/telegram-token",
+  "allowed_user_id": 123456789,
+  "facade": {
+    "addr": "vmd.example.com:19450",
+    "server_name": "vmd.example.com",
+    "ca_file": "/home/USER/.config/vmbot/pki/facade-ca.crt",
+    "cert_file": "/home/USER/.config/vmbot/pki/vmbot-client.crt",
+    "key_file": "/home/USER/.config/vmbot/pki/vmbot-client.key"
+  },
+  "vm": {
+    "image_id": "base-image-id",
+    "profile": "small"
+  },
+  "max_vms": 2,
+  "state_dir": "/home/USER/.local/state/vmbot",
+  "terminal": {
+    "listen_addr": "0.0.0.0:8443",
+    "public_origin": "https://bot.example.com:8443",
+    "tls_cert_file": "/path/to/your/fullchain.pem",
+    "tls_key_file": "/path/to/your/privkey.pem",
+    "ttyd_path": "ttyd",
+    "ssh_path": "ssh",
+    "ssh_key_file": "/home/USER/.config/vmbot/guest-ssh-key",
+    "ssh_use_bastion": false,
+    "max_clients": 2,
+    "insecure_http_for_testing": false
+  }
+}

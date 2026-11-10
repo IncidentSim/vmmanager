@@ -1,25 +1,23 @@
-# systemd USER unit for vmbot (source template; installing it needs operator approval).
-#   install -m 0644 vmbot.service ~/.config/systemd/user/vmbot.service
-#   systemctl --user daemon-reload && systemctl --user enable --now vmbot.service
-# Run `loginctl enable-linger $USER` if it must survive logout.
+# Source-only systemd USER template for the NEW HTTP frontend.
+# Install as vmbot-http.service only after the explicit handoff documented in
+# docs/bot-api-client.md. Never run it alongside the legacy Telegram poller.
+# This template intentionally does NOT replace the old binary/config/unit paths.
 [Unit]
-Description=vmbot: Telegram single-VM bot with capability-link web terminal
+Description=vmbot HTTP-only Telegram frontend
+After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/vmbot -config %h/.config/vmbot/vmbot.json
-# Restarting the bot never deletes the VM: it reconciles and keeps it.
+ExecStart=%h/.local/bin/vmbot-http -config %h/.config/vmbot-http/vmbot.json
 Restart=on-failure
 RestartSec=5s
 UMask=0077
 NoNewPrivileges=yes
 MemoryMax=256M
-TasksMax=128
-# SIGTERM lets the bot close terminals and stop polling; the control-group kill
-# afterwards also reaps any ttyd/ssh left behind.
+TasksMax=64
 KillSignal=SIGTERM
 KillMode=control-group
-TimeoutStopSec=30s
+TimeoutStopSec=55s
 
 [Install]
 WantedBy=default.target

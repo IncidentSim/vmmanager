@@ -127,7 +127,11 @@ func (r *record) snapshot() VM {
 
 func (r *record) isCreating() bool { r.st.Lock(); defer r.st.Unlock(); return r.creating }
 
-func (r *record) isUncertainPrepare() bool { r.st.Lock(); defer r.st.Unlock(); return r.uncertainPrepare }
+func (r *record) isUncertainPrepare() bool {
+	r.st.Lock()
+	defer r.st.Unlock()
+	return r.uncertainPrepare
+}
 
 func (r *record) isDeleted() bool { r.st.Lock(); defer r.st.Unlock(); return r.deleted }
 
@@ -172,6 +176,7 @@ func (r *record) applyIfUnchanged(h HostVM, ver uint64) bool {
 // committed) no later read may move the VM back to running/exiting/preparing.
 // Retention is sticky until a successful delete.
 func (r *record) applyLocked(h HostVM) {
+	r.vm.Resources = h.Resources
 	if r.exited {
 		return
 	}
@@ -229,10 +234,13 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (VM, error) {
 		}
 		req.ID = id
 	}
-	for _, c := range [][2]string{{"vm", req.ID}, {"image", req.ImageID}, {"profile", req.Profile}} {
+	for _, c := range [][2]string{{"vm", req.ID}, {"image", req.ImageID}} {
 		if err := ValidateID(c[0], c[1]); err != nil {
 			return VM{}, err
 		}
+	}
+	if err := ValidateResourceSelection(req.Profile, req.Resources); err != nil {
+		return VM{}, err
 	}
 	if err := ValidatePublicKey(req.SSHPublicKey); err != nil {
 		return VM{}, err
@@ -272,7 +280,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (VM, error) {
 		})
 	}
 
-	host, err := s.b.Prepare(ctx, PrepareRequest{VMID: req.ID, ImageID: req.ImageID, Profile: req.Profile, SSHPublicKey: req.SSHPublicKey})
+	host, err := s.b.Prepare(ctx, PrepareRequest{Resources: req.Resources, VMID: req.ID, ImageID: req.ImageID, Profile: req.Profile, SSHPublicKey: req.SSHPublicKey})
 	if err != nil {
 		if errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrResourceExhausted) || errors.Is(err, ErrAlreadyExists) {
 			drop() // definitive refusal: nothing was prepared
@@ -409,6 +417,13 @@ func (s *Service) List(ctx context.Context) ([]VM, error) {
 	return out, nil
 }
 
+func (s *Service) DeleteImage(ctx context.Context, id string) error {
+	if err := ValidateID("image", id); err != nil {
+		return err
+	}
+	return s.b.DeleteImage(ctx, id)
+}
+
 func (s *Service) ListImages(ctx context.Context) ([]Image, error) {
 	imgs, err := s.b.ListImages(ctx)
 	if err != nil {
@@ -416,6 +431,17 @@ func (s *Service) ListImages(ctx context.Context) ([]Image, error) {
 	}
 	sort.Slice(imgs, func(i, j int) bool { return imgs[i].ID < imgs[j].ID })
 	return imgs, nil
+}
+
+// Capabilities forwards the backend's current resource policy. Profiles are
+// copied so callers cannot mutate backend state; SSH/bastion data is dropped.
+func (s *Service) Capabilities(ctx context.Context) (ResourceCapabilities, error) {
+	c, err := s.b.Capabilities(ctx)
+	if err != nil {
+		return ResourceCapabilities{}, err
+	}
+	return ResourceCapabilities{MaxVMs: c.MaxVMs, Profiles: append([]Profile(nil), c.Profiles...),
+		MaxTotalMemMiB: c.MaxTotalMemMiB, MaxTotalVCPU: c.MaxTotalVCPU}, nil
 }
 
 func (s *Service) SSHInfo(ctx context.Context, id string) (SSHInfo, error) {
