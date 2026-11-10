@@ -9,11 +9,11 @@ import (
 
 func TestOrchestrationSubsecondStatusReturnsCompletedResult(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.ctl.Create(context.Background(), "a"); err != nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), "a"); err != nil {
 		t.Fatal(err)
 	}
 	e.ctl.cfg.QueryTimeout = 250 * time.Millisecond
-	s, err := e.ctl.Status(context.Background(), Ref{Sel: "a"})
+	s, err := e.ctl.Status(WithUser(context.Background(), testUser), Ref{Sel: "a"})
 	if err != nil {
 		t.Fatalf("completed workflow must return within query budget: %v", err)
 	}
@@ -25,7 +25,7 @@ func TestOrchestrationSubsecondStatusReturnsCompletedResult(t *testing.T) {
 func TestOrchestrationOneEnginePerStore(t *testing.T) {
 	e := newEnv(t)
 	other := NewController(e.lc, e.store, e.terms, e.ctl.cfg)
-	err := other.Start(context.Background())
+	err := other.Start(WithUser(context.Background(), testUser))
 	if err == nil {
 		_ = other.Close()
 		t.Fatal("a shared Store must not bypass single-executor ownership")
@@ -60,7 +60,7 @@ func TestOrchestrationCannotStartOnClosedStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := NewController(e.lc, e.store, e.terms, e.ctl.cfg)
-	if err := other.Start(context.Background()); err == nil {
+	if err := other.Start(WithUser(context.Background(), testUser)); err == nil {
 		_ = other.Close()
 		t.Fatal("Start must require an open locked store")
 	}

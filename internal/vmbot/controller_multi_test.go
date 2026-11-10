@@ -14,7 +14,7 @@ import (
 	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 )
 
-var bg = context.Background()
+var bg = WithUser(context.Background(), testUser)
 
 func mustCreate(t *testing.T, e *env, name string) Status {
 	t.Helper()
@@ -520,7 +520,7 @@ func TestMigratedLiveVMIsAdoptedNotRecreatedAndKeepsItsLink(t *testing.T) {
 	}
 	dir := filepath.Join(t.TempDir(), "state")
 	oldTok := testTok(424242)
-	writeState(t, dir, v1File(7, 555, &VMRecord{ID: liveID, Token: oldTok, Phase: PhaseActive, Generation: 7}), 0o600)
+	writeState(t, dir, v1File(7, 555, &VMRecord{OwnerUserID: testUser, ID: liveID, Token: oldTok, Phase: PhaseActive, Generation: 7}), 0o600)
 
 	var creates, deletes atomic.Int32
 	lc := &hookLC{Lifecycle: svc,
@@ -532,13 +532,13 @@ func TestMigratedLiveVMIsAdoptedNotRecreatedAndKeepsItsLink(t *testing.T) {
 			deletes.Add(1)
 			return svc.Delete(ctx, id)
 		}}
-	store, err := OpenStore(dir)
+	store, err := OpenStore(dir, testUser)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 	terms := &fakeTerms{}
-	ctl := NewController(lc, store, terms, ControllerConfig{ImageID: "base", Profile: "small",
+	ctl := NewController(lc, store, terms, ControllerConfig{AllowedUserIDs: []int64{testUser}, MaxVMsPerUser: 8, ImageID: "base", Profile: "small",
 		PublicOrigin: "https://bot.example.test:8443", MaxVMs: 2, OpTimeout: 2 * time.Second, QueryTimeout: time.Second})
 	if err := ctl.Start(bg); err != nil {
 		t.Fatal(err)

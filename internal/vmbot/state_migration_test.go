@@ -15,6 +15,11 @@ func testTok(n int) string { return fmt.Sprintf("%043d", n) }
 
 // v1File builds a synthetic v1 state file (no real populated state is ever read).
 func v1File(gen uint64, offset int64, vm *VMRecord) []byte {
+	if vm != nil {
+		cp := *vm
+		cp.OwnerUserID = 0
+		vm = &cp
+	}
 	b, _ := json.Marshal(stateV1{Version: 1, Generation: gen, VM: vm, Offset: offset})
 	return b
 }
@@ -33,18 +38,18 @@ func TestMigrateV1PreservesEveryPhaseOffsetAndCapability(t *testing.T) {
 	for _, phase := range []string{PhaseCreating, PhaseActive, PhaseDeleting} {
 		t.Run(phase, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "state")
-			rec := VMRecord{ID: "bot-c5d5cd1e8a7894eb", Token: testTok(77), Phase: phase, Generation: 5}
+			rec := VMRecord{OwnerUserID: testUser, ID: "bot-c5d5cd1e8a7894eb", Token: testTok(77), Phase: phase, Generation: 5}
 			raw := v1File(9, 123456789, &rec)
 			writeState(t, dir, raw, 0o600)
 
-			s, err := OpenStore(dir)
+			s, err := OpenStore(dir, testUser)
 			if err != nil {
 				t.Fatal(err)
 			}
 			check := func(s *Store) {
 				t.Helper()
 				got := s.Snapshot()
-				if got.Version != 2 || got.Generation != 9 || got.Offset != 123456789 || len(got.VMs) != 1 {
+				if got.Version != 3 || got.Generation != 9 || got.Offset != 123456789 || len(got.VMs) != 1 {
 					t.Fatalf("migrated state %+v", got)
 				}
 				v := got.VMs[0]
@@ -69,7 +74,7 @@ func TestMigrateV1PreservesEveryPhaseOffsetAndCapability(t *testing.T) {
 			s.Close()
 
 			// restart: loads v2 directly, no second migration, nothing changed
-			s2, err := OpenStore(dir)
+			s2, err := OpenStore(dir, testUser)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -85,7 +90,7 @@ func TestMigrateV1PreservesEveryPhaseOffsetAndCapability(t *testing.T) {
 func TestMigrateV1WithoutVMKeepsGenerationAndOffset(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	writeState(t, dir, v1File(4, 8, nil), 0o600)
-	s, err := OpenStore(dir)
+	s, err := OpenStore(dir, testUser)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +101,7 @@ func TestMigrateV1WithoutVMKeepsGenerationAndOffset(t *testing.T) {
 	// a new VM continues after the high-water mark: generations are never reused
 	if err := s.Update(func(st *State) {
 		st.Generation++
-		st.VMs = append(st.VMs, VMRecord{ID: "bot-new", Token: testTok(2), Phase: PhaseCreating, Generation: st.Generation})
+		st.VMs = append(st.VMs, VMRecord{OwnerUserID: testUser, ID: "bot-new", Token: testTok(2), Phase: PhaseCreating, Generation: st.Generation})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +112,7 @@ func TestMigrateV1WithoutVMKeepsGenerationAndOffset(t *testing.T) {
 
 func TestMigrationBackupIsNeverOverwrittenOnRetry(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
-	rec := VMRecord{ID: "bot-old", Token: testTok(1), Phase: PhaseActive, Generation: 1}
+	rec := VMRecord{OwnerUserID: testUser, ID: "bot-old", Token: testTok(1), Phase: PhaseActive, Generation: 1}
 	first := v1File(1, 10, &rec)
 	writeState(t, dir, first, 0o600)
 	bak := filepath.Join(dir, "state.json.v1.bak")
@@ -117,7 +122,7 @@ func TestMigrationBackupIsNeverOverwrittenOnRetry(t *testing.T) {
 	if err := os.WriteFile(bak, first, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s, err := OpenStore(dir)
+	s, err := OpenStore(dir, testUser)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +137,7 @@ func TestMigrationBackupIsNeverOverwrittenOnRetry(t *testing.T) {
 	rec2.Generation = 2
 	second := v1File(2, 99, &rec2)
 	writeState(t, dir, second, 0o600)
-	s, err = OpenStore(dir)
+	s, err = OpenStore(dir, testUser)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +159,7 @@ func TestMigrationBackupIsNeverOverwrittenOnRetry(t *testing.T) {
 
 func TestMigrationFailureLeavesV1Untouched(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
-	rec := VMRecord{ID: "bot-x", Token: testTok(1), Phase: PhaseActive, Generation: 1}
+	rec := VMRecord{OwnerUserID: testUser, ID: "bot-x", Token: testTok(1), Phase: PhaseActive, Generation: 1}
 	raw := v1File(1, 5, &rec)
 	writeState(t, dir, raw, 0o600)
 	// A directory squats the backup name AND all numbered ones' first slot is
@@ -166,7 +171,7 @@ func TestMigrationFailureLeavesV1Untouched(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
 	}
-	if s, err := OpenStore(dir); err == nil {
+	if s, err := OpenStore(dir, testUser); err == nil {
 		s.Close()
 		t.Fatal("migration must fail closed when no backup can be written")
 	}
@@ -177,9 +182,9 @@ func TestMigrationFailureLeavesV1Untouched(t *testing.T) {
 
 func TestStoreRejectsInvalidStatesBeforeUse(t *testing.T) {
 	good := func() State {
-		return State{Version: 2, Generation: 3, Offset: 1, VMs: []VMRecord{
-			{ID: "bot-a", Token: testTok(1), Phase: PhaseActive, Generation: 1, Label: "one"},
-			{ID: "bot-b", Token: testTok(2), Phase: PhaseCreating, Generation: 3, Label: "two"},
+		return State{Version: 3, Generation: 3, Offset: 1, VMs: []VMRecord{
+			{OwnerUserID: testUser, ID: "bot-a", Token: testTok(1), Phase: PhaseActive, Generation: 1, Label: "one"},
+			{OwnerUserID: testUser, ID: "bot-b", Token: testTok(2), Phase: PhaseCreating, Generation: 3, Label: "two"},
 		}}
 	}
 	cases := map[string]func(s *State){
@@ -204,7 +209,7 @@ func TestStoreRejectsInvalidStatesBeforeUse(t *testing.T) {
 			mut(&st)
 			b, _ := json.Marshal(st)
 			writeState(t, dir, b, 0o600)
-			if s, err := OpenStore(dir); err == nil {
+			if s, err := OpenStore(dir, testUser); err == nil {
 				s.Close()
 				t.Fatal("invalid state must fail closed")
 			}
@@ -217,7 +222,7 @@ func TestStoreRejectsInvalidStatesBeforeUse(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	b, _ := json.Marshal(good())
 	writeState(t, dir, b, 0o600)
-	s, err := OpenStore(dir)
+	s, err := OpenStore(dir, testUser)
 	if err != nil {
 		t.Fatalf("control: %v", err)
 	}
@@ -225,22 +230,22 @@ func TestStoreRejectsInvalidStatesBeforeUse(t *testing.T) {
 }
 
 func TestStoreRejectsInvalidV1AndUnknownFields(t *testing.T) {
-	rec := VMRecord{ID: "bot-a", Token: testTok(1), Phase: PhaseActive, Generation: 2}
+	rec := VMRecord{OwnerUserID: testUser, ID: "bot-a", Token: testTok(1), Phase: PhaseActive, Generation: 2}
 	for name, raw := range map[string][]byte{
-		"v1 bad phase":       v1File(2, 0, &VMRecord{ID: "bot-a", Token: testTok(1), Phase: "x", Generation: 2}),
+		"v1 bad phase":       v1File(2, 0, &VMRecord{OwnerUserID: testUser, ID: "bot-a", Token: testTok(1), Phase: "x", Generation: 2}),
 		"v1 gen above mark":  v1File(1, 0, &rec),
 		"v1 negative offset": v1File(2, -5, &rec),
-		"v1 bad token":       v1File(2, 0, &VMRecord{ID: "bot-a", Token: "t", Phase: PhaseActive, Generation: 2}),
+		"v1 bad token":       v1File(2, 0, &VMRecord{OwnerUserID: testUser, ID: "bot-a", Token: "t", Phase: PhaseActive, Generation: 2}),
 		"v1 unknown field":   []byte(`{"version":1,"generation":1,"offset":0,"extra":true}`),
 		"v1 trailing data":   append(v1File(2, 0, &rec), []byte(` {"x":1}`)...),
 		"v2 unknown field":   []byte(`{"version":2,"generation":1,"offset":0,"vms":[],"extra":1}`),
-		"future version":     []byte(`{"version":3,"generation":1}`),
+		"future version":     []byte(`{"version":99,"generation":1}`),
 		"zero version":       []byte(`{"generation":1}`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "state")
 			writeState(t, dir, raw, 0o600)
-			if s, err := OpenStore(dir); err == nil {
+			if s, err := OpenStore(dir, testUser); err == nil {
 				s.Close()
 				t.Fatal("must fail closed")
 			}
@@ -260,14 +265,14 @@ func TestStoreRejectsInvalidV1AndUnknownFields(t *testing.T) {
 
 func TestUpdateValidatesBeforeMutatingState(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
-	s, _ := OpenStore(dir)
+	s, _ := OpenStore(dir, testUser)
 	defer s.Close()
 	add := func(id string, g uint64, label string) error {
 		return s.Update(func(st *State) {
 			if g > st.Generation {
 				st.Generation = g
 			}
-			st.VMs = append(st.VMs, VMRecord{ID: id, Token: testTok(int(g)), Phase: PhaseActive, Generation: g, Label: label})
+			st.VMs = append(st.VMs, VMRecord{OwnerUserID: testUser, ID: id, Token: testTok(int(g)), Phase: PhaseActive, Generation: g, Label: label})
 		})
 	}
 	if err := add("bot-a", 1, "one"); err != nil {
@@ -283,7 +288,7 @@ func TestUpdateValidatesBeforeMutatingState(t *testing.T) {
 		t.Fatalf("refused updates must not change memory: %+v", got)
 	}
 	s.Close()
-	s2, err := OpenStore(dir)
+	s2, err := OpenStore(dir, testUser)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,13 +300,13 @@ func TestUpdateValidatesBeforeMutatingState(t *testing.T) {
 
 func TestStoreKeepsDeterministicGenerationOrder(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
-	s, _ := OpenStore(dir)
+	s, _ := OpenStore(dir, testUser)
 	defer s.Close()
 	_ = s.Update(func(st *State) {
 		st.Generation = 3
 		st.VMs = []VMRecord{
-			{ID: "bot-c", Token: testTok(3), Phase: PhaseActive, Generation: 3},
-			{ID: "bot-a", Token: testTok(1), Phase: PhaseActive, Generation: 1},
+			{OwnerUserID: testUser, ID: "bot-c", Token: testTok(3), Phase: PhaseActive, Generation: 3},
+			{OwnerUserID: testUser, ID: "bot-a", Token: testTok(1), Phase: PhaseActive, Generation: 1},
 		}
 	})
 	got := s.Snapshot().VMs

@@ -15,7 +15,7 @@ func (s startHookTerms) Start(ctx context.Context, t TerminalTarget) error { ret
 
 func TestDeleteIntentPreventsTransientTerminalRepublication(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.ctl.Create(context.Background(), "a"); err != nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), "a"); err != nil {
 		t.Fatal(err)
 	}
 	rec := e.only(t)
@@ -33,7 +33,7 @@ func TestDeleteIntentPreventsTransientTerminalRepublication(t *testing.T) {
 		observed = resp.StatusCode
 		return err
 	}}
-	_ = e.ctl.ensureTerminalLocked(context.Background(), rec)
+	_ = e.ctl.ensureTerminalLocked(WithUser(context.Background(), testUser), rec)
 	if observed != http.StatusNotFound {
 		t.Fatalf("revoked capability was transiently reachable: HTTP %d", observed)
 	}
@@ -41,13 +41,13 @@ func TestDeleteIntentPreventsTransientTerminalRepublication(t *testing.T) {
 
 func TestDurableDeleteIntentRejectsNewHTTPBeforeCleanup(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.ctl.Create(context.Background(), "a"); err != nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), "a"); err != nil {
 		t.Fatal(err)
 	}
 	rec := e.only(t)
 	term := newTerm(t, nil)
 	e.ctl.term = term.m
-	if err := e.ctl.ensureTerminalLocked(context.Background(), rec); err != nil {
+	if err := e.ctl.ensureTerminalLocked(WithUser(context.Background(), testUser), rec); err != nil {
 		t.Fatal(err)
 	}
 	resp, _ := term.get(t, http.MethodGet, "/t/"+rec.Token+"/", nil)

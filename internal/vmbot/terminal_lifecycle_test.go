@@ -33,7 +33,7 @@ func (c *lifecycleGatedConn) Close() error {
 // cleanup until the returned gate is closed.
 func holdRevoke(t *testing.T, e *tenv) (old *session, gate chan struct{}, done chan struct{}) {
 	t.Helper()
-	if err := e.m.Start(context.Background(), target("bot-a", tokA)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-a", tokA)); err != nil {
 		t.Fatal(err)
 	}
 	old = e.m.lookup(tokA)
@@ -95,7 +95,7 @@ func TestSecondRevokeWaitsWhenAnotherGoroutineOwnsTermination(t *testing.T) {
 func TestSameVMStartIsRefusedUntilOlderCleanupCompletes(t *testing.T) {
 	e := newTerm(t, nil)
 	_, gate, done := holdRevoke(t, e)
-	if err := e.m.Start(context.Background(), target("bot-a", tokB)); err == nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-a", tokB)); err == nil {
 		t.Fatal("a replacement must not be admitted/published while the older session is still being cleaned up")
 	}
 	if r, _ := e.get(t, "GET", "/t/"+tokB+"/", nil); r.StatusCode != 404 {
@@ -108,7 +108,7 @@ func TestSameVMStartIsRefusedUntilOlderCleanupCompletes(t *testing.T) {
 	<-done
 	// after the cleanup finished, a replacement works and keeps working: the old
 	// cleanup can no longer unlink its socket or known_hosts
-	if err := e.m.Start(context.Background(), target("bot-a", tokB)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-a", tokB)); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
@@ -125,15 +125,15 @@ func TestSameVMStartIsRefusedUntilOlderCleanupCompletes(t *testing.T) {
 func TestCapabilityTokenAndCapacityStayReservedWhileTerminating(t *testing.T) {
 	e := newTerm(t, func(c *ManagerConfig) { c.MaxSessions = 1 })
 	_, gate, done := holdRevoke(t, e)
-	if err := e.m.Start(context.Background(), target("bot-b", tokA)); err == nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-b", tokA)); err == nil {
 		t.Fatal("the token of a still-terminating session must stay reserved")
 	}
-	if err := e.m.Start(context.Background(), target("bot-b", tokB)); err == nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-b", tokB)); err == nil {
 		t.Fatal("a terminating session must keep occupying its slot (bounded processes)")
 	}
 	close(gate)
 	<-done
-	if err := e.m.Start(context.Background(), target("bot-b", tokB)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-b", tokB)); err != nil {
 		t.Fatalf("slot free after cleanup: %v", err)
 	}
 }
@@ -149,7 +149,7 @@ func TestCloseWaitsForFailedStartupCleanup(t *testing.T) {
 	}
 	e := newTerm(t, func(c *ManagerConfig) { c.TTYDPath = wrapper; c.StartTimeout = 200 * time.Millisecond })
 	started := make(chan error, 1)
-	go func() { started <- e.m.Start(context.Background(), target("bot-a", tokA)) }()
+	go func() { started <- e.m.Start(WithUser(context.Background(), testUser), target("bot-a", tokA)) }()
 	deadline := time.Now().Add(3 * time.Second)
 	var pid int
 	for {
@@ -202,7 +202,7 @@ func TestConcurrentPendingStartsCannotShareAToken(t *testing.T) {
 	}
 	e := newTerm(t, func(c *ManagerConfig) { c.TTYDPath = wrapper })
 	errA := make(chan error, 1)
-	go func() { errA <- e.m.Start(context.Background(), target("bot-a", tokA)) }()
+	go func() { errA <- e.m.Start(WithUser(context.Background(), testUser), target("bot-a", tokA)) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		e.m.mu.Lock()
@@ -216,7 +216,7 @@ func TestConcurrentPendingStartsCannotShareAToken(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if err := e.m.Start(context.Background(), target("bot-b", tokA)); err == nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-b", tokA)); err == nil {
 		t.Fatal("a token reserved by a pending start must not be admitted for another VM")
 	}
 	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {

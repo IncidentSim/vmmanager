@@ -125,26 +125,26 @@ func TestOrchestrationProcessWorker(t *testing.T) {
 		lc.marker("intent")
 		select {}
 	}
-	c := NewController(lc, st, diskTerms{lc}, ControllerConfig{ImageID: "base", Profile: "small", OpTimeout: 3 * time.Second, QueryTimeout: time.Second})
-	if err = c.Start(context.Background()); err != nil {
+	c := NewController(lc, st, diskTerms{lc}, ControllerConfig{AllowedUserIDs: []int64{testUser}, MaxVMsPerUser: 8, ImageID: "base", Profile: "small", OpTimeout: 3 * time.Second, QueryTimeout: time.Second})
+	if err = c.Start(WithUser(context.Background(), testUser)); err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
 	switch mode {
 	case "create-effect":
-		_, err = c.Create(context.Background(), "alpha")
+		_, err = c.Create(WithUser(context.Background(), testUser), "alpha")
 	case "delete-intent", "delete-effect":
-		_, err = c.Delete(context.Background(), Ref{Sel: "alpha"})
+		_, err = c.Delete(WithUser(context.Background(), testUser), Ref{Sel: "alpha"})
 	case "create-delete-intent":
-		go c.Create(context.Background(), "alpha")
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		go c.Create(WithUser(context.Background(), testUser), "alpha")
+		ctx, cancel := context.WithTimeout(WithUser(context.Background(), testUser), 8*time.Second)
 		defer cancel()
 		if err = waitMarker(ctx, filepath.Join(root, "effect")); err != nil {
 			t.Fatal(err)
 		}
-		_, err = c.Delete(context.Background(), Ref{Sel: "alpha"})
+		_, err = c.Delete(WithUser(context.Background(), testUser), Ref{Sel: "alpha"})
 	case "recover":
-		err = c.Recover(context.Background())
+		err = c.Recover(WithUser(context.Background(), testUser))
 	default:
 		t.Fatal("unknown child mode")
 	}
@@ -172,7 +172,7 @@ func TestOrchestrationRealKillRecovery(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				rec := VMRecord{ID: "bot-existing", Token: testTok(123), Phase: PhaseActive, Generation: 1, Label: "alpha"}
+				rec := VMRecord{OwnerUserID: testUser, ID: "bot-existing", Token: testTok(123), Phase: PhaseActive, Generation: 1, Label: "alpha"}
 				err = st.Update(func(s *State) { s.Generation = 1; s.VMs = []VMRecord{rec} })
 				if err != nil {
 					t.Fatal(err)
@@ -182,7 +182,7 @@ func TestOrchestrationRealKillRecovery(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(WithUser(context.Background(), testUser), 10*time.Second)
 			defer cancel()
 			cmd := childCmd(t, ctx, root, mode)
 			if err := cmd.Start(); err != nil {
@@ -211,7 +211,7 @@ func TestOrchestrationRealKillRecovery(t *testing.T) {
 			if err := cmd.Wait(); err == nil {
 				t.Fatal("expected actual killed process")
 			}
-			rctx, rcancel := context.WithTimeout(context.Background(), 12*time.Second)
+			rctx, rcancel := context.WithTimeout(WithUser(context.Background(), testUser), 12*time.Second)
 			defer rcancel()
 			if out, err := childCmd(t, rctx, root, "recover").CombinedOutput(); err != nil {
 				t.Fatalf("recovery: %v\n%s", err, out)

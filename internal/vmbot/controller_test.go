@@ -101,7 +101,7 @@ func newEnvMax(t *testing.T, maxVMs int) *env {
 		t.Fatal(err)
 	}
 	e := &env{be: be, svc: svc, lc: &hookLC{Lifecycle: svc}, terms: &fakeTerms{}, dir: filepath.Join(t.TempDir(), "state"), max: maxVMs}
-	e.store, err = OpenStore(e.dir)
+	e.store, err = OpenStore(e.dir, testUser)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,12 +123,12 @@ func (w testLogWriter) Write(p []byte) (int, error) {
 // SQLite file under the state directory (there is no non-durable mode).
 func (e *env) newController(t *testing.T) *Controller {
 	t.Helper()
-	c := NewController(e.lc, e.store, e.terms, ControllerConfig{
+	c := NewController(e.lc, e.store, e.terms, ControllerConfig{AllowedUserIDs: []int64{testUser}, MaxVMsPerUser: 8,
 		ImageID: "base", Profile: "small", PublicOrigin: "https://bot.example.test:8443",
 		MaxVMs: e.max, OpTimeout: 2 * time.Second, QueryTimeout: time.Second,
 		Logger: log.New(testLogWriter{t}, "ctl: ", 0),
 	})
-	if err := c.Start(context.Background()); err != nil {
+	if err := c.Start(WithUser(context.Background(), testUser)); err != nil {
 		t.Fatal(err)
 	}
 	return c
@@ -141,7 +141,7 @@ func (e *env) restart(t *testing.T) {
 	e.ctl.Close()
 	e.store.Close()
 	var err error
-	e.store, err = OpenStore(e.dir)
+	e.store, err = OpenStore(e.dir, testUser)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestCreateSavesIdentityAndCapabilityBeforeRemoteCall(t *testing.T) {
 		}
 		return e.svc.Create(ctx, r)
 	}
-	st, err := e.ctl.Create(context.Background(), "")
+	st, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,16 +198,16 @@ func TestCreateSavesIdentityAndCapabilityBeforeRemoteCall(t *testing.T) {
 
 func TestTokenIs256BitAndRotatesPerVM(t *testing.T) {
 	e := newEnv(t)
-	st1, _ := e.ctl.Create(context.Background(), "")
+	st1, _ := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	tok1 := e.only(t).Token
 	raw, err := base64.RawURLEncoding.DecodeString(tok1)
 	if err != nil || len(raw) != 32 {
 		t.Fatalf("token must be 32 random bytes base64url: %v %d", err, len(raw))
 	}
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err != nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err != nil {
 		t.Fatal(err)
 	}
-	st2, err := e.ctl.Create(context.Background(), "")
+	st2, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestTokenIs256BitAndRotatesPerVM(t *testing.T) {
 	if tok1 == tok2 || st1.VMID == st2.VMID || st2.Generation != 2 {
 		t.Fatalf("replacement must rotate ID/token/generation: %v %v %d", tok1 == tok2, st1.VMID == st2.VMID, st2.Generation)
 	}
-	link, err := e.ctl.Terminal(context.Background(), Ref{})
+	link, err := e.ctl.Terminal(WithUser(context.Background(), testUser), Ref{})
 	if err != nil || link != "https://bot.example.test:8443/t/"+tok2+"/" {
 		t.Fatalf("link %q %v", link, err)
 	}
@@ -233,7 +233,7 @@ func TestConcurrentCreatesAreSerializedToOneVM(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := e.ctl.Create(context.Background(), "")
+			_, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -258,20 +258,20 @@ func TestForeignVMsAreNeverTouchedAndBackendCapacityIsAuthoritative(t *testing.T
 	e := newEnvMax(t, 8)
 	var foreign []string
 	for i := 0; i < 2; i++ {
-		v, err := e.svc.Create(context.Background(), vmlib.CreateRequest{ImageID: "base", Profile: "small"})
+		v, err := e.svc.Create(WithUser(context.Background(), testUser), vmlib.CreateRequest{ImageID: "base", Profile: "small"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		foreign = append(foreign, v.ID)
 	}
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); !errors.Is(err, ErrNoVM) {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); !errors.Is(err, ErrNoVM) {
 		t.Fatalf("delete must not touch foreign VMs: %v", err)
 	}
-	if _, err := e.ctl.Create(context.Background(), "mine"); err != nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), "mine"); err != nil {
 		t.Fatalf("a foreign VM below backend capacity must not block create: %v", err)
 	}
 	// Backend is now full (capacity 3): its refusal is reported, nothing is left owned.
-	_, err := e.ctl.Create(context.Background(), "extra")
+	_, err := e.ctl.Create(WithUser(context.Background(), testUser), "extra")
 	if !errors.Is(err, ErrBackendFull) {
 		t.Fatalf("want ErrBackendFull, got %v", err)
 	}
@@ -279,11 +279,11 @@ func TestForeignVMsAreNeverTouchedAndBackendCapacityIsAuthoritative(t *testing.T
 		t.Fatalf("a definitively refused create must not stay owned: %d records", n)
 	}
 	for _, id := range foreign {
-		if v, err := e.svc.Get(context.Background(), id); err != nil || v.State != vmlib.StateRunning {
+		if v, err := e.svc.Get(WithUser(context.Background(), testUser), id); err != nil || v.State != vmlib.StateRunning {
 			t.Fatalf("foreign VM disturbed: %v %v", v, err)
 		}
 	}
-	list, _ := e.ctl.List(context.Background())
+	list, _ := e.ctl.List(WithUser(context.Background(), testUser))
 	if len(list) != 1 || list[0].Name != "mine" {
 		t.Fatalf("only owned VMs are listed: %+v", list)
 	}
@@ -292,7 +292,7 @@ func TestForeignVMsAreNeverTouchedAndBackendCapacityIsAuthoritative(t *testing.T
 func TestCreateDoesNotDependOnListing(t *testing.T) {
 	e := newEnv(t)
 	e.lc.list = func(context.Context) ([]vmlib.VM, error) { return nil, errors.New("rpc: unavailable /var/secret/path") }
-	if _, err := e.ctl.Create(context.Background(), ""); err != nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); err != nil {
 		t.Fatalf("create must not call List: %v", err)
 	}
 }
@@ -305,14 +305,14 @@ func TestAmbiguousCreateKeepsOccupancyAndAdoptsVM(t *testing.T) {
 		}
 		return vmlib.VM{}, context.DeadlineExceeded // response lost
 	}
-	st, err := e.ctl.Create(context.Background(), "")
+	st, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err == nil || !st.Present {
 		t.Fatalf("ambiguous failure must keep the VM occupied: %+v %v", st, err)
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); !errors.Is(err, ErrCapacity) {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("second create must be refused: %v", err)
 	}
-	s2, err := e.ctl.Status(context.Background(), Ref{})
+	s2, err := e.ctl.Status(WithUser(context.Background(), testUser), Ref{})
 	if err != nil || !s2.Present || s2.State != string(vmlib.StateRunning) {
 		t.Fatalf("status after adoption: %+v %v", s2, err)
 	}
@@ -328,16 +328,16 @@ func TestAmbiguousCreateThenRemoteUnreachableStaysOccupied(t *testing.T) {
 		e.lc.get = func(context.Context, string) (vmlib.VM, error) { return vmlib.VM{}, errors.New("unavailable") }
 		return vmlib.VM{}, context.DeadlineExceeded
 	}
-	st, err := e.ctl.Create(context.Background(), "")
+	st, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err == nil || !st.Present || !st.Uncertain {
 		t.Fatalf("want uncertain occupied, got %+v %v", st, err)
 	}
 	e.lc.list = func(context.Context) ([]vmlib.VM, error) { return nil, errors.New("unavailable") }
-	if _, err := e.ctl.Create(context.Background(), ""); err == nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); err == nil {
 		t.Fatal("must not create a second VM while the first is unresolved")
 	}
 	e.lc.get, e.lc.list = nil, nil
-	if err := e.ctl.Recover(context.Background()); err != nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err != nil {
 		t.Fatal(err)
 	}
 	if v := e.vm(); v == nil || v.Phase != PhaseActive {
@@ -348,14 +348,14 @@ func TestAmbiguousCreateThenRemoteUnreachableStaysOccupied(t *testing.T) {
 func TestDefinitiveCreateFailureReleasesOccupancy(t *testing.T) {
 	e := newEnv(t)
 	e.be.StartErr = errors.New("boom")
-	if _, err := e.ctl.Create(context.Background(), ""); err == nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); err == nil {
 		t.Fatal("expected failure")
 	}
 	if e.vm() != nil || e.be.Count() != 0 {
 		t.Fatalf("rolled-back create must free the slot: %+v count=%d", e.vm(), e.be.Count())
 	}
 	e.be.StartErr = nil
-	if _, err := e.ctl.Create(context.Background(), ""); err != nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); err != nil {
 		t.Fatalf("create after rollback: %v", err)
 	}
 }
@@ -363,14 +363,14 @@ func TestDefinitiveCreateFailureReleasesOccupancy(t *testing.T) {
 func TestRetainedCreateFailureStaysOccupied(t *testing.T) {
 	e := newEnv(t)
 	e.be.StartUncertainErr = errors.New("uncertain start")
-	st, err := e.ctl.Create(context.Background(), "")
+	st, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	if !st.Present {
 		t.Fatalf("a VM that may be running must stay occupied: %+v", st)
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); !errors.Is(err, ErrCapacity) {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -379,12 +379,12 @@ func TestDeleteRevokesTerminalBeforeRemoteDelete(t *testing.T) {
 	e := newEnv(t)
 	var events []string
 	e.terms.events = &events
-	st, _ := e.ctl.Create(context.Background(), "")
+	st, _ := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	e.lc.del = func(ctx context.Context, id string) (vmlib.DeleteResult, error) {
 		events = append(events, "delete:"+id)
 		return e.svc.Delete(ctx, id)
 	}
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err != nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(events) < 2 || events[0] != "revoke:"+st.VMID {
@@ -408,7 +408,7 @@ func TestDeleteRevokesTerminalBeforeRemoteDelete(t *testing.T) {
 
 func TestUnknownDeleteResultKeepsOccupancyAndAllowsRetry(t *testing.T) {
 	e := newEnv(t)
-	st, _ := e.ctl.Create(context.Background(), "")
+	st, _ := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	fail := true
 	e.lc.del = func(ctx context.Context, id string) (vmlib.DeleteResult, error) {
 		if fail {
@@ -416,26 +416,26 @@ func TestUnknownDeleteResultKeepsOccupancyAndAllowsRetry(t *testing.T) {
 		}
 		return e.svc.Delete(ctx, id)
 	}
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err == nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err == nil {
 		t.Fatal("expected error")
 	}
 	if v := e.vm(); v == nil || v.Phase != PhaseDeleting || v.ID != st.VMID {
 		t.Fatalf("must stay occupied while deletion is unconfirmed: %+v", v)
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); !errors.Is(err, ErrCapacity) {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("create during unconfirmed delete: %v", err)
 	}
-	if _, err := e.ctl.Terminal(context.Background(), Ref{}); err == nil {
+	if _, err := e.ctl.Terminal(WithUser(context.Background(), testUser), Ref{}); err == nil {
 		t.Fatal("terminal must stay revoked after a delete attempt")
 	}
 	fail = false
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err != nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	if e.vm() != nil {
 		t.Fatal("retry must release")
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); err != nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); err != nil {
 		t.Fatalf("create after confirmed delete: %v", err)
 	}
 }
@@ -443,12 +443,12 @@ func TestUnknownDeleteResultKeepsOccupancyAndAllowsRetry(t *testing.T) {
 func TestRetainedDeleteKeepsVMUntilExitProven(t *testing.T) {
 	e := newEnv(t)
 	e.be.AutoExit = false
-	st, err := e.ctl.Create(context.Background(), "")
+	st, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.ctl.cfg.OpTimeout = 150 * time.Millisecond
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err == nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err == nil {
 		t.Fatal("delete must fail while exit is unproven")
 	}
 	if e.vm() == nil {
@@ -456,39 +456,39 @@ func TestRetainedDeleteKeepsVMUntilExitProven(t *testing.T) {
 	}
 	e.be.ExitVM(st.VMID, true)
 	e.ctl.cfg.OpTimeout = 2 * time.Second
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err != nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err != nil {
 		t.Fatalf("retry after exit: %v", err)
 	}
 }
 
 func TestDeleteIsBoundToGeneration(t *testing.T) {
 	e := newEnv(t)
-	e.ctl.Create(context.Background(), "")
-	e.ctl.Delete(context.Background(), Ref{})
-	st2, _ := e.ctl.Create(context.Background(), "")
-	if _, err := e.ctl.Delete(context.Background(), Ref{Gen: 1}); !errors.Is(err, ErrStale) {
+	e.ctl.Create(WithUser(context.Background(), testUser), "")
+	e.ctl.Delete(WithUser(context.Background(), testUser), Ref{})
+	st2, _ := e.ctl.Create(WithUser(context.Background(), testUser), "")
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{Gen: 1}); !errors.Is(err, ErrStale) {
 		t.Fatalf("stale generation must be refused: %v", err)
 	}
-	if _, err := e.svc.Get(context.Background(), st2.VMID); err != nil {
+	if _, err := e.svc.Get(WithUser(context.Background(), testUser), st2.VMID); err != nil {
 		t.Fatalf("replacement VM must be untouched: %v", err)
 	}
-	if _, err := e.ctl.Delete(context.Background(), Ref{Gen: 2}); err != nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{Gen: 2}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestRestartPreservesLinkAndRestartsTerminal(t *testing.T) {
 	e := newEnv(t)
-	st, _ := e.ctl.Create(context.Background(), "")
-	link1, _ := e.ctl.Terminal(context.Background(), Ref{})
+	st, _ := e.ctl.Create(WithUser(context.Background(), testUser), "")
+	link1, _ := e.ctl.Terminal(WithUser(context.Background(), testUser), Ref{})
 	e.restart(t)
-	if _, err := e.ctl.Create(context.Background(), ""); !errors.Is(err, ErrCapacity) {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("restart must not allow a second VM: %v", err)
 	}
-	if err := e.ctl.Recover(context.Background()); err != nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err != nil {
 		t.Fatal(err)
 	}
-	link2, err := e.ctl.Terminal(context.Background(), Ref{})
+	link2, err := e.ctl.Terminal(WithUser(context.Background(), testUser), Ref{})
 	if err != nil || link1 != link2 {
 		t.Fatalf("link must survive restart: %q %q %v", link1, link2, err)
 	}
@@ -502,18 +502,18 @@ func TestRestartPreservesLinkAndRestartsTerminal(t *testing.T) {
 
 func TestRecoverClearsVMGoneAndKeepsOnUnknown(t *testing.T) {
 	e := newEnv(t)
-	st, _ := e.ctl.Create(context.Background(), "")
+	st, _ := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	e.restart(t)
 	e.lc.get = func(context.Context, string) (vmlib.VM, error) { return vmlib.VM{}, errors.New("timeout") }
-	if err := e.ctl.Recover(context.Background()); err == nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err == nil {
 		t.Fatal("expected uncertain recovery error")
 	}
 	if e.vm() == nil {
 		t.Fatal("unknown remote state must keep occupancy")
 	}
 	e.lc.get = nil
-	e.svc.Delete(context.Background(), st.VMID) // removed out of band
-	if err := e.ctl.Recover(context.Background()); err != nil {
+	e.svc.Delete(WithUser(context.Background(), testUser), st.VMID) // removed out of band
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err != nil {
 		t.Fatal(err)
 	}
 	if e.vm() != nil {
@@ -526,12 +526,12 @@ func TestRecoverClearsVMGoneAndKeepsOnUnknown(t *testing.T) {
 
 func TestTerminalRequiresRunningVM(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.ctl.Terminal(context.Background(), Ref{}); !errors.Is(err, ErrNoVM) {
+	if _, err := e.ctl.Terminal(WithUser(context.Background(), testUser), Ref{}); !errors.Is(err, ErrNoVM) {
 		t.Fatalf("got %v", err)
 	}
-	st, _ := e.ctl.Create(context.Background(), "")
+	st, _ := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	e.be.ExitVM(st.VMID, true)
-	if _, err := e.ctl.Terminal(context.Background(), Ref{}); !errors.Is(err, ErrNotRunning) {
+	if _, err := e.ctl.Terminal(WithUser(context.Background(), testUser), Ref{}); !errors.Is(err, ErrNotRunning) {
 		t.Fatalf("stopped VM: %v", err)
 	}
 }
@@ -542,7 +542,7 @@ func TestErrorsDoNotLeakRPCInternals(t *testing.T) {
 		return vmlib.VM{}, errors.New("rpc error: /srv/firecracker/secret.sock denied")
 	}
 	e.lc.get = func(context.Context, string) (vmlib.VM, error) { return vmlib.VM{}, vmlib.ErrNotFound }
-	_, err := e.ctl.Create(context.Background(), "")
+	_, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err == nil || strings.Contains(err.Error(), "/srv/firecracker") {
 		t.Fatalf("leak: %v", err)
 	}
@@ -550,19 +550,19 @@ func TestErrorsDoNotLeakRPCInternals(t *testing.T) {
 
 func TestDeleteLostResponseIsResolvedOnlyByTheDeleteBarrier(t *testing.T) {
 	e := newEnv(t)
-	e.ctl.Create(context.Background(), "")
+	e.ctl.Create(WithUser(context.Background(), testUser), "")
 	e.lc.del = func(ctx context.Context, id string) (vmlib.DeleteResult, error) {
 		e.svc.Delete(ctx, id) // really deleted, response lost
 		return vmlib.DeleteResult{}, context.DeadlineExceeded
 	}
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err == nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err == nil {
 		t.Fatal("a lost response must not by itself release the slot (Get NotFound is not proof)")
 	}
 	if v := e.vm(); v == nil || v.Phase != PhaseDeleting {
 		t.Fatalf("slot must stay occupied in deleting phase: %+v", v)
 	}
 	e.lc.del = nil // the retry (or next reconcile) reaches vmlib's idempotent Delete
-	if _, err := e.ctl.Status(context.Background(), Ref{}); err != nil {
+	if _, err := e.ctl.Status(WithUser(context.Background(), testUser), Ref{}); err != nil {
 		t.Fatal(err)
 	}
 	if e.vm() != nil || e.be.Count() != 0 {

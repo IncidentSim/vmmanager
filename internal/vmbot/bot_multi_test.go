@@ -206,7 +206,7 @@ func TestOldGenerationCallbackSelectsTheMigratedOriginalNeverTheReplacement(t *t
 		t.Fatal(err)
 	}
 	e.store.Close()
-	writeState(t, e.dir, v1File(5, 77, &VMRecord{ID: liveID, Token: testTok(5), Phase: PhaseActive, Generation: 5}), 0o600)
+	writeState(t, e.dir, v1File(5, 77, &VMRecord{OwnerUserID: testUser, ID: liveID, Token: testTok(5), Phase: PhaseActive, Generation: 5}), 0o600)
 	e.restart(t)
 	b, api := newBot(t, e)
 	// a second VM exists next to the original; the OLD message's button d:5
@@ -358,7 +358,7 @@ func TestNameAndSelectorInputCannotInjectPathsOrCommands(t *testing.T) {
 	if e.be.Count() != n {
 		t.Fatal("a hostile selector deleted a VM")
 	}
-	if _, err := e.ctl.Resolve(Ref{Sel: "all"}); err == nil {
+	if _, err := e.ctl.Resolve(testUser, Ref{Sel: "all"}); err == nil {
 		t.Fatal("'all' must not be a selector")
 	}
 	_ = api

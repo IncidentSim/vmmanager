@@ -34,14 +34,14 @@ func TestOrchestrationSlowTerminalCleanupDoesNotBlockOtherVMDelete(t *testing.T)
 	release := func() { releaseOnce.Do(func() { close(blocker.release) }) }
 	t.Cleanup(release)
 	adone := make(chan error, 1)
-	go func() { _, err := e.ctl.Delete(context.Background(), Ref{Sel: "a"}); adone <- err }()
+	go func() { _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{Sel: "a"}); adone <- err }()
 	select {
 	case <-blocker.entered:
 	case <-time.After(2 * time.Second):
 		t.Fatal("no revoke")
 	}
 	bdone := make(chan error, 1)
-	go func() { _, err := e.ctl.Delete(context.Background(), Ref{Sel: "b"}); bdone <- err }()
+	go func() { _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{Sel: "b"}); bdone <- err }()
 	select {
 	case err := <-bdone:
 		if err != nil {
@@ -53,7 +53,7 @@ func TestOrchestrationSlowTerminalCleanupDoesNotBlockOtherVMDelete(t *testing.T)
 		<-bdone
 		t.Fatal("unrelated delete blocked behind another VM terminal cleanup")
 	}
-	if _, err := e.svc.Get(context.Background(), b.VMID); !errors.Is(err, vmlib.ErrNotFound) {
+	if _, err := e.svc.Get(WithUser(context.Background(), testUser), b.VMID); !errors.Is(err, vmlib.ErrNotFound) {
 		t.Fatalf("b not deleted: %v", err)
 	}
 	release()
@@ -66,7 +66,7 @@ func TestOrchestrationWorkflowIDCollisionCannotRetarget(t *testing.T) {
 	e := newEnvMax(t, 2)
 	a := mustCreate(t, e, "a")
 	b := mustCreate(t, e, "b")
-	if _, err := e.ctl.submit(OpInput{Kind: opDelete, VMID: b.VMID, Seq: 1}, createID(a.VMID)); err == nil {
+	if _, err := e.ctl.submit(OpInput{OwnerUserID: testUser, Kind: opDelete, VMID: b.VMID, Seq: 1}, createID(a.VMID)); err == nil {
 		t.Fatal("workflow ID reused with another intent")
 	}
 	if e.be.Count() != 2 {
@@ -93,7 +93,7 @@ func TestOrchestrationDuplicateDeleteAttachesToSameAttempt(t *testing.T) {
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(unblock)
 	first := make(chan error, 1)
-	go func() { _, err := e.ctl.Delete(context.Background(), Ref{Sel: "a"}); first <- err }()
+	go func() { _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{Sel: "a"}); first <- err }()
 	select {
 	case <-entered:
 	case <-time.After(time.Second):

@@ -20,20 +20,20 @@ func (f *panicOnRevoke) Revoke(id string) { f.fakeTerms.Revoke(id); panic("simul
 
 func TestRevocationSurvivesCrashDuringDelete(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.ctl.Create(context.Background(), ""); err != nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); err != nil {
 		t.Fatal(err)
 	}
 	old := e.only(t).Token
 	e.ctl.term = &panicOnRevoke{e.terms}
 	func() {
 		defer func() { _ = recover() }()
-		e.ctl.Delete(context.Background(), Ref{})
+		e.ctl.Delete(WithUser(context.Background(), testUser), Ref{})
 	}()
 	if v := e.vm(); v == nil || v.Phase != PhaseDeleting {
 		t.Fatalf("deleting phase must be durable before the revoke: %+v", v)
 	}
 	e.restart(t)
-	if err := e.ctl.Recover(context.Background()); err != nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err != nil {
 		t.Fatal(err)
 	}
 	for _, tg := range e.terms.started {
@@ -41,27 +41,27 @@ func TestRevocationSurvivesCrashDuringDelete(t *testing.T) {
 			t.Fatal("restart re-authorized the revoked capability")
 		}
 	}
-	if _, err := e.ctl.Terminal(context.Background(), Ref{}); err == nil {
+	if _, err := e.ctl.Terminal(WithUser(context.Background(), testUser), Ref{}); err == nil {
 		t.Fatal("no terminal may be served for a VM in the deleting phase")
 	}
 	// Recovery executes the durable delete, not just the terminal revoke.
 	if e.vm() != nil || e.be.Count() != 0 {
 		t.Fatal("recovery must complete deletion without leaving a resource")
 	}
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); !errors.Is(err, ErrNoVM) {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); !errors.Is(err, ErrNoVM) {
 		t.Fatalf("completed deletion must not target another VM: %v", err)
 	}
 }
 
 func TestDeletePersistFailureChangesNothing(t *testing.T) {
 	e := newEnv(t)
-	st, err := e.ctl.Create(context.Background(), "")
+	st, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	good := e.store.dir
 	e.store.dir = filepath.Join(good, "missing") // every persist fails
-	_, derr := e.ctl.Delete(context.Background(), Ref{})
+	_, derr := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{})
 	e.store.dir = good
 	if !errors.Is(derr, ErrFailed) {
 		t.Fatalf("want ErrFailed, got %v", derr)
@@ -75,20 +75,20 @@ func TestDeletePersistFailureChangesNothing(t *testing.T) {
 	if v := e.vm(); v == nil || v.Phase != PhaseActive || v.ID != st.VMID {
 		t.Fatalf("state must be unchanged: %+v", v)
 	}
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err != nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err != nil {
 		t.Fatalf("delete works once persistence recovers: %v", err)
 	}
 }
 
 func TestRestartInDeletingPhaseNeverRestartsTerminal(t *testing.T) {
 	e := newEnv(t)
-	st, _ := e.ctl.Create(context.Background(), "")
+	st, _ := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	e.lc.del = func(context.Context, string) (vmlib.DeleteResult, error) {
 		return vmlib.DeleteResult{}, context.DeadlineExceeded
 	}
-	e.ctl.Delete(context.Background(), Ref{})
+	e.ctl.Delete(WithUser(context.Background(), testUser), Ref{})
 	e.restart(t)
-	if err := e.ctl.Recover(context.Background()); err == nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err == nil {
 		t.Fatal("failed recovered delete must report an unconfirmed outcome")
 	}
 	if len(e.terms.started) != 0 {
@@ -100,7 +100,7 @@ func TestRestartInDeletingPhaseNeverRestartsTerminal(t *testing.T) {
 	if v := e.vm(); v == nil || v.ID != st.VMID || v.Phase != PhaseDeleting {
 		t.Fatalf("%+v", v)
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); !errors.Is(err, ErrCapacity) {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("slot must stay occupied: %v", err)
 	}
 }
@@ -169,19 +169,19 @@ func pendingCreateEnv(t *testing.T) (*env, *slowPrepare, chan struct{}) {
 func TestNotFoundDuringPendingCreateKeepsOccupancy(t *testing.T) {
 	e, sb, finished := pendingCreateEnv(t)
 	sb.failRel.Store(true)
-	_, err := e.ctl.Create(context.Background(), "")
+	_, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err == nil {
 		t.Fatal("expected the first RPC to fail")
 	}
 	if e.vm() == nil {
 		t.Fatal("slot released while the original Create may still be running")
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); !errors.Is(err, ErrCapacity) {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("replacement create must be refused: %v", err)
 	}
 	close(sb.proceed)
 	<-finished
-	all, err := e.svc.List(context.Background())
+	all, err := e.svc.List(WithUser(context.Background(), testUser))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,14 +190,14 @@ func TestNotFoundDuringPendingCreateKeepsOccupancy(t *testing.T) {
 	}
 	// The original settled as retained (release uncertain). Delete keeps it
 	// occupied until the release is confirmed, then frees the slot.
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err == nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err == nil {
 		t.Fatal("delete must not release while the release is unconfirmed")
 	}
 	if e.vm() == nil {
 		t.Fatal("retained VM abandoned")
 	}
 	sb.failRel.Store(false)
-	if _, err := e.ctl.Delete(context.Background(), Ref{}); err != nil {
+	if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err != nil {
 		t.Fatal(err)
 	}
 	if e.vm() != nil {
@@ -211,20 +211,20 @@ func TestMisleadingNotFoundNeverReleasesBeforeBarrier(t *testing.T) {
 	e, sb, finished := pendingCreateEnv(t)
 	e.lc.get = func(context.Context, string) (vmlib.VM, error) { return vmlib.VM{}, vmlib.ErrNotFound }
 	e.ctl.cfg.OpTimeout = 300 * time.Millisecond
-	_, err := e.ctl.Create(context.Background(), "")
+	_, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if !errors.Is(err, ErrUncertain) {
 		t.Fatalf("want ErrUncertain, got %v", err)
 	}
 	if v := e.vm(); v == nil || v.Phase != PhaseCreating {
 		t.Fatalf("must stay in creating phase: %+v", v)
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); err == nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); err == nil {
 		t.Fatal("second create must be refused")
 	}
 	// restart while still unsettled: same conclusion, still occupied.
 	e.restart(t)
 	e.ctl.cfg.OpTimeout = 300 * time.Millisecond
-	if err := e.ctl.Recover(context.Background()); err == nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err == nil {
 		t.Fatal("recovery must report uncertainty while the barrier cannot settle")
 	}
 	if v := e.vm(); v == nil || v.Phase != PhaseCreating {
@@ -233,12 +233,12 @@ func TestMisleadingNotFoundNeverReleasesBeforeBarrier(t *testing.T) {
 	close(sb.proceed)
 	<-finished
 	e.ctl.cfg.OpTimeout = 2 * time.Second
-	if err := e.ctl.Recover(context.Background()); err != nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err != nil {
 		t.Fatalf("once settled the barrier proves the outcome: %v", err)
 	}
 	if e.vm() != nil || e.be.Count() != 0 {
 		// the barrier deleted the unconfirmed VM; nothing may be left behind
-		all, _ := e.svc.List(context.Background())
+		all, _ := e.svc.List(WithUser(context.Background(), testUser))
 		t.Fatalf("slot/vms not clean: %+v %+v", e.vm(), all)
 	}
 }
@@ -252,17 +252,17 @@ func TestCreatingPhaseWithUnknownRemoteStaysOccupiedAcrossRestart(t *testing.T) 
 	e.lc.del = func(context.Context, string) (vmlib.DeleteResult, error) {
 		return vmlib.DeleteResult{}, errors.New("unreachable")
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); !errors.Is(err, ErrUncertain) {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); !errors.Is(err, ErrUncertain) {
 		t.Fatalf("got %v", err)
 	}
 	e.restart(t)
-	if err := e.ctl.Recover(context.Background()); err == nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err == nil {
 		t.Fatal("expected uncertainty")
 	}
 	if e.vm() == nil {
 		t.Fatal("ownership dropped on NotFound without barrier proof")
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); err == nil {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); err == nil {
 		t.Fatal("new VM allowed while the old create is unresolved")
 	}
 }
@@ -283,23 +283,23 @@ func TestUnprovableAmbiguousPrepareKeepsSlotUntilOperatorRecovery(t *testing.T) 
 	}
 	e.svc = svc
 	e.lc.Lifecycle = svc
-	st, err := e.ctl.Create(context.Background(), "")
+	st, err := e.ctl.Create(WithUser(context.Background(), testUser), "")
 	if err == nil || !st.Present {
 		t.Fatalf("the unproven identity must stay owned: %+v %v", st, err)
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := e.ctl.Delete(context.Background(), Ref{}); err == nil {
+		if _, err := e.ctl.Delete(WithUser(context.Background(), testUser), Ref{}); err == nil {
 			t.Fatal("delete must not release an unproven ambiguous prepare")
 		}
 		if e.vm() == nil {
 			t.Fatal("slot released without backend proof")
 		}
 	}
-	if _, err := e.ctl.Create(context.Background(), ""); !errors.Is(err, ErrCapacity) {
+	if _, err := e.ctl.Create(WithUser(context.Background(), testUser), ""); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("no second VM while unresolved: %v", err)
 	}
 	e.restart(t) // operator recovery boundary: restarting the controller alone changes nothing
-	if err := e.ctl.Recover(context.Background()); err == nil && e.vm() == nil {
+	if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err == nil && e.vm() == nil {
 		t.Fatal("restart must not release the slot")
 	}
 }

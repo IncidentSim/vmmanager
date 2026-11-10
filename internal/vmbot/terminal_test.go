@@ -242,7 +242,7 @@ func TestSSHInjectionBoundary(t *testing.T) {
 
 func TestTTYDArgvIsFixedAndSecretFree(t *testing.T) {
 	e := newTerm(t, nil)
-	if err := e.m.Start(context.Background(), target("bot-1", tokA)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA)); err != nil {
 		t.Fatal(err)
 	}
 	var argv []string
@@ -269,7 +269,7 @@ func TestTTYDArgvIsFixedAndSecretFree(t *testing.T) {
 
 func TestGatewayAuthOnEveryPath(t *testing.T) {
 	e := newTerm(t, nil)
-	if err := e.m.Start(context.Background(), target("bot-1", tokA)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA)); err != nil {
 		t.Fatal(err)
 	}
 	ok := "/t/" + tokA + "/"
@@ -321,7 +321,7 @@ func TestGatewayAuthOnEveryPath(t *testing.T) {
 
 func TestWebSocketOriginAndTokenChecks(t *testing.T) {
 	e := newTerm(t, nil)
-	e.m.Start(context.Background(), target("bot-1", tokA))
+	e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA))
 	for name, c := range map[string]struct {
 		path string
 		hdr  map[string]string
@@ -357,7 +357,7 @@ func TestWebSocketOriginAndTokenChecks(t *testing.T) {
 
 func TestRevokeClosesOpenWebSocketKillsChildrenAndRotates(t *testing.T) {
 	e := newTerm(t, nil)
-	if err := e.m.Start(context.Background(), target("bot-1", tokA)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA)); err != nil {
 		t.Fatal(err)
 	}
 	resp, conn, br := e.ws(t, "/t/"+tokA+"/ws", nil)
@@ -397,7 +397,7 @@ func TestRevokeClosesOpenWebSocketKillsChildrenAndRotates(t *testing.T) {
 	}
 
 	// replacement VM: new token, new known_hosts; old link stays dead.
-	if err := e.m.Start(context.Background(), target("bot-2", tokB)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-2", tokB)); err != nil {
 		t.Fatal(err)
 	}
 	if r, _ := e.get(t, "GET", "/t/"+tokB+"/", nil); r.StatusCode != 200 {
@@ -413,23 +413,23 @@ func TestRevokeClosesOpenWebSocketKillsChildrenAndRotates(t *testing.T) {
 
 func TestStartIsIdempotentAndBoundsSessions(t *testing.T) {
 	e := newTerm(t, func(c *ManagerConfig) { c.MaxSessions = 1 })
-	if err := e.m.Start(context.Background(), target("bot-1", tokA)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA)); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.m.Start(context.Background(), target("bot-1", tokA)); err != nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA)); err != nil {
 		t.Fatalf("idempotent restart of same VM: %v", err)
 	}
-	if err := e.m.Start(context.Background(), target("bot-2", tokB)); err == nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-2", tokB)); err == nil {
 		t.Fatal("a terminal beyond MaxSessions must be refused until another is revoked")
 	}
-	if err := e.m.Start(context.Background(), target("bot-1", tokB)); err == nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokB)); err == nil {
 		t.Fatal("same VM with a different token must be refused (token rotation = new VM)")
 	}
 }
 
 func TestMaxClientsBound(t *testing.T) {
 	e := newTerm(t, func(c *ManagerConfig) { c.MaxClients = 1 })
-	e.m.Start(context.Background(), target("bot-1", tokA))
+	e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA))
 	resp, c1, _ := e.ws(t, "/t/"+tokA+"/ws", nil)
 	defer c1.Close()
 	if resp.StatusCode != 101 {
@@ -451,7 +451,7 @@ func TestMaxClientsBound(t *testing.T) {
 
 func TestCloseTerminatesBackendAndWebSockets(t *testing.T) {
 	e := newTerm(t, nil)
-	e.m.Start(context.Background(), target("bot-1", tokA))
+	e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA))
 	_, conn, br := e.ws(t, "/t/"+tokA+"/ws", nil)
 	defer conn.Close()
 	conn.Write([]byte("x\n"))
@@ -467,14 +467,14 @@ func TestCloseTerminatesBackendAndWebSockets(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.dir, "ttyd-bot-1.sock")); err == nil {
 		t.Fatal("socket must be removed on shutdown")
 	}
-	if err := e.m.Start(context.Background(), target("bot-3", tokB)); err == nil {
+	if err := e.m.Start(WithUser(context.Background(), testUser), target("bot-3", tokB)); err == nil {
 		t.Fatal("closed manager must not start terminals")
 	}
 }
 
 func TestStartFailsLoudlyWhenBackendDies(t *testing.T) {
 	e := newTerm(t, func(c *ManagerConfig) { c.TTYDPath = "/bin/false"; c.StartTimeout = 2 * time.Second })
-	err := e.m.Start(context.Background(), target("bot-1", tokA))
+	err := e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA))
 	if err == nil || strings.Contains(err.Error(), tokA) {
 		t.Fatalf("want stage error without secret, got %v", err)
 	}

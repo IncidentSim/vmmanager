@@ -51,6 +51,8 @@ type Terminals interface {
 }
 
 type ControllerConfig struct {
+	AllowedUserIDs   []int64
+	MaxVMsPerUser    int
 	ImageID, Profile string
 	PublicOrigin     string
 	MaxVMs           int           // application ceiling on owned VMs; default 2
@@ -107,8 +109,43 @@ func NewController(lc vmlib.Lifecycle, st *Store, term Terminals, cfg Controller
 	if cfg.MaxVMs <= 0 {
 		cfg.MaxVMs = DefaultMaxVMs
 	}
+	if cfg.MaxVMsPerUser <= 0 {
+		cfg.MaxVMsPerUser = 1
+	}
+	cfg.AllowedUserIDs = append([]int64(nil), cfg.AllowedUserIDs...)
 	cfg.PublicOrigin = strings.TrimRight(cfg.PublicOrigin, "/")
 	return &Controller{lc: lc, st: st, term: term, cfg: cfg}
+}
+
+type userKey struct{}
+
+// WithUser attaches the authenticated Telegram sender, never a selector or payload identity.
+// Only trusted transport adapters should establish this identity. Missing/zero is denied.
+func WithUser(ctx context.Context, userID int64) context.Context {
+	return context.WithValue(ctx, userKey{}, userID)
+}
+func caller(ctx context.Context) int64 { id, _ := ctx.Value(userKey{}).(int64); return id }
+func (c *Controller) allowedUser(id int64) bool {
+	if id <= 0 {
+		return false
+	}
+	for _, allowed := range c.cfg.AllowedUserIDs {
+		if id == allowed {
+			return true
+		}
+	}
+	return false
+}
+func (c *Controller) ownedState(id int64) State {
+	s := c.st.Snapshot()
+	out := s.VMs[:0]
+	for _, r := range s.VMs {
+		if r.OwnerUserID == id {
+			out = append(out, r)
+		}
+	}
+	s.VMs = out
+	return s
 }
 
 func (c *Controller) logf(format string, a ...any) {
@@ -154,8 +191,11 @@ func (c *Controller) query(ctx context.Context) (context.Context, context.Cancel
 }
 
 // Resolve maps a Ref to a durable record without any remote call.
-func (c *Controller) Resolve(ref Ref) (VMRecord, error) {
-	st := c.st.Snapshot()
+func (c *Controller) Resolve(userID int64, ref Ref) (VMRecord, error) {
+	if !c.allowedUser(userID) {
+		return VMRecord{}, ErrNoVM
+	}
+	st := c.ownedState(userID)
 	switch {
 	case ref.Gen != 0:
 		r, ok := st.ByGeneration(ref.Gen)
@@ -263,7 +303,7 @@ func (c *Controller) confirmGoneLocked(ctx context.Context, rec VMRecord) bool {
 // revokes) is therefore always noticed by one of the two sides.
 func (c *Controller) ensureTerminalLocked(ctx context.Context, rec VMRecord) error {
 	cur, ok := c.st.Snapshot().ByID(rec.ID)
-	if !ok || cur.Phase != PhaseActive {
+	if !ok || cur.Phase != PhaseActive || !c.allowedUser(cur.OwnerUserID) {
 		c.term.Revoke(rec.ID)
 		return ErrNotRunning
 	}
@@ -273,7 +313,7 @@ func (c *Controller) ensureTerminalLocked(ctx context.Context, rec VMRecord) err
 	}
 	authorized := func() bool {
 		r, ok := c.st.Snapshot().ByID(cur.ID)
-		return ok && r.Phase == PhaseActive && r.Generation == cur.Generation && r.Token == cur.Token
+		return ok && c.allowedUser(r.OwnerUserID) && r.OwnerUserID == cur.OwnerUserID && r.Phase == PhaseActive && r.Generation == cur.Generation && r.Token == cur.Token
 	}
 	if err := c.term.Start(ctx, TerminalTarget{VMID: cur.ID, Token: cur.Token, Host: info.Host, User: info.User, ProxyJump: info.ProxyJump(), authorize: authorized}); err != nil {
 		return err
@@ -337,7 +377,10 @@ func (c *Controller) recoverOne(rec VMRecord) error {
 // List reports every owned VM, reconciling each first. Uncertain VMs are listed
 // with Uncertain=true and busy ones from durable data; none is dropped.
 func (c *Controller) List(ctx context.Context) ([]Status, error) {
-	recs := c.st.Snapshot().VMs
+	if !c.allowedUser(caller(ctx)) {
+		return nil, ErrNoVM
+	}
+	recs := c.ownedState(caller(ctx)).VMs
 	out := make([]Status, len(recs))
 	var wg sync.WaitGroup
 	for i, r := range recs {
@@ -365,17 +408,17 @@ func (c *Controller) List(ctx context.Context) ([]Status, error) {
 
 // Status reports one VM, reconciling first.
 func (c *Controller) Status(ctx context.Context, ref Ref) (Status, error) {
-	rec, err := c.Resolve(ref)
+	rec, err := c.Resolve(caller(ctx), ref)
 	if err != nil {
 		return Status{}, err
 	}
 	return c.reconcileVM(rec, c.cfg.QueryTimeout)
 }
 
-func pickLabel(s *State, want string) (string, error) {
+func pickLabel(s *State, owner int64, want string) (string, error) {
 	taken := func(l string) bool {
 		for _, r := range s.VMs {
-			if r.Label == l {
+			if r.OwnerUserID == owner && r.Label == l {
 				return true
 			}
 		}
@@ -399,6 +442,10 @@ func pickLabel(s *State, want string) (string, error) {
 // also makes the create intent durable; the create workflow then runs on the
 // VM's own queue partition, so a slow Create never blocks another VM.
 func (c *Controller) Create(ctx context.Context, name string) (Status, error) {
+	owner := caller(ctx)
+	if !c.allowedUser(owner) {
+		return Status{}, ErrNoVM
+	}
 	if name != "" && ValidateLabel(name) != nil {
 		return Status{}, ErrBadName
 	}
@@ -415,12 +462,21 @@ func (c *Controller) Create(ctx context.Context, name string) (Status, error) {
 		if len(s.VMs) >= c.cfg.MaxVMs {
 			return ErrCapacity
 		}
+		n := 0
+		for _, r := range s.VMs {
+			if r.OwnerUserID == owner {
+				n++
+			}
+		}
+		if n >= c.cfg.MaxVMsPerUser {
+			return ErrCapacity
+		}
 		s.Generation++
-		label, lerr := pickLabel(s, name)
+		label, lerr := pickLabel(s, owner, name)
 		if lerr != nil {
 			return lerr
 		}
-		rec = VMRecord{ID: id, Token: tok, Phase: PhaseCreating, Generation: s.Generation, Label: label}
+		rec = VMRecord{OwnerUserID: owner, ID: id, Token: tok, Phase: PhaseCreating, Generation: s.Generation, Label: label}
 		s.VMs = append(s.VMs, rec)
 		return nil
 	}); err != nil {
@@ -449,7 +505,7 @@ func (c *Controller) Create(ctx context.Context, name string) (Status, error) {
 
 // Terminal returns the secret link for one VM, (re)starting its backend.
 func (c *Controller) Terminal(ctx context.Context, ref Ref) (string, error) {
-	rec, err := c.Resolve(ref)
+	rec, err := c.Resolve(caller(ctx), ref)
 	if err != nil {
 		return "", err
 	}
@@ -462,7 +518,7 @@ func (c *Controller) Terminal(ctx context.Context, ref Ref) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: random source", ErrFailed)
 	}
-	h, err := c.submit(OpInput{Kind: opTerminal, VMID: rec.ID}, id)
+	h, err := c.submit(OpInput{Kind: opTerminal, VMID: rec.ID, OwnerUserID: rec.OwnerUserID}, id)
 	if err != nil {
 		return "", err
 	}
@@ -475,7 +531,7 @@ func (c *Controller) Terminal(ctx context.Context, ref Ref) (string, error) {
 	}
 	// The link is built from durable state now, never from the workflow result.
 	cur, ok := c.st.Snapshot().ByID(rec.ID)
-	if !ok || cur.Phase != PhaseActive {
+	if !ok || cur.Phase != PhaseActive || cur.OwnerUserID != caller(ctx) || !c.allowedUser(cur.OwnerUserID) {
 		return "", ErrNotRunning
 	}
 	return c.cfg.PublicOrigin + "/t/" + cur.Token + "/", nil
@@ -484,7 +540,7 @@ func (c *Controller) Terminal(ctx context.Context, ref Ref) (string, error) {
 // Delete removes one VM; it never acts without an unambiguous Ref. Ref.Gen
 // binds the call to one generation so a stale button cannot hit a replacement.
 func (c *Controller) Delete(ctx context.Context, ref Ref) (Status, error) {
-	rec, err := c.Resolve(ref)
+	rec, err := c.Resolve(caller(ctx), ref)
 	if err != nil {
 		return Status{}, err
 	}

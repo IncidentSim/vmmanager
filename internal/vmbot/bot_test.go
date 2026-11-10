@@ -76,7 +76,7 @@ func newBot(t *testing.T, e *env) (*Bot, *fakeAPI) {
 func TestUnauthorizedSendersAndChatsAreIgnored(t *testing.T) {
 	e := newEnv(t)
 	b, api := newBot(t, e)
-	ctx := context.Background()
+	ctx := WithUser(context.Background(), testUser)
 	for _, u := range []Update{
 		msg(1, 999, 999, "private", "/create"),             // wrong user
 		msg(2, testUser, -100123, "supergroup", "/create"), // right user, group chat
@@ -97,7 +97,7 @@ func TestUnauthorizedSendersAndChatsAreIgnored(t *testing.T) {
 func TestCommandsHappyPathAndRussianUI(t *testing.T) {
 	e := newEnv(t)
 	b, api := newBot(t, e)
-	ctx := context.Background()
+	ctx := WithUser(context.Background(), testUser)
 	b.Handle(ctx, msg(1, testUser, testUser, "private", "/start"))
 	if !api.sent[0].MainKeyboard || !strings.Contains(api.sent[0].Text, "/create") {
 		t.Fatalf("start: %+v", api.sent[0])
@@ -135,7 +135,7 @@ func TestCommandsHappyPathAndRussianUI(t *testing.T) {
 func TestStaleDeleteCallbackCannotDeleteReplacement(t *testing.T) {
 	e := newEnv(t)
 	b, api := newBot(t, e)
-	ctx := context.Background()
+	ctx := WithUser(context.Background(), testUser)
 	b.Handle(ctx, msg(1, testUser, testUser, "private", "/create"))
 	b.Handle(ctx, msg(2, testUser, testUser, "private", "/delete"))
 	b.Handle(ctx, msg(3, testUser, testUser, "private", "/create"))
@@ -161,7 +161,7 @@ func TestUserVisibleErrorsHideRPCInternals(t *testing.T) {
 		return vmlib.VM{}, context.DeadlineExceeded
 	}
 	e.lc.get = func(context.Context, string) (vmlib.VM, error) { return vmlib.VM{}, context.DeadlineExceeded }
-	b.Handle(context.Background(), msg(1, testUser, testUser, "private", "/create"))
+	b.Handle(WithUser(context.Background(), testUser), msg(1, testUser, testUser, "private", "/create"))
 	txt := api.texts()
 	if strings.Contains(txt, "deadline") || strings.Contains(txt, "rpc") {
 		t.Fatalf("raw error leaked: %s", txt)
@@ -180,7 +180,7 @@ func TestRunPersistsOffsetBeforeHandlingAndNeverReplays(t *testing.T) {
 		return e.svc.Create(ctx, r)
 	}
 	api.batches = [][]Update{{msg(10, testUser, testUser, "private", "/create")}}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(WithUser(context.Background(), testUser))
 	done := make(chan struct{})
 	go func() { b.Run(ctx); close(done) }()
 	deadline := time.Now().Add(3 * time.Second)
@@ -196,7 +196,7 @@ func TestRunPersistsOffsetBeforeHandlingAndNeverReplays(t *testing.T) {
 	e.restart(t)
 	api2 := &fakeAPI{}
 	b2 := NewBot(testUser, api2, e.ctl, e.store, nil)
-	ctx2, cancel2 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(WithUser(context.Background(), testUser))
 	done2 := make(chan struct{})
 	go func() { b2.Run(ctx2); close(done2) }()
 	deadline = time.Now().Add(3 * time.Second)
@@ -219,7 +219,7 @@ func TestRunPersistsOffsetBeforeHandlingAndNeverReplays(t *testing.T) {
 func TestCreateAutomaticallySendsSecretLinkAfterStatus(t *testing.T) {
 	e := newEnv(t)
 	b, api := newBot(t, e)
-	b.Handle(context.Background(), msg(1, testUser, testUser, "private", "/create"))
+	b.Handle(WithUser(context.Background(), testUser), msg(1, testUser, testUser, "private", "/create"))
 	n := len(api.sent)
 	if n < 3 {
 		t.Fatalf("want progress, status and link messages, got %d", n)
@@ -241,7 +241,7 @@ func TestFailedCreateSendsNoLink(t *testing.T) {
 		return vmlib.VM{}, context.DeadlineExceeded
 	}
 	e.lc.get = func(context.Context, string) (vmlib.VM, error) { return vmlib.VM{}, context.DeadlineExceeded }
-	b.Handle(context.Background(), msg(1, testUser, testUser, "private", "/create"))
+	b.Handle(WithUser(context.Background(), testUser), msg(1, testUser, testUser, "private", "/create"))
 	for _, m := range api.sent {
 		if m.Secret {
 			t.Fatal("no link may be sent when create failed")

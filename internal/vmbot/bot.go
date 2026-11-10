@@ -30,7 +30,7 @@ const (
 // Bot is the Telegram front end. It processes only the configured user in a
 // private chat; everything else is dropped without any reply.
 type Bot struct {
-	userID     int64
+	users      map[int64]bool
 	api        TGAPI
 	ctl        *Controller
 	st         *Store
@@ -39,7 +39,17 @@ type Bot struct {
 }
 
 func NewBot(userID int64, api TGAPI, ctl *Controller, st *Store, lg *log.Logger) *Bot {
-	return &Bot{userID: userID, api: api, ctl: ctl, st: st, log: lg, RetryDelay: 3 * time.Second}
+	return NewBotUsers([]int64{userID}, api, ctl, st, lg)
+}
+
+func NewBotUsers(ids []int64, api TGAPI, ctl *Controller, st *Store, lg *log.Logger) *Bot {
+	users := map[int64]bool{}
+	for _, id := range ids {
+		if id > 0 {
+			users[id] = true
+		}
+	}
+	return &Bot{users: users, api: api, ctl: ctl, st: st, log: lg, RetryDelay: 3 * time.Second}
 }
 
 func (b *Bot) logf(format string, a ...any) {
@@ -95,7 +105,7 @@ func (b *Bot) sleep(ctx context.Context) {
 }
 
 func (b *Bot) allowed(from *User, chat Chat) bool {
-	return from != nil && from.ID == b.userID && chat.Type == "private" && chat.ID == b.userID
+	return from != nil && b.users[from.ID] && chat.Type == "private" && chat.ID == from.ID
 }
 
 // Handle authorizes and dispatches one update.
@@ -107,13 +117,13 @@ func (b *Bot) Handle(ctx context.Context, u Update) {
 			return
 		}
 		cmd, args := parseCommand(m.Text)
-		b.command(ctx, m.Chat.ID, cmd, args)
+		b.command(WithUser(ctx, m.From.ID), m.Chat.ID, cmd, args)
 	case u.CallbackQuery != nil:
 		q := u.CallbackQuery
 		if q.Message == nil || !b.allowed(&q.From, q.Message.Chat) {
 			return
 		}
-		b.callback(ctx, q)
+		b.callback(WithUser(ctx, q.From.ID), q)
 	}
 }
 
@@ -233,7 +243,7 @@ func (b *Bot) callback(ctx context.Context, q *CallbackQuery) {
 	}
 	// Buttons name a generation, which is unique forever: a replacement VM can
 	// never be reached through a button made for its predecessor.
-	if _, found := b.st.Snapshot().ByGeneration(gen); !found {
+	if _, err := b.ctl.Resolve(caller(ctx), Ref{Gen: gen}); err != nil {
 		answer("Устарело: кнопка относится к другой VM.")
 		return
 	}
@@ -375,7 +385,7 @@ func (b *Bot) doTerminal(ctx context.Context, chat int64, ref Ref) {
 		return
 	}
 	name := ""
-	if r, rerr := b.ctl.Resolve(ref); rerr == nil {
+	if r, rerr := b.ctl.Resolve(caller(ctx), ref); rerr == nil {
 		name = " для " + displayLabel(r)
 	}
 	b.send(ctx, OutMessage{ChatID: chat, Secret: true,

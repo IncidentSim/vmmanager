@@ -26,7 +26,7 @@ func TestOrchestrationTerminalCreateErrorReconcilesRemoteOutcome(t *testing.T) {
 				}
 				panic("injected workflow failure")
 			}
-			if _, err := e.ctl.Create(context.Background(), "a"); err == nil {
+			if _, err := e.ctl.Create(WithUser(context.Background(), testUser), "a"); err == nil {
 				t.Fatal("expected workflow error")
 			}
 			rec := e.only(t)
@@ -43,7 +43,7 @@ func TestOrchestrationTerminalCreateErrorReconcilesRemoteOutcome(t *testing.T) {
 				return e.svc.Delete(ctx, id)
 			}
 			e.restart(t)
-			if err := e.ctl.Recover(context.Background()); err != nil {
+			if err := e.ctl.Recover(WithUser(context.Background(), testUser)); err != nil {
 				t.Fatal(err)
 			}
 			if creates.Load() != 1 {
@@ -54,7 +54,7 @@ func TestOrchestrationTerminalCreateErrorReconcilesRemoteOutcome(t *testing.T) {
 				if !ok || cur.Phase != PhaseActive || cur.Token != rec.Token || cur.Generation != rec.Generation {
 					t.Fatal("existing remote VM not adopted with unchanged identity")
 				}
-				s, err := e.ctl.Status(context.Background(), Ref{Sel: "a"})
+				s, err := e.ctl.Status(WithUser(context.Background(), testUser), Ref{Sel: "a"})
 				if err != nil || s.Busy || s.Uncertain || !s.Present {
 					t.Fatalf("status: %+v %v", s, err)
 				}

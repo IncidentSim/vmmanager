@@ -18,7 +18,10 @@ import (
 // separate 0600 file named by TelegramTokenFile.
 type Config struct {
 	TelegramTokenFile string         `json:"telegram_token_file"`
-	AllowedUserID     int64          `json:"allowed_user_id"`
+	AllowedUserID     int64          `json:"allowed_user_id,omitempty"`
+	AllowedUserIDs    []int64        `json:"allowed_user_ids,omitempty"`
+	LegacyOwnerUserID int64          `json:"legacy_owner_user_id,omitempty"`
+	MaxVMsPerUser     int            `json:"max_vms_per_user"`
 	Facade            FacadeConfig   `json:"facade"`
 	VM                VMConfig       `json:"vm"`
 	MaxVMs            int            `json:"max_vms"` // application ceiling, default 2; backend policy stays authoritative
@@ -75,6 +78,9 @@ func LoadConfig(path string) (Config, error) {
 	if c.Terminal.MaxClients == 0 {
 		c.Terminal.MaxClients = 2
 	}
+	if c.MaxVMsPerUser == 0 {
+		c.MaxVMsPerUser = 1
+	}
 	if c.MaxVMs == 0 {
 		c.MaxVMs = DefaultMaxVMs
 	}
@@ -82,6 +88,22 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("config: %w", err)
 	}
 	return c, nil
+}
+
+// UserIDs returns a copy of the explicit effective allowlist.
+func (c Config) UserIDs() []int64 {
+	if c.AllowedUserID > 0 {
+		return []int64{c.AllowedUserID}
+	}
+	return append([]int64(nil), c.AllowedUserIDs...)
+}
+
+// LegacyOwner never infers ownership from plural allowlist order.
+func (c Config) LegacyOwner() int64 {
+	if c.AllowedUserID > 0 {
+		return c.AllowedUserID
+	}
+	return c.LegacyOwnerUserID
 }
 
 func isLoopbackListen(addr string) bool {
@@ -104,8 +126,25 @@ func (c Config) validate() error {
 			return fmt.Errorf("%s must be an absolute path", name)
 		}
 	}
-	if c.AllowedUserID <= 0 {
-		return errors.New("allowed_user_id must be a positive Telegram user ID")
+	if c.AllowedUserID < 0 || (c.AllowedUserID != 0 && c.AllowedUserIDs != nil) {
+		return errors.New("specify exactly one of allowed_user_id or allowed_user_ids")
+	}
+	ids := c.UserIDs()
+	if len(ids) == 0 {
+		return errors.New("positive Telegram user allowlist required")
+	}
+	seen := map[int64]bool{}
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			return errors.New("allowlist IDs must be positive and unique")
+		}
+		seen[id] = true
+	}
+	if c.LegacyOwnerUserID < 0 || (c.AllowedUserID > 0 && c.LegacyOwnerUserID > 0 && c.LegacyOwnerUserID != c.AllowedUserID) {
+		return errors.New("invalid or conflicting legacy owner")
+	}
+	if c.MaxVMsPerUser < 1 || c.MaxVMsPerUser > MaxVMsLimit {
+		return errors.New("max_vms_per_user must be 1..8")
 	}
 	if c.Facade.Addr == "" || c.Facade.ServerName == "" {
 		return errors.New("facade.addr and facade.server_name are required")

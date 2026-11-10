@@ -46,9 +46,10 @@ const (
 
 // OpInput is the workflow input: identifiers only, never a token or a link.
 type OpInput struct {
-	Kind string
-	VMID string
-	Seq  uint64
+	OwnerUserID int64 // durable owner, never obtained from a selector or callback
+	Kind        string
+	VMID        string
+	Seq         uint64
 }
 
 // Result codes carried in OpResult (an outcome is a value, not a workflow error:
@@ -181,6 +182,11 @@ func vmbotOp(ctx dbos.Context, in OpInput) (OpResult, error) {
 	if c == nil {
 		return OpResult{Code: codeFailed, Msg: "no controller"}, nil
 	}
+	// Old orchestration records have no owner field. Replay derives it only from
+	// the explicitly migrated durable record; new submissions must carry it.
+	if rec, ok := c.st.Snapshot().ByID(in.VMID); ok && in.OwnerUserID != 0 && rec.OwnerUserID != in.OwnerUserID {
+		return OpResult{Code: codeNoVM}, nil
+	}
 	switch in.Kind {
 	case opCreate:
 		return c.createFlow(ctx, in)
@@ -299,6 +305,19 @@ func sameInput(got any, want OpInput) bool {
 // DBOS handed back really carries our input: DBOS silently returns an old
 // execution for a reused ID, which must never retarget a command.
 func (c *Controller) submit(in OpInput, id string) (opHandle, error) {
+	rec, ok := c.st.Snapshot().ByID(in.VMID)
+	if !ok || in.OwnerUserID <= 0 || rec.OwnerUserID != in.OwnerUserID {
+		return nil, ErrNoVM
+	}
+	// Backward-compatible attachment to an existing pre-v3 workflow. Never
+	// relax actor equality for a newly submitted input or a nonzero old actor.
+	if _, old := c.lookup(id); old != nil {
+		legacy := in
+		legacy.OwnerUserID = 0
+		if sameInput(old.Input, legacy) {
+			in = legacy
+		}
+	}
 	e := c.engine()
 	if e == nil || !e.ready.Load() {
 		return nil, fmt.Errorf("%w: orchestration not running", ErrFailed)
@@ -344,7 +363,7 @@ func (c *Controller) wait(h opHandle, d time.Duration) (OpResult, error) {
 
 // ensureCreate submits (or re-attaches to) the create workflow of a record.
 func (c *Controller) ensureCreate(rec VMRecord) (opHandle, error) {
-	return c.submit(OpInput{Kind: opCreate, VMID: rec.ID}, createID(rec.ID))
+	return c.submit(OpInput{Kind: opCreate, VMID: rec.ID, OwnerUserID: rec.OwnerUserID}, createID(rec.ID))
 }
 
 // createFinished reports whether the create workflow of a record has concluded
@@ -413,7 +432,7 @@ func (c *Controller) persistAndSubmitDelete(rec VMRecord) (opHandle, VMRecord, e
 			return nil, cur, fmt.Errorf("%w: cannot persist state", ErrFailed)
 		}
 	}
-	h, err := c.submit(OpInput{Kind: opDelete, VMID: cur.ID, Seq: cur.Seq}, deleteID(cur.ID, cur.Seq))
+	h, err := c.submit(OpInput{Kind: opDelete, VMID: cur.ID, Seq: cur.Seq, OwnerUserID: cur.OwnerUserID}, deleteID(cur.ID, cur.Seq))
 	return h, cur, err
 }
 
@@ -440,7 +459,7 @@ func (c *Controller) reconcileVM(rec VMRecord, d time.Duration) (Status, error) 
 	if err != nil {
 		return statusOf(&rec, nil), fmt.Errorf("%w: random source", ErrFailed)
 	}
-	h, err := c.submit(OpInput{Kind: opReconcile, VMID: rec.ID}, id)
+	h, err := c.submit(OpInput{Kind: opReconcile, VMID: rec.ID, OwnerUserID: rec.OwnerUserID}, id)
 	if err != nil {
 		return statusOf(&rec, nil), err
 	}

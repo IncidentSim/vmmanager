@@ -30,14 +30,14 @@ func TestTelegramClientRequestsAndSecretMessageFlags(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewTelegramClient(srv.URL, fakeToken, srv.Client())
-	ups, err := c.GetUpdates(context.Background(), 5, 1)
+	ups, err := c.GetUpdates(WithUser(context.Background(), testUser), 5, 1)
 	if err != nil || len(ups) != 1 || ups[0].UpdateID != 5 || ups[0].Message.From.ID != 4242 || ups[0].Message.Chat.Type != "private" {
 		t.Fatalf("updates: %+v %v", ups, err)
 	}
 	if bodies[0]["offset"].(float64) != 5 || bodies[0]["timeout"].(float64) != 1 {
 		t.Fatalf("getUpdates body %v", bodies[0])
 	}
-	if err := c.SendMessage(context.Background(), OutMessage{ChatID: 4242, Text: "https://x/t/abc/", Secret: true}); err != nil {
+	if err := c.SendMessage(WithUser(context.Background(), testUser), OutMessage{ChatID: 4242, Text: "https://x/t/abc/", Secret: true}); err != nil {
 		t.Fatal(err)
 	}
 	b := bodies[1]
@@ -48,14 +48,14 @@ func TestTelegramClientRequestsAndSecretMessageFlags(t *testing.T) {
 	if paths[1] != "/bot"+fakeToken+"/sendMessage" {
 		t.Fatalf("path %q", paths[1])
 	}
-	if err := c.SendMessage(context.Background(), OutMessage{ChatID: 1, Text: "hi", MainKeyboard: true,
+	if err := c.SendMessage(WithUser(context.Background(), testUser), OutMessage{ChatID: 1, Text: "hi", MainKeyboard: true,
 		Inline: [][]Button{{{Text: "Удалить", Data: "d:1"}}, {{Text: "Терминал", Data: "t:1"}}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := bodies[2]["reply_markup"]; !ok {
 		t.Fatal("keyboard missing")
 	}
-	if err := c.AnswerCallback(context.Background(), "id1", "ok"); err != nil || !strings.HasSuffix(paths[3], "/answerCallbackQuery") {
+	if err := c.AnswerCallback(WithUser(context.Background(), testUser), "id1", "ok"); err != nil || !strings.HasSuffix(paths[3], "/answerCallbackQuery") {
 		t.Fatalf("answer: %v %v", err, paths)
 	}
 }
@@ -66,7 +66,7 @@ func TestTelegramErrorsNeverContainToken(t *testing.T) {
 	url := srv.URL
 	srv.Close()
 	c := NewTelegramClient(url, fakeToken, http.DefaultClient)
-	_, err := c.GetUpdates(context.Background(), 0, 0)
+	_, err := c.GetUpdates(WithUser(context.Background(), testUser), 0, 0)
 	if err == nil || strings.Contains(err.Error(), fakeToken) || strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("transport error leaks token: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestTelegramErrorsNeverContainToken(t *testing.T) {
 	}))
 	defer srv2.Close()
 	c = NewTelegramClient(srv2.URL, fakeToken, srv2.Client())
-	err = c.SendMessage(context.Background(), OutMessage{ChatID: 1, Text: "x"})
+	err = c.SendMessage(WithUser(context.Background(), testUser), OutMessage{ChatID: 1, Text: "x"})
 	if err == nil || strings.Contains(err.Error(), "SECRET") || !strings.Contains(err.Error(), "sendMessage") {
 		t.Fatalf("api error: %v", err)
 	}

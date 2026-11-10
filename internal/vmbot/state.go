@@ -29,7 +29,7 @@ const (
 )
 
 const (
-	stateVersion   = 2
+	stateVersion   = 3
 	stateVersionV1 = 1
 	// MaxVMsLimit is the hard ceiling for the configurable max_vms.
 	MaxVMsLimit = 8
@@ -52,11 +52,12 @@ func ValidateLabel(l string) error {
 
 // VMRecord is one VM this application owns.
 type VMRecord struct {
-	ID         string `json:"id"`
-	Token      string `json:"token"` // terminal capability (secret)
-	Phase      string `json:"phase"`
-	Generation uint64 `json:"generation"`
-	Label      string `json:"label,omitempty"` // unique, immutable display name
+	OwnerUserID int64  `json:"owner_user_id"`
+	ID          string `json:"id"`
+	Token       string `json:"token"` // terminal capability (secret)
+	Phase       string `json:"phase"`
+	Generation  uint64 `json:"generation"`
+	Label       string `json:"label,omitempty"` // unique, immutable display name
 	// Seq is the delete-attempt sequence (ADR 0004): the durable part of the
 	// delete workflow ID. 0 = no delete intent yet. A retry after a finished,
 	// unsuccessful attempt persists Seq+1 before a new workflow is submitted.
@@ -142,6 +143,9 @@ func (s State) validate() error {
 	ids, toks, labels := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	var prev uint64
 	for _, r := range s.VMs {
+		if r.OwnerUserID <= 0 {
+			return errors.New("invalid state: owner must be positive")
+		}
 		if err := vmlib.ValidateID("vm", r.ID); err != nil {
 			return fmt.Errorf("invalid state: bad VM id: %w", err)
 		}
@@ -164,10 +168,10 @@ func (s State) validate() error {
 			if err := ValidateLabel(r.Label); err != nil {
 				return errors.New("invalid state: bad label")
 			}
-			if labels[r.Label] {
+			if labels[fmt.Sprintf("%d/%s", r.OwnerUserID, r.Label)] {
 				return errors.New("invalid state: duplicate label")
 			}
-			labels[r.Label] = true
+			labels[fmt.Sprintf("%d/%s", r.OwnerUserID, r.Label)] = true
 		}
 		if ids[r.ID] || toks[r.Token] {
 			return errors.New("invalid state: duplicate VM id or token")
@@ -190,12 +194,20 @@ type Store struct {
 	engineOwner *Controller // keeps the flock alive while DBOS may execute work
 	st          State
 	migration   *MigrationInfo
+	legacyOwner int64
 }
 
 // OpenStore creates dir (0700) if needed, takes the exclusive lock and loads
 // state, migrating a v1 file to v2. It fails closed on loose permissions,
 // corrupt, invalid or future-version data.
-func OpenStore(dir string) (*Store, error) {
+func OpenStore(dir string, legacyOwner ...int64) (*Store, error) {
+	var owner int64
+	if len(legacyOwner) > 1 || (len(legacyOwner) == 1 && legacyOwner[0] <= 0) {
+		return nil, errors.New("invalid legacy owner")
+	}
+	if len(legacyOwner) == 1 {
+		owner = legacyOwner[0]
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("state dir: %w", err)
 	}
@@ -217,7 +229,7 @@ func OpenStore(dir string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("state lock: %w", err)
 	}
-	s := &Store{dir: dir, lock: lf}
+	s := &Store{dir: dir, lock: lf, legacyOwner: owner}
 	if err := s.load(); err != nil {
 		lf.Close()
 		return nil, err
@@ -277,6 +289,13 @@ func (s *Store) load() error {
 		return nil
 	case stateVersionV1:
 		return s.migrateV1(b)
+	case 2:
+		var st State
+		if err := decodeStrict(b, &st); err != nil {
+			return err
+		}
+		st.Version = stateVersion
+		return s.migrateLegacy(b, st, 2)
 	default:
 		return fmt.Errorf("state file version %d unsupported", probe.Version)
 	}
@@ -298,10 +317,23 @@ func (s *Store) migrateV1(raw []byte) error {
 		r.Label = fmt.Sprintf("vm-%d", r.Generation)
 		next.VMs = append(next.VMs, r)
 	}
-	if err := next.validate(); err != nil {
-		return fmt.Errorf("state file (v1): %w", err)
+	return s.migrateLegacy(raw, next, 1)
+}
+
+func (s *Store) migrateLegacy(raw []byte, next State, version int) error {
+	for i := range next.VMs {
+		if next.VMs[i].OwnerUserID != 0 {
+			return errors.New("legacy state unexpectedly has an owner")
+		}
+		if s.legacyOwner <= 0 {
+			return errors.New("legacy state requires explicit legacy owner")
+		}
+		next.VMs[i].OwnerUserID = s.legacyOwner
 	}
-	bak, err := s.preserveBackup(raw)
+	if err := next.validate(); err != nil {
+		return err
+	}
+	bak, err := s.preserveBackup(raw, version)
 	if err != nil {
 		return fmt.Errorf("state migration aborted (no backup): %w", err)
 	}
@@ -315,8 +347,8 @@ func (s *Store) migrateV1(raw []byte) error {
 
 // preserveBackup stores raw as state.json.v1.bak (then .1, .2, ...). An existing
 // file is never overwritten; an identical earlier backup (a retry) is reused.
-func (s *Store) preserveBackup(raw []byte) (string, error) {
-	base := filepath.Join(s.dir, "state.json.v1.bak")
+func (s *Store) preserveBackup(raw []byte, version int) (string, error) {
+	base := filepath.Join(s.dir, fmt.Sprintf("state.json.v%d.bak", version))
 	for i := 0; i < 1000; i++ {
 		name := base
 		if i > 0 {
@@ -389,6 +421,11 @@ func (s *Store) UpdateErr(mutate func(*State) error) error {
 	next := clone(s.st)
 	if err := mutate(&next); err != nil {
 		return err
+	}
+	for _, old := range s.st.VMs {
+		if cur, ok := next.ByID(old.ID); ok && cur.OwnerUserID != old.OwnerUserID {
+			return errors.New("persist state: VM owner is immutable")
+		}
 	}
 	next.Version = stateVersion
 	sort.Slice(next.VMs, func(i, j int) bool { return next.VMs[i].Generation < next.VMs[j].Generation })

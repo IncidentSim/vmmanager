@@ -46,7 +46,7 @@ func openWS(t *testing.T, e *tenv, vm, tok string) (net.Conn, func() string, int
 
 func TestRevokingOneVMKeepsTheOtherInteractiveOnTheSameURL(t *testing.T) {
 	e := newTerm(t, nil)
-	ctx := context.Background()
+	ctx := WithUser(context.Background(), testUser)
 	if err := e.m.Start(ctx, target("bot-a", tokA)); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestRevokingOneVMKeepsTheOtherInteractiveOnTheSameURL(t *testing.T) {
 
 func TestCloseShutsEverySessionWithoutNeedingVMs(t *testing.T) {
 	e := newTerm(t, nil)
-	ctx := context.Background()
+	ctx := WithUser(context.Background(), testUser)
 	e.m.Start(ctx, target("bot-a", tokA))
 	e.m.Start(ctx, target("bot-b", tokB))
 	connA, _, pidA := openWS(t, e, "bot-a", tokA)
@@ -129,7 +129,7 @@ func TestCloseShutsEverySessionWithoutNeedingVMs(t *testing.T) {
 
 func TestSessionLimitsAndTokenUniquenessAreBounded(t *testing.T) {
 	e := newTerm(t, func(c *ManagerConfig) { c.MaxClients = 1; c.MaxSessions = 2 })
-	ctx := context.Background()
+	ctx := WithUser(context.Background(), testUser)
 	if err := e.m.Start(ctx, target("bot-a", tokA)); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestRevokeDuringSlowStartAndOtherVMsAreNotBlocked(t *testing.T) {
 	}
 	e := newTerm(t, func(c *ManagerConfig) { c.TTYDPath = slow; c.StartTimeout = 20 * time.Second })
 	errA := make(chan error, 1)
-	go func() { errA <- e.m.Start(context.Background(), target("bot-a", tokA)) }()
+	go func() { errA <- e.m.Start(WithUser(context.Background(), testUser), target("bot-a", tokA)) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		e.m.mu.Lock()
@@ -201,7 +201,7 @@ func TestRevokeDuringSlowStartAndOtherVMsAreNotBlocked(t *testing.T) {
 	}
 	// While A is still starting, the manager lock is free: lookups and B's start proceed.
 	started := make(chan error, 1)
-	go func() { started <- e.m.Start(context.Background(), target("bot-b", tokB)) }()
+	go func() { started <- e.m.Start(WithUser(context.Background(), testUser), target("bot-b", tokB)) }()
 	select {
 	case err := <-started:
 		if err != nil {
@@ -240,7 +240,7 @@ func TestRevokeDuringSlowStartAndOtherVMsAreNotBlocked(t *testing.T) {
 // Race detector target: Start/Revoke/Close/lookup across different VMs.
 func TestConcurrentStartRevokeCloseLookupAcrossVMs(t *testing.T) {
 	e := newTerm(t, nil)
-	ctx := context.Background()
+	ctx := WithUser(context.Background(), testUser)
 	vms := []struct{ id, tok string }{{"bot-a", tokA}, {"bot-b", tokB}}
 	var wg sync.WaitGroup
 	for _, v := range vms {

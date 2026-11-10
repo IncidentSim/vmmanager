@@ -55,9 +55,9 @@ func TestLimitListenerBoundsConnections(t *testing.T) {
 func TestServeGatewayShutdownClosesWebSockets(t *testing.T) {
 	e := newTerm(t, nil)
 	e.srv.Close() // use ServeGateway's own listener instead of httptest's
-	e.m.Start(context.Background(), target("bot-1", tokA))
+	e.m.Start(WithUser(context.Background(), testUser), target("bot-1", tokA))
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(WithUser(context.Background(), testUser))
 	done := make(chan error, 1)
 	go func() { done <- ServeGateway(ctx, ln, "", "", e.m) }()
 
