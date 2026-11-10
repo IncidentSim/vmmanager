@@ -30,6 +30,9 @@ type Backend struct {
 	StartUncertainErr error
 	// GuestDNS is advertised in guest network metadata (default 1.1.1.1; nil = none).
 	GuestDNS []string
+	// OnInspect runs inside Inspect AFTER the state was read and the lock was
+	// released, so a test can make a read return stale data.
+	OnInspect func(id string)
 	// OnStart runs inside Start (before returning); useful for races.
 	OnStart func(vmID string)
 
@@ -180,12 +183,17 @@ func (b *Backend) Start(_ context.Context, id string) (vmlib.HostVM, error) {
 
 func (b *Backend) Inspect(_ context.Context, id string) (vmlib.HostVM, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	v, err := b.get(id)
 	if err != nil {
+		b.mu.Unlock()
 		return vmlib.HostVM{}, err
 	}
-	return v.host, nil
+	h, hook := v.host, b.OnInspect
+	b.mu.Unlock()
+	if hook != nil {
+		hook(id)
+	}
+	return h, nil
 }
 
 func (b *Backend) List(context.Context) ([]vmlib.HostVM, error) {

@@ -60,6 +60,7 @@ type record struct {
 	op chan struct{}
 
 	st           sync.Mutex
+	ver          uint64 // bumped on every state change; guards late application of reads
 	vm           VM
 	keyRef       string // immutable after publication
 	exited       bool   // original exit receipt observed (or never started)
@@ -120,19 +121,50 @@ func (r *record) exitInfo() (exited, clean, never bool) {
 }
 
 // mutate runs f under the state lock.
-func (r *record) mutate(f func(r *record)) { r.st.Lock(); defer r.st.Unlock(); f(r) }
+func (r *record) mutate(f func(r *record)) {
+	r.st.Lock()
+	defer r.st.Unlock()
+	r.ver++
+	f(r)
+}
 
-// apply merges the backend's view. Retention is sticky until a successful
-// delete and is independent of the lifecycle state.
+func (r *record) version() uint64 { r.st.Lock(); defer r.st.Unlock(); return r.ver }
+
+// apply merges the backend's view unconditionally (used on paths that hold the
+// operation lock, such as Create and rehydration).
 func (r *record) apply(h HostVM) {
 	r.st.Lock()
 	defer r.st.Unlock()
+	r.applyLocked(h)
+}
+
+// applyIfUnchanged merges a read only if nothing changed the record since the
+// read began (ver). A read that was overtaken by a lifecycle operation is stale
+// and is dropped; the caller reports the record's current snapshot instead.
+func (r *record) applyIfUnchanged(h HostVM, ver uint64) bool {
+	r.st.Lock()
+	defer r.st.Unlock()
+	if r.ver != ver {
+		return false
+	}
+	r.applyLocked(h)
+	return true
+}
+
+// applyLocked is monotonic: once the original exit is known (stopped, failed,
+// committed) no later read may move the VM back to running/exiting/preparing.
+// Retention is sticky until a successful delete.
+func (r *record) applyLocked(h HostVM) {
+	if r.exited {
+		return
+	}
 	if h.Retained {
 		r.vm.Retained = true
 		if r.vm.RetainedReason == "" {
 			r.vm.RetainedReason = h.RetainedReason
 		}
 	}
+	before := r.vm.State
 	switch h.State {
 	case HostPrepared:
 		if r.vm.State != StateFailed && r.vm.State != StateStopped {
@@ -148,6 +180,9 @@ func (r *record) apply(h HostVM) {
 		if r.vm.State != StateCommitted && r.vm.State != StateFailed {
 			r.vm.State = StateStopped
 		}
+	}
+	if r.vm.State != before || h.Retained {
+		r.ver++
 	}
 }
 
@@ -286,11 +321,12 @@ func (s *Service) lookup(ctx context.Context, id string) (*record, error) {
 
 func (s *Service) refresh(ctx context.Context, rec *record) error {
 	id := rec.snapshot().ID
+	ver := rec.version() // the read is only applied if no operation overtakes it
 	h, err := s.b.Inspect(ctx, id)
 	if err != nil {
 		return err
 	}
-	rec.apply(h)
+	rec.applyIfUnchanged(h, ver)
 	return nil
 }
 
