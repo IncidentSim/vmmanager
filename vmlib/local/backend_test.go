@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"example.com/firecracker-postgres-builder/vmlib"
-	"example.com/firecracker-postgres-builder/vmlib/local"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib/local"
 )
 
 const inv = "0123456789abcdef0123456789abcdef"

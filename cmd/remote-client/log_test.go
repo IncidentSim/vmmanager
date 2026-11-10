@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/firecracker-postgres-builder/internal/remote"
+	"github.com/petruekhin/vibe-firecracker/internal/remote"
 )
 
 func TestClientLogCursor(t *testing.T) {

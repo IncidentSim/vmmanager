@@ -6,8 +6,8 @@ import (
 
 	"google.golang.org/grpc"
 
-	"example.com/firecracker-postgres-builder/vmlib"
-	pb "example.com/firecracker-postgres-builder/vmlib/gen/vmlib/backend/v1"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	pb "github.com/petruekhin/vibe-firecracker/vmlib/gen/vmlib/backend/v1"
 )
 
 // ---- server -----------------------------------------------------------------

@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"example.com/firecracker-postgres-builder/vmlib"
-	"example.com/firecracker-postgres-builder/vmlib/remote"
-	"example.com/firecracker-postgres-builder/vmlib/remote/pkitest"
-	"example.com/firecracker-postgres-builder/vmlib/vmlibtest"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib/remote"
+	"github.com/petruekhin/vibe-firecracker/vmlib/remote/pkitest"
+	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 )
 
 type facadeEnv struct {
@@ -189,7 +189,7 @@ func TestFacadeClientContextEndDoesNotKillVM(t *testing.T) {
 
 // The portable client must not drag in the Firecracker SDK or the local backend.
 func TestRemotePackageHasNoKVMDependencies(t *testing.T) {
-	out, err := exec.Command("go", "list", "-deps", "example.com/firecracker-postgres-builder/vmlib/remote").CombinedOutput()
+	out, err := exec.Command("go", "list", "-deps", "github.com/petruekhin/vibe-firecracker/vmlib/remote").CombinedOutput()
 	if err != nil {
 		t.Skipf("go list unavailable: %v", err)
 	}

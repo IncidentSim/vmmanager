@@ -6,7 +6,7 @@ BUILD_DIR ?= .
 IMAGE ?= images/ubuntu-postgres.ext4
 FC_SOCKET ?= /run/firecracker-builder/main.sock
 
-.PHONY: build remote-client test vet check shell-syntax run verify demo proto proto-check vmd vmctl vm-launcher
+.PHONY: build remote-client test vet check shell-syntax run verify demo proto proto-check consumer-smoke vmd vmctl vm-launcher
 
 build:
 	mkdir -p "$(BUILD_DIR)"
@@ -37,7 +37,10 @@ proto:
 proto-check:
 	bash scripts/gen-proto.sh --check
 
-check: test vet shell-syntax proto-check
+consumer-smoke:
+	bash scripts/consumer-smoke.sh
+
+check: test vet shell-syntax proto-check consumer-smoke
 
 # Runtime helpers expect image-builder in the repository root.
 # These targets use the existing external VMM; no host-service management.

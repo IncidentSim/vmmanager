@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/firecracker-postgres-builder/vmlib/local"
+	"github.com/petruekhin/vibe-firecracker/vmlib/local"
 )
 
 // The launcher may pass nothing but a fixed verb and a bounded integer.

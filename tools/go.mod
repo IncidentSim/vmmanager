@@ -1,4 +1,4 @@
-module example.com/firecracker-postgres-builder/tools
+module github.com/petruekhin/vibe-firecracker/tools
 
 go 1.22
 

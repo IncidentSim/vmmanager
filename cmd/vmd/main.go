@@ -21,9 +21,9 @@ import (
 
 	"google.golang.org/grpc"
 
-	"example.com/firecracker-postgres-builder/vmlib"
-	"example.com/firecracker-postgres-builder/vmlib/local"
-	"example.com/firecracker-postgres-builder/vmlib/remote"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib/local"
+	"github.com/petruekhin/vibe-firecracker/vmlib/remote"
 )
 
 // deps lets tests replace the two host seams; production leaves it zero.

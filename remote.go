@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"example.com/firecracker-postgres-builder/internal/remote"
+	"github.com/petruekhin/vibe-firecracker/internal/remote"
 )
 
 // No CommandContext: SIGKILL would bypass receipt-based cleanup. The slot stays

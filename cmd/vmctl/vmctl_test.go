@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/firecracker-postgres-builder/vmlib"
-	"example.com/firecracker-postgres-builder/vmlib/vmlibtest"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 )
 
 func svc(t *testing.T) *vmlib.Service {

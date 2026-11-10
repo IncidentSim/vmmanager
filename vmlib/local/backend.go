@@ -27,7 +27,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"example.com/firecracker-postgres-builder/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
 const maxSlots = 64

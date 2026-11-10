@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"sync"
 
-	"example.com/firecracker-postgres-builder/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
 // Backend is a fake host backend with admission caps and unique guest IPs.

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"example.com/firecracker-postgres-builder/internal/remote"
+	"github.com/petruekhin/vibe-firecracker/internal/remote"
 )
 
 // Exercise both executables without accessing a VMM: a fixed local build must

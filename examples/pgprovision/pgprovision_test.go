@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/firecracker-postgres-builder/examples/pgprovision"
-	"example.com/firecracker-postgres-builder/vmlib"
-	"example.com/firecracker-postgres-builder/vmlib/vmlibtest"
+	"github.com/petruekhin/vibe-firecracker/examples/pgprovision"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 )
 
 type recorder struct {

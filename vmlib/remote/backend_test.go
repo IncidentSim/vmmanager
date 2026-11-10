@@ -12,10 +12,10 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
-	backendv1 "example.com/firecracker-postgres-builder/vmlib/gen/vmlib/backend/v1"
+	backendv1 "github.com/petruekhin/vibe-firecracker/vmlib/gen/vmlib/backend/v1"
 
-	"example.com/firecracker-postgres-builder/vmlib"
-	"example.com/firecracker-postgres-builder/vmlib/remote"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib/remote"
 )
 
 func connect(t *testing.T, e *env) *remote.BackendClient {

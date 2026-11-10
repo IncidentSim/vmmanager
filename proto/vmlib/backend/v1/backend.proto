@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package vmlib.backend.v1;
 
-option go_package = "example.com/firecracker-postgres-builder/vmlib/gen/vmlib/backend/v1;backendv1";
+option go_package = "github.com/petruekhin/vibe-firecracker/vmlib/gen/vmlib/backend/v1;backendv1";
 
 // HostBackend is the narrow set of host operations required by the VM lifecycle
 // facade. Every identifier is opaque and validated by the server; no request

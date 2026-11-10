@@ -24,8 +24,8 @@ The legacy CLI (`package main`) and `internal/remote` HTTPS build manager are un
 
 ```go
 import (
-    "example.com/firecracker-postgres-builder/vmlib"
-    "example.com/firecracker-postgres-builder/vmlib/remote"
+    "github.com/petruekhin/vibe-firecracker/vmlib"
+    "github.com/petruekhin/vibe-firecracker/vmlib/remote"
 )
 
 // A) Facade over a REMOTE host backend (client-side orchestration):

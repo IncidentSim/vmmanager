@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package vmlib.facade.v1;
 
-option go_package = "example.com/firecracker-postgres-builder/vmlib/gen/vmlib/facade/v1;facadev1";
+option go_package = "github.com/petruekhin/vibe-firecracker/vmlib/gen/vmlib/facade/v1;facadev1";
 
 // VMService is the lifecycle facade. A call's deadline bounds that call only;
 // it never terminates a running VM. Stop and Delete are idempotent.

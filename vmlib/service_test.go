@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"example.com/firecracker-postgres-builder/vmlib"
-	"example.com/firecracker-postgres-builder/vmlib/vmlibtest"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 )
 
 func newSvc(t *testing.T, max int) (*vmlib.Service, *vmlibtest.Backend) {

@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"example.com/firecracker-postgres-builder/internal/remote"
+	"github.com/petruekhin/vibe-firecracker/internal/remote"
 )
 
 func clientPKI(t *testing.T) (string, string, string) {

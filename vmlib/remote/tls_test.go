@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"example.com/firecracker-postgres-builder/vmlib"
-	"example.com/firecracker-postgres-builder/vmlib/remote"
-	"example.com/firecracker-postgres-builder/vmlib/remote/pkitest"
-	"example.com/firecracker-postgres-builder/vmlib/vmlibtest"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib/remote"
+	"github.com/petruekhin/vibe-firecracker/vmlib/remote/pkitest"
+	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 )
 
 const host = "vmd.test"

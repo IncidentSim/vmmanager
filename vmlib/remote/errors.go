@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
-	"example.com/firecracker-postgres-builder/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
 const (

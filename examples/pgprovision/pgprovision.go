@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"example.com/firecracker-postgres-builder/vmlib"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
 // Script runs IN THE GUEST (same steps as the legacy builder), never on the host.
