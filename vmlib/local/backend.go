@@ -158,7 +158,15 @@ type Backend struct {
 	entries map[string]*entry
 	corrupt []string // unreadable workspaces: admission fails closed
 	locks   []*os.File
-	closed  bool
+
+	// Lifecycle gate: every exported operation is admitted through enter() and
+	// Close drains them before the ownership locks are released.
+	gmu       sync.Mutex
+	gcond     *sync.Cond
+	active    int
+	closing   bool
+	closeCh   chan struct{} // closed when Close begins; wakes blocking waits
+	closeDone chan struct{} // closed once the locks are released
 
 	// hookAfterLookup is a test seam between entry lookup and lock acquisition.
 	hookAfterLookup func(id string)
@@ -312,7 +320,8 @@ func New(cfg Config) (*Backend, error) {
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 15 * time.Second
 	}
-	b := &Backend{cfg: cfg, entries: map[string]*entry{}}
+	b := &Backend{cfg: cfg, entries: map[string]*entry{}, closeCh: make(chan struct{}), closeDone: make(chan struct{})}
+	b.gcond = sync.NewCond(&b.gmu)
 	sorted := append([]string(nil), roots...)
 	sort.Strings(sorted) // fixed order avoids lock-order deadlock between owners
 	for _, dir := range sorted {
@@ -334,29 +343,64 @@ func New(cfg Config) (*Backend, error) {
 	return b, nil
 }
 
-// Close releases the ownership locks. It never stops a VM or removes state, and
-// is idempotent. Operations after Close fail.
-func (b *Backend) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.closed = true
-	var first error
-	for _, f := range b.locks {
-		if err := f.Close(); err != nil && first == nil {
-			first = err
-		}
+// ErrClosed is returned by operations attempted after Close has begun.
+var ErrClosed = errors.New("local backend is closed or closing")
+
+// enter admits one operation. It fails once Close has begun, so nothing new can
+// start; the returned func must be called when the operation finishes. Internal
+// helpers never call enter (only exported operations do), so nested calls cannot
+// deadlock against Close.
+func (b *Backend) enter() (func(), error) {
+	b.gmu.Lock()
+	defer b.gmu.Unlock()
+	if b.closing {
+		return nil, ErrClosed
 	}
-	b.locks = nil
-	return first
+	b.active++
+	return func() {
+		b.gmu.Lock()
+		b.active--
+		if b.active == 0 {
+			b.gcond.Broadcast()
+		}
+		b.gmu.Unlock()
+	}, nil
 }
 
-func (b *Backend) open() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		return errors.New("local backend is closed")
+// Close stops admitting operations, waits for every admitted operation to
+// finish, and only then releases the ownership locks. It never stops a VM or
+// removes state. Blocking waits (WaitExit) are woken and return ErrClosed;
+// Start, once it has persisted its launch intent, always runs to completion, so
+// Close can wait up to that operation's own bounded timeouts. Cancelling an
+// operation's context is how a caller shortens that wait. Close is idempotent
+// and safe to call concurrently; every call returns after the locks are released.
+func (b *Backend) Close() error {
+	b.gmu.Lock()
+	first := !b.closing
+	if first {
+		b.closing = true
+		close(b.closeCh)
 	}
-	return nil
+	for b.active > 0 {
+		b.gcond.Wait()
+	}
+	b.gmu.Unlock()
+	if !first {
+		<-b.closeDone
+		return nil
+	}
+	var err error
+	b.mu.Lock()
+	locks := b.locks
+	b.locks = nil
+	b.mu.Unlock()
+	for _, f := range locks {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	close(b.closeDone)
+	return err
 }
 
 func (b *Backend) vmDir(id string) string    { return filepath.Join(b.cfg.WorkRoot, "vms", id) }
@@ -516,6 +560,11 @@ func fileSHA(p string) (string, error) {
 }
 
 func (b *Backend) ListImages(context.Context) ([]vmlib.Image, error) {
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return nil, gerr
+	}
+	defer leave()
 	files, err := os.ReadDir(b.cfg.ImagesDir)
 	if err != nil {
 		return nil, err
@@ -535,6 +584,11 @@ func (b *Backend) ListImages(context.Context) ([]vmlib.Image, error) {
 }
 
 func (b *Backend) GetImage(_ context.Context, id string) (vmlib.Image, error) {
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return vmlib.Image{}, gerr
+	}
+	defer leave()
 	_, info, err := b.imagePath(id)
 	if err != nil {
 		return vmlib.Image{}, err
@@ -569,9 +623,11 @@ func (b *Backend) leasedLocked() (mem, vcpu uint32) {
 }
 
 func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.HostVM, error) {
-	if err := b.open(); err != nil {
-		return vmlib.HostVM{}, err
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return vmlib.HostVM{}, gerr
 	}
+	defer leave()
 	for _, c := range [][2]string{{"vm", req.VMID}, {"image", req.ImageID}, {"profile", req.Profile}} {
 		if err := vmlib.ValidateID(c[0], c[1]); err != nil {
 			return vmlib.HostVM{}, err
@@ -697,9 +753,6 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 // one. A stale pointer (removed or replaced after lookup) yields errStale, which
 // guards against acting on a workspace that was re-created under the same ID.
 func (b *Backend) lockEntry(id string) (*entry, error) {
-	if err := b.open(); err != nil {
-		return nil, err
-	}
 	if err := vmlib.ValidateID("vm", id); err != nil {
 		return nil, err
 	}
@@ -728,6 +781,11 @@ func staleToNotFound(id string, err error) error {
 }
 
 func (b *Backend) Inspect(_ context.Context, id string) (vmlib.HostVM, error) {
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return vmlib.HostVM{}, gerr
+	}
+	defer leave()
 	e, err := b.lockEntry(id)
 	if err != nil {
 		return vmlib.HostVM{}, staleToNotFound(id, err)
@@ -737,9 +795,11 @@ func (b *Backend) Inspect(_ context.Context, id string) (vmlib.HostVM, error) {
 }
 
 func (b *Backend) List(context.Context) ([]vmlib.HostVM, error) {
-	if err := b.open(); err != nil {
-		return nil, err
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return nil, gerr
 	}
+	defer leave()
 	b.mu.Lock()
 	es := make([]*entry, 0, len(b.entries))
 	for _, e := range b.entries {
@@ -773,6 +833,11 @@ func (b *Backend) mustPersist(e *entry) error {
 // runs to completion regardless of the caller's context (a cancelled helper
 // invocation could lose its acknowledgement).
 func (b *Backend) Start(ctx context.Context, id string) (vmlib.HostVM, error) {
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return vmlib.HostVM{}, gerr
+	}
+	defer leave()
 	e, err := b.lockEntry(id)
 	if err != nil {
 		return vmlib.HostVM{}, staleToNotFound(id, err)
@@ -893,6 +958,11 @@ func (b *Backend) readReceipt(m meta) (clean, present bool, err error) {
 // whose invocation id is recorded (including retained/uncertain ones) and
 // refuses when identity is unknown or a replacement answers.
 func (b *Backend) RequestShutdown(ctx context.Context, id string) (vmlib.HostVM, error) {
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return vmlib.HostVM{}, gerr
+	}
+	defer leave()
 	e, err := b.lockEntry(id)
 	if err != nil {
 		return vmlib.HostVM{}, staleToNotFound(id, err)
@@ -933,6 +1003,11 @@ func (b *Backend) markExitedLocked(e *entry) vmlib.HostVM {
 }
 
 func (b *Backend) WaitExit(ctx context.Context, id string) (vmlib.ExitReceipt, error) {
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return vmlib.ExitReceipt{}, gerr
+	}
+	defer leave()
 	for {
 		e, err := b.lockEntry(id)
 		if err != nil {
@@ -961,6 +1036,8 @@ func (b *Backend) WaitExit(ctx context.Context, id string) (vmlib.ExitReceipt, e
 		select {
 		case <-ctx.Done():
 			return vmlib.ExitReceipt{}, fmt.Errorf("waiting for exit receipt of %s: %w", id, ctx.Err())
+		case <-b.closeCh:
+			return vmlib.ExitReceipt{}, fmt.Errorf("waiting for exit receipt of %s: %w", id, ErrClosed)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -972,6 +1049,11 @@ func (b *Backend) WaitExit(ctx context.Context, id string) (vmlib.ExitReceipt, e
 // marker is made durable BEFORE the image appears, so an image is never visible
 // without its classification; a failure at any step publishes nothing.
 func (b *Backend) Publish(_ context.Context, id, newID string) (vmlib.Image, error) {
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return vmlib.Image{}, gerr
+	}
+	defer leave()
 	if err := vmlib.ValidateID("image", newID); err != nil {
 		return vmlib.Image{}, err
 	}
@@ -1065,6 +1147,11 @@ func (b *Backend) Publish(_ context.Context, id, newID string) (vmlib.Image, err
 // VMM's exit receipt exists. A stale entry (already released, possibly re-created
 // under the same ID) is reported as already released and never touched.
 func (b *Backend) Release(_ context.Context, id string) (vmlib.ReleaseResult, error) {
+	leave, gerr := b.enter()
+	if gerr != nil {
+		return vmlib.ReleaseResult{}, gerr
+	}
+	defer leave()
 	e, err := b.lockEntry(id)
 	if errors.Is(err, vmlib.ErrNotFound) || errors.Is(err, errStale) {
 		return vmlib.ReleaseResult{Released: true, Detail: "already released"}, nil
