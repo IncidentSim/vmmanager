@@ -157,12 +157,13 @@ Shutdown also waits for the child; supervisors must not impose an unsafe
 SIGKILL timeout. If cleanup cannot prove a clean VMM exit, the existing local
 builder retains its working disk and reports the reason in the job log.
 
-Only one job/underlying VMM is supported. Aggregate **2 GiB RAM / 1 CPU / 20 GB
-disk** limits are not implemented here: they require an externally configured
-shared cgroup/systemd slice and filesystem quota covering the VMM, manager,
-work disks, staging copies and retained artifacts. Current VM configuration
-remains 2 vCPUs / 1024 MiB. A 30-minute strict multi-VM TTL and automatic safe
-artifact deletion would require additional lifecycle/quota work.
+Only one job/underlying VMM is supported. Resource budgets are externally managed,
+not client-controlled: see [`deployment/resources.md`](deployment/resources.md)
+for a shared **2 GiB RAM / 1 CPU** VMM slice and a real **20 GiB** work/artifact
+filesystem. Those boundaries are enabled on the deployed host. The user API and
+fixed base assets have separate resource accounting. Current VM configuration
+remains 2 vCPUs / 1024 MiB (two vCPU threads share the one-CPU host budget).
+A strict persistent VM TTL and automatic safe artifact deletion are not implemented.
 
 ## Lifecycle and diagnostics
 
