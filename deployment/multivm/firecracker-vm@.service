@@ -1,14 +1,27 @@
 # PROPOSED template (source only). Install only after operator review/approval.
-# One VMM process per slot N (firecracker-vm@N.service). Separate from the
-# active legacy firecracker-builder@main.service: different unit, runtime dir,
-# jail, TAP prefix (tap-vmN), address range (172.17.N.0/30) and receipts.
+# One VMM process per slot N (firecracker-vm@N.service), separate from the active
+# legacy firecracker-builder@main.service: different unit, runtime dir, jail, TAP
+# prefix (tap-vmN) and operator-chosen guest pool (/etc/firecracker-vms/pool.conf).
 # Replace @CLIENT_GROUP@ with the unprivileged vmd user's primary group.
 #
-# Slot instances share the legacy aggregate budget slice so 2 GiB / 1 CPU is not
-# silently multiplied; see deployment/resources.md and deployment/multivm/README.md.
+# Networking is NOT done here. RootDirectory= applies to every Exec* line of this
+# unit (a "+" prefix is not relied on), so the jail deliberately contains no
+# shell/ip/iptables. TAP/NAT is a separate host-root oneshot dependency,
+# firecracker-vm-network@%i.service, started via Requires= and stopped after this
+# unit (After= reverses on shutdown), i.e. after ExecStopPost has written the
+# exit receipt.
+#
+# Instances share the legacy aggregate budget slice, so 2 GiB / 1 CPU is shared with
+# the legacy VMM instead of multiplied. See deployment/resources.md.
 [Unit]
 Description=Isolated Firecracker VMM for VM slot %i
-ConditionPathExists=/dev/kvm
+Requires=firecracker-vm-network@%i.service
+After=firecracker-vm-network@%i.service
+# Assert* (not Condition*) so a missing prerequisite FAILS the start instead of silently skipping it.
+AssertPathExists=/dev/kvm
+RequiresMountsFor=/var/lib/firecracker-builder/storage
+AssertPathIsMountPoint=/var/lib/firecracker-builder/storage
+AssertPathIsDirectory=/var/lib/firecracker-builder/storage/vms/work
 StartLimitIntervalSec=0
 
 [Service]
@@ -26,14 +39,11 @@ RuntimeDirectoryPreserve=yes
 BindReadOnlyPaths=/opt/firecracker-builder/firecracker:/bin/firecracker
 BindReadOnlyPaths=/opt/firecracker-builder/vmlinux:/kernel/vmlinux
 BindReadOnlyPaths=/usr/local/libexec/fc-vm-launcher
-BindPaths=/var/lib/firecracker-vms/work:/work
+BindPaths=/var/lib/firecracker-builder/storage/vms/work:/work
 BindPaths=/run/firecracker-vms/slot-%i:/run/slot
 BindPaths=/dev/kvm /dev/net/tun
-# TAP/NAT for this slot only; refuses existing interfaces/routes it did not create.
-ExecStartPre=+/usr/local/libexec/fc-vm-network up %i
 ExecStart=/usr/local/libexec/fc-vm-launcher run %i
 ExecStopPost=/usr/local/libexec/fc-vm-launcher record-exit %i
-ExecStopPost=+/usr/local/libexec/fc-vm-network down %i
 # A guest reboot/exit ends the VMM; the slot stays idle until the helper starts it again.
 Restart=no
 KillMode=control-group
@@ -59,7 +69,7 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# Per-instance cap (guest RAM + VMM overhead); the shared slice enforces the aggregate.
+# Per-instance cap (guest RAM + VMM overhead); keep >= profile mem + vmm_overhead_mib.
 MemoryMax=768M
 TasksMax=64
 LimitNOFILE=1024

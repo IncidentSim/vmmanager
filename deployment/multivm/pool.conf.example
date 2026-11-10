@@ -1,0 +1,10 @@
+# Install as /etc/firecracker-vms/pool.conf (root:root 0644). Shared, by value,
+# by the network script, the helper and vmd (vmd refuses to start on a mismatch).
+#
+# GUEST_PREFIX is YOURS to choose: slot N uses PREFIX.N.0/30 (guest PREFIX.N.2).
+# Pick a range that overlaps nothing on this host. The network script re-checks
+# every route and interface address at start and refuses on any overlap. Do not
+# use Docker's 172.17/16, the legacy 172.16.0.0/30, or any range your LAN/VPN uses.
+# The value below is a placeholder, not a recommendation for your network.
+GUEST_PREFIX=10.213
+MAX_SLOTS=2

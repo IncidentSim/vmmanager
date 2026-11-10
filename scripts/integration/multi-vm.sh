@@ -33,7 +33,7 @@ run="it$(date +%s)"
 golden="golden-$run"
 vms=("$run-src" "$run-a" "$run-b")
 created=()
-vmctl() { "$work/vmctl" -addr "$FC_ADDR" -server-name "$FC_SERVER_NAME" -ca "$FC_CA" -cert "$FC_CERT" -key "$FC_KEY" "$@"; }
+vmctl() { "${FC_VMCTL:-$work/vmctl}" -addr "$FC_ADDR" -server-name "$FC_SERVER_NAME" -ca "$FC_CA" -cert "$FC_CERT" -key "$FC_KEY" "$@"; }
 
 cleanup() {
   local rc=$?
@@ -46,7 +46,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-(cd "$root" && CGO_ENABLED=0 go build -o "$work/vmctl" ./cmd/vmctl)
+# FC_VMCTL is only for the offline script test (scripts/integration/test_multi_vm.py).
+[[ -n ${FC_VMCTL:-} ]] || (cd "$root" && CGO_ENABLED=0 go build -o "$work/vmctl" ./cmd/vmctl)
 [[ -z ${FC_BASE_IMAGE_PATH:-} ]] || base_before=$(sha256sum "$FC_BASE_IMAGE_PATH" | cut -d' ' -f1)
 
 guest() { # guest VM COMMAND... : ssh through the bastion with a per-VM known_hosts
@@ -80,6 +81,9 @@ echo "== 3. graceful stop + commit NEW image $golden"
 vmctl stop "${vms[0]}" >/dev/null
 vmctl commit "${vms[0]}" "$golden" >/dev/null
 if vmctl commit "${vms[0]}" "$golden" >/dev/null 2>&1; then echo "FAIL: overwrite accepted" >&2; exit 1; fi
+echo "== 3b. delete the committed source so its slot/lease is free (max_vms may be 2)"
+vmctl delete "${vms[0]}" >/dev/null
+created=()
 echo "== 4. two independent VMs from $golden"
 for v in "${vms[1]}" "${vms[2]}"; do
   created+=("$v")
