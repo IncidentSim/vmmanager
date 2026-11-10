@@ -79,7 +79,9 @@ func buildLocal(l *localConfig, d deps) (*local.Backend, error) {
 		bastion = &vmlib.Bastion{Host: l.Bastion.Host, Port: l.Bastion.Port, User: l.Bastion.User}
 	}
 	return local.New(local.Config{WorkRoot: l.WorkRoot, ImagesDir: l.ImagesDir, RunDir: l.RunDir, MaxVMs: l.MaxVMs,
-		Profiles: profiles, SSHUser: l.SSHUser, Bastion: bastion, Launcher: launcher, VMM: vmm, MinFreeMiB: l.MinFreeMiB})
+		Profiles: profiles, SSHUser: l.SSHUser, Bastion: bastion, Launcher: launcher, VMM: vmm, MinFreeMiB: l.MinFreeMiB,
+		StorageMount: l.StorageMount, MaxTotalMemMiB: l.MaxTotalMemMiB, MaxTotalVCPU: l.MaxTotalVCPU,
+		UnitMemLimitMiB: l.UnitMemLimitMiB, VMMOverheadMiB: l.VMMOverheadMiB, GuestDNS: l.GuestDNS})
 }
 
 // run_ serves until ctx is cancelled. Cancelling ctx stops listeners only; it
@@ -94,6 +96,8 @@ func run_(ctx context.Context, cfg *config, d deps, ready func(map[string]string
 			return err
 		}
 		backend = b
+		// Close releases the filesystem ownership locks only; VMs keep running.
+		closeBackend = b.Close
 	case "remote":
 		r := cfg.Backend.Remote
 		tlsCfg, err := remote.ClientTLSFromFiles(r.CA, r.Cert, r.Key, r.ServerName)

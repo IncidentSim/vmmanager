@@ -22,16 +22,23 @@ const inv = "0123456789abcdef0123456789abcdef"
 
 // fakes for the two narrow seams. They are NOT evidence of real Firecracker.
 type fakeLauncher struct {
-	mu    sync.Mutex
-	slots []int
-	err   error
+	mu       sync.Mutex
+	slots    []int
+	err      error
+	ctxErrAt []error // ctx.Err() observed at each call
+	during   func()  // runs while the (possibly started) unit is being launched
 }
 
-func (l *fakeLauncher) StartSlot(_ context.Context, slot int) error {
+func (l *fakeLauncher) StartSlot(ctx context.Context, slot int) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.slots = append(l.slots, slot)
-	return l.err
+	l.ctxErrAt = append(l.ctxErrAt, ctx.Err())
+	during, err := l.during, l.err
+	l.mu.Unlock()
+	if during != nil {
+		during()
+	}
+	return err
 }
 
 type fakeVMM struct {
@@ -42,6 +49,7 @@ type fakeVMM struct {
 	ctrlAltDe int
 	cfgErr    error
 	infoErr   error
+	onCtrl    func()
 }
 
 func (v *fakeVMM) Info(context.Context, int) (local.VMMInfo, error) {
@@ -66,6 +74,9 @@ func (v *fakeVMM) CtrlAltDel(context.Context, int) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.ctrlAltDe++
+	if v.onCtrl != nil {
+		v.onCtrl()
+	}
 	return nil
 }
 
@@ -97,6 +108,7 @@ func newRig(t *testing.T, max int) *rig {
 		Profiles: []vmlib.Profile{{Name: "small", VCPU: 1, MemMiB: 256, DiskMiB: 64}},
 		SSHUser:  "root", Bastion: &vmlib.Bastion{Host: "bastion.example.test", Port: 22, User: "jump"},
 		Launcher: r.launcher, VMM: r.vmm, MinFreeMiB: 0,
+		MaxTotalMemMiB: 4096, MaxTotalVCPU: 16, UnitMemLimitMiB: 768, VMMOverheadMiB: 64,
 	}
 	return r
 }
@@ -106,6 +118,7 @@ func (r *rig) backend() *local.Backend {
 	if err != nil {
 		r.t.Fatal(err)
 	}
+	r.t.Cleanup(func() { b.Close() })
 	return b
 }
 
@@ -244,13 +257,25 @@ func TestStartRefusesBusyOrUnidentifiedVMM(t *testing.T) {
 	if len(r.vmm.specs) != 0 {
 		t.Fatal("configured a busy VMM")
 	}
-	r.vmm.state, r.vmm.id = "Not started", "not-hex"
+	h, _ := b.Inspect(ctx, "a")
+	if !h.Retained || h.State == vmlib.HostPrepared {
+		t.Fatalf("after a helper invocation the disk may be held: must be retained, not retryable: %+v", h)
+	}
+	if len(r.vmm.specs) != 0 {
+		t.Fatal("configured a busy or unidentified VMM")
+	}
+}
+
+func TestInvalidInvocationIDIsNeverConfigured(t *testing.T) {
+	r := newRig(t, 1)
+	b := r.backend()
+	prep(b, "a")
+	r.vmm.id = "not-hex"
 	if _, err := b.Start(ctx, "a"); err == nil || len(r.vmm.specs) != 0 {
 		t.Fatal("accepted invalid invocation id")
 	}
-	h, _ := b.Inspect(ctx, "a")
-	if h.State != vmlib.HostPrepared || h.Retained {
-		t.Fatalf("pre-configuration refusal must stay retryable: %+v", h)
+	if h, _ := b.Inspect(ctx, "a"); !h.Retained {
+		t.Fatalf("%+v", h)
 	}
 }
 
@@ -263,8 +288,8 @@ func TestConfigureFailureRetainsDisk(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	h, _ := b.Inspect(ctx, "a")
-	if !h.Retained || h.State != vmlib.HostRetained {
-		t.Fatalf("%+v", h)
+	if !h.Retained || h.State != vmlib.HostRunning {
+		t.Fatalf("retention is a flag over the real lifecycle state: %+v", h)
 	}
 	if res, _ := b.Release(ctx, "a"); res.Released {
 		t.Fatal("released a disk that a VMM may hold")
@@ -401,9 +426,10 @@ func TestRestartReconciliationFailsClosed(t *testing.T) {
 	prep(b, "idle")               // slot 2, never started
 	r.receipt(1, inv, "success", "exited", "0")
 	// done's invocation id equals run's in this simple fake; use a distinct id.
+	b.Close()
 	b2 := r.backend() // "restart"
 	h, _ := b2.Inspect(ctx, "run")
-	if h.State != vmlib.HostRetained || !h.Retained {
+	if h.State != vmlib.HostRunning || !h.Retained {
 		t.Fatalf("running VM without proof must be retained after restart: %+v", h)
 	}
 	if res, _ := b2.Release(ctx, "run"); res.Released {
@@ -422,10 +448,12 @@ func TestCorruptMetadataBlocksNewAdmission(t *testing.T) {
 	b := r.backend()
 	prep(b, "a")
 	os.WriteFile(filepath.Join(r.root, "vms", "a", "meta.json"), []byte("{broken"), 0o600)
+	b.Close()
 	b2, err := local.New(r.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer b2.Close()
 	if _, err := prep(b2, "b"); err == nil {
 		t.Fatal("admitted a VM while host state is unreadable")
 	}

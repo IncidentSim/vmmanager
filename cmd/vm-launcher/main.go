@@ -81,7 +81,17 @@ func recordExit(dir, id, result, code, status string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Link(f.Name(), filepath.Join(dir, id+".exit.json")) // fails if it exists
+	if err := os.Link(f.Name(), filepath.Join(dir, id+".exit.json")); err != nil { // fails if it exists
+		return err
+	}
+	// Make the receipt's directory entry durable: a crash right after the exit
+	// must not lose the only proof that the VMM is gone.
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func cleanupStaleSocket(path string) error {

@@ -22,15 +22,24 @@ type bastionConfig struct {
 }
 
 type localConfig struct {
-	WorkRoot   string          `json:"work_root"`
-	ImagesDir  string          `json:"images_dir"`
-	RunDir     string          `json:"run_dir"`
-	MaxVMs     int             `json:"max_vms"`
-	Helper     string          `json:"helper"`
-	SSHUser    string          `json:"ssh_user"`
-	MinFreeMiB uint64          `json:"min_free_mib"`
-	Profiles   []profileConfig `json:"profiles"`
-	Bastion    *bastionConfig  `json:"bastion,omitempty"`
+	WorkRoot   string `json:"work_root"`
+	ImagesDir  string `json:"images_dir"`
+	RunDir     string `json:"run_dir"`
+	MaxVMs     int    `json:"max_vms"`
+	Helper     string `json:"helper"`
+	SSHUser    string `json:"ssh_user"`
+	MinFreeMiB uint64 `json:"min_free_mib"`
+	// StorageMount is the bounded storage mount point; required so a missing
+	// mount can never fall back to the root filesystem.
+	StorageMount string `json:"storage_mount"`
+	// Aggregate admission; keep within the installed cgroup slice budget.
+	MaxTotalMemMiB  uint32          `json:"max_total_mem_mib"`
+	MaxTotalVCPU    uint32          `json:"max_total_vcpu"`
+	UnitMemLimitMiB uint32          `json:"unit_mem_limit_mib"`
+	VMMOverheadMiB  uint32          `json:"vmm_overhead_mib"`
+	GuestDNS        []string        `json:"guest_dns,omitempty"`
+	Profiles        []profileConfig `json:"profiles"`
+	Bastion         *bastionConfig  `json:"bastion,omitempty"`
 }
 
 type remoteConfig struct {
@@ -94,6 +103,12 @@ func (c *config) validate() error {
 		}
 		if l.WorkRoot == "" || l.ImagesDir == "" || l.RunDir == "" {
 			return errors.New("backend.local work_root, images_dir and run_dir are required")
+		}
+		if l.StorageMount == "" {
+			return errors.New("backend.local.storage_mount is required (bounded storage mount guard)")
+		}
+		if l.MaxTotalMemMiB == 0 || l.MaxTotalVCPU == 0 || l.UnitMemLimitMiB == 0 {
+			return errors.New("backend.local max_total_mem_mib, max_total_vcpu and unit_mem_limit_mib are required admission policy")
 		}
 	case "remote":
 		r := c.Backend.Remote
