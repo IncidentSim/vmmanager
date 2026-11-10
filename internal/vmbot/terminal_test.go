@@ -117,7 +117,7 @@ func newTerm(t *testing.T, mutate func(c *ManagerConfig)) *tenv {
 	}
 	os.Chmod(dir, 0o700)
 	cfg := ManagerConfig{TTYDPath: os.Args[0], SSHPath: "/usr/bin/ssh", SSHKeyFile: "/keys/id_test", StateDir: dir,
-		PublicOrigin: "https://" + pubHost, MaxClients: 2, StartTimeout: 5 * time.Second}
+		PublicOrigin: "https://" + pubHost, MaxClients: 2, MaxSessions: 2, StartTimeout: 5 * time.Second}
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -411,8 +411,8 @@ func TestRevokeClosesOpenWebSocketKillsChildrenAndRotates(t *testing.T) {
 	}
 }
 
-func TestStartIsIdempotentAndRefusesSecondVM(t *testing.T) {
-	e := newTerm(t, nil)
+func TestStartIsIdempotentAndBoundsSessions(t *testing.T) {
+	e := newTerm(t, func(c *ManagerConfig) { c.MaxSessions = 1 })
 	if err := e.m.Start(context.Background(), target("bot-1", tokA)); err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestStartIsIdempotentAndRefusesSecondVM(t *testing.T) {
 		t.Fatalf("idempotent restart of same VM: %v", err)
 	}
 	if err := e.m.Start(context.Background(), target("bot-2", tokB)); err == nil {
-		t.Fatal("a second concurrent terminal must be refused until the first is revoked")
+		t.Fatal("a terminal beyond MaxSessions must be refused until another is revoked")
 	}
 	if err := e.m.Start(context.Background(), target("bot-1", tokB)); err == nil {
 		t.Fatal("same VM with a different token must be refused (token rotation = new VM)")

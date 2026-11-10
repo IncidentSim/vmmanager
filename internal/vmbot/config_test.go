@@ -51,6 +51,29 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 }
 
+func TestMaxVMsDefaultsToTwoAndIsBoundedConsistentlyWithClients(t *testing.T) {
+	p, _ := writeCfg(t, nil)
+	c, err := LoadConfig(p)
+	if err != nil || c.MaxVMs != 2 {
+		t.Fatalf("default max_vms must be 2 (also for configs without the field): %+v %v", c.MaxVMs, err)
+	}
+	p, _ = writeCfg(t, func(c *Config) { c.MaxVMs = 8; c.Terminal.MaxClients = 8 })
+	if _, err := LoadConfig(p); err != nil {
+		t.Fatalf("8x8 equals the gateway bound: %v", err)
+	}
+	for name, mut := range map[string]func(c *Config){
+		"negative":      func(c *Config) { c.MaxVMs = -1 },
+		"above ceiling": func(c *Config) { c.MaxVMs = 9 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, _ := writeCfg(t, mut)
+			if _, err := LoadConfig(p); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
 func TestLoadConfigRejects(t *testing.T) {
 	cases := map[string]func(c *Config){
 		"http origin w/o test flag": func(c *Config) { c.Terminal.PublicOrigin = "http://bot.example.test" },

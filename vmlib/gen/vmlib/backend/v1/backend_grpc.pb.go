@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion8
 const (
 	HostBackend_Capabilities_FullMethodName    = "/vmlib.backend.v1.HostBackend/Capabilities"
 	HostBackend_ListImages_FullMethodName      = "/vmlib.backend.v1.HostBackend/ListImages"
+	HostBackend_DeleteImage_FullMethodName     = "/vmlib.backend.v1.HostBackend/DeleteImage"
 	HostBackend_GetImage_FullMethodName        = "/vmlib.backend.v1.HostBackend/GetImage"
 	HostBackend_Prepare_FullMethodName         = "/vmlib.backend.v1.HostBackend/Prepare"
 	HostBackend_Start_FullMethodName           = "/vmlib.backend.v1.HostBackend/Start"
@@ -42,6 +43,7 @@ const (
 type HostBackendClient interface {
 	Capabilities(ctx context.Context, in *CapabilitiesRequest, opts ...grpc.CallOption) (*CapabilitiesResponse, error)
 	ListImages(ctx context.Context, in *ListImagesRequest, opts ...grpc.CallOption) (*ListImagesResponse, error)
+	DeleteImage(ctx context.Context, in *DeleteImageRequest, opts ...grpc.CallOption) (*DeleteImageResponse, error)
 	GetImage(ctx context.Context, in *GetImageRequest, opts ...grpc.CallOption) (*Image, error)
 	Prepare(ctx context.Context, in *PrepareRequest, opts ...grpc.CallOption) (*HostVM, error)
 	Start(ctx context.Context, in *VMRef, opts ...grpc.CallOption) (*HostVM, error)
@@ -77,6 +79,16 @@ func (c *hostBackendClient) ListImages(ctx context.Context, in *ListImagesReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListImagesResponse)
 	err := c.cc.Invoke(ctx, HostBackend_ListImages_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *hostBackendClient) DeleteImage(ctx context.Context, in *DeleteImageRequest, opts ...grpc.CallOption) (*DeleteImageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteImageResponse)
+	err := c.cc.Invoke(ctx, HostBackend_DeleteImage_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +195,7 @@ func (c *hostBackendClient) Release(ctx context.Context, in *VMRef, opts ...grpc
 type HostBackendServer interface {
 	Capabilities(context.Context, *CapabilitiesRequest) (*CapabilitiesResponse, error)
 	ListImages(context.Context, *ListImagesRequest) (*ListImagesResponse, error)
+	DeleteImage(context.Context, *DeleteImageRequest) (*DeleteImageResponse, error)
 	GetImage(context.Context, *GetImageRequest) (*Image, error)
 	Prepare(context.Context, *PrepareRequest) (*HostVM, error)
 	Start(context.Context, *VMRef) (*HostVM, error)
@@ -206,6 +219,9 @@ func (UnimplementedHostBackendServer) Capabilities(context.Context, *Capabilitie
 }
 func (UnimplementedHostBackendServer) ListImages(context.Context, *ListImagesRequest) (*ListImagesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListImages not implemented")
+}
+func (UnimplementedHostBackendServer) DeleteImage(context.Context, *DeleteImageRequest) (*DeleteImageResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteImage not implemented")
 }
 func (UnimplementedHostBackendServer) GetImage(context.Context, *GetImageRequest) (*Image, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetImage not implemented")
@@ -279,6 +295,24 @@ func _HostBackend_ListImages_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(HostBackendServer).ListImages(ctx, req.(*ListImagesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HostBackend_DeleteImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteImageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostBackendServer).DeleteImage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostBackend_DeleteImage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostBackendServer).DeleteImage(ctx, req.(*DeleteImageRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -459,6 +493,10 @@ var HostBackend_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListImages",
 			Handler:    _HostBackend_ListImages_Handler,
+		},
+		{
+			MethodName: "DeleteImage",
+			Handler:    _HostBackend_DeleteImage_Handler,
 		},
 		{
 			MethodName: "GetImage",

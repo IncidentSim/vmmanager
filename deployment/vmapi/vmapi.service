@@ -1,0 +1,26 @@
+# Source-only systemd USER template for the standalone control API (vmapi).
+# NOT installed or enabled by anything in this repository. Install only after the
+# explicit handoff in docs/control-api.md ("Migration and handoff"): stop the
+# legacy vmbot first (it holds the state-directory lifetime lock), keep the old
+# binary/config/unit files for rollback, and never run legacy vmbot and vmapi on
+# the same state directory.
+[Unit]
+Description=vmapi: authenticated VM control API (owns DBOS state and terminals)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vmapi -config %h/.config/vmapi/vmapi.json
+# Restarting never deletes VMs: startup repair re-drives durable operations.
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+MemoryMax=512M
+TasksMax=128
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=default.target

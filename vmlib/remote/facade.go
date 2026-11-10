@@ -19,13 +19,29 @@ import (
 // ---- conversions -------------------------------------------------------------
 
 func vmToPB(v vmlib.VM) *pb.VM {
-	return &pb.VM{VmId: v.ID, ImageId: v.ImageID, Profile: v.Profile, State: string(v.State), Labels: v.Labels,
+	return &pb.VM{Resources: facadeResourcesToPB(&v.Resources), VmId: v.ID, ImageId: v.ImageID, Profile: v.Profile, State: string(v.State), Labels: v.Labels,
 		Retained: v.Retained, RetainedReason: v.RetainedReason}
 }
 
 func vmFromPB(v *pb.VM) vmlib.VM {
-	return vmlib.VM{ID: v.GetVmId(), ImageID: v.GetImageId(), Profile: v.GetProfile(), State: vmlib.VMState(v.GetState()),
+	return vmlib.VM{Resources: facadeResourceValue(v.GetResources()), ID: v.GetVmId(), ImageID: v.GetImageId(), Profile: v.GetProfile(), State: vmlib.VMState(v.GetState()),
 		Labels: v.GetLabels(), Retained: v.GetRetained(), RetainedReason: v.GetRetainedReason()}
+}
+
+func facadeResourcesToPB(r *vmlib.VMResources) *pb.VMResources {
+	if r == nil {
+		return nil
+	}
+	return &pb.VMResources{Vcpu: r.VCPU, MemMib: r.MemMiB}
+}
+func facadeResourcesFromPB(r *pb.VMResources) *vmlib.VMResources {
+	if r == nil {
+		return nil
+	}
+	return &vmlib.VMResources{VCPU: r.GetVcpu(), MemMiB: r.GetMemMib()}
+}
+func facadeResourceValue(r *pb.VMResources) vmlib.VMResources {
+	return vmlib.VMResources{VCPU: r.GetVcpu(), MemMiB: r.GetMemMib()}
 }
 
 func facadeImageToPB(i vmlib.Image) *pb.Image {
@@ -113,10 +129,13 @@ func (s *facadeServer) CreateVM(ctx context.Context, r *pb.CreateVMRequest) (*pb
 	if len(r.GetSshKeyReference()) > 128 {
 		return nil, toStatus(vmlib.ErrInvalidArgument)
 	}
-	for _, c := range [][2]string{{"image", r.GetImageId()}, {"profile", r.GetProfile()}} {
+	for _, c := range [][2]string{{"image", r.GetImageId()}} {
 		if err := vmlib.ValidateID(c[0], c[1]); err != nil {
 			return nil, toStatus(err)
 		}
+	}
+	if err := vmlib.ValidateResourceSelection(r.GetProfile(), facadeResourcesFromPB(r.GetResources())); err != nil {
+		return nil, toStatus(err)
 	}
 	if err := vmlib.ValidatePublicKey(r.GetSshPublicKey()); err != nil {
 		return nil, toStatus(err)
@@ -126,7 +145,7 @@ func (s *facadeServer) CreateVM(ctx context.Context, r *pb.CreateVMRequest) (*pb
 	}
 	// The client's RPC context bounds this call only; Service never ties a
 	// running VM's lifetime to it.
-	vm, err := s.l.Create(ctx, vmlib.CreateRequest{ID: r.GetVmId(), ImageID: r.GetImageId(), Profile: r.GetProfile(),
+	vm, err := s.l.Create(ctx, vmlib.CreateRequest{Resources: facadeResourcesFromPB(r.GetResources()), ID: r.GetVmId(), ImageID: r.GetImageId(), Profile: r.GetProfile(),
 		Labels: r.GetLabels(), SSHPublicKey: r.GetSshPublicKey(), SSHKeyReference: r.GetSshKeyReference()})
 	if err != nil {
 		return nil, toStatusWithVM(err, vm) // ambiguous failures keep the VM id
@@ -207,6 +226,20 @@ func (s *facadeServer) DeleteVM(ctx context.Context, r *pb.VMRef) (*pb.DeleteVMR
 	return &pb.DeleteVMResponse{Deleted: res.Deleted, Retained: res.Retained, Detail: res.Detail}, nil
 }
 
+func (s *facadeServer) DeleteImage(ctx context.Context, r *pb.DeleteImageRequest) (*pb.DeleteImageResponse, error) {
+	if err := vmlib.ValidateID("image", r.GetId()); err != nil {
+		return nil, toStatus(err)
+	}
+	if err := s.l.DeleteImage(ctx, r.GetId()); err != nil {
+		return nil, toStatus(err)
+	}
+	return &pb.DeleteImageResponse{}, nil
+}
+func (c *FacadeClient) DeleteImage(ctx context.Context, id string) error {
+	_, err := c.c.DeleteImage(ctx, &pb.DeleteImageRequest{Id: id})
+	return fromStatus(err)
+}
+
 func (s *facadeServer) ListImages(ctx context.Context, _ *pb.ListImagesRequest) (*pb.ListImagesResponse, error) {
 	imgs, err := s.l.ListImages(ctx)
 	if err != nil {
@@ -215,6 +248,30 @@ func (s *facadeServer) ListImages(ctx context.Context, _ *pb.ListImagesRequest) 
 	out := &pb.ListImagesResponse{}
 	for _, i := range imgs {
 		out.Images = append(out.Images, facadeImageToPB(i))
+	}
+	return out, nil
+}
+
+func (s *facadeServer) GetCapabilities(ctx context.Context, _ *pb.GetCapabilitiesRequest) (*pb.GetCapabilitiesResponse, error) {
+	c, err := s.l.Capabilities(ctx)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	out := &pb.GetCapabilitiesResponse{MaxVms: uint32(c.MaxVMs), MaxTotalMemMib: c.MaxTotalMemMiB, MaxTotalVcpu: c.MaxTotalVCPU}
+	for _, p := range c.Profiles {
+		out.Profiles = append(out.Profiles, &pb.CapabilityProfile{Name: p.Name, Vcpu: p.VCPU, MemMib: p.MemMiB, DiskMib: p.DiskMiB})
+	}
+	return out, nil
+}
+
+func (c *FacadeClient) Capabilities(ctx context.Context) (vmlib.ResourceCapabilities, error) {
+	r, err := c.c.GetCapabilities(ctx, &pb.GetCapabilitiesRequest{})
+	if err != nil {
+		return vmlib.ResourceCapabilities{}, fromStatus(err)
+	}
+	out := vmlib.ResourceCapabilities{MaxVMs: int(r.GetMaxVms()), MaxTotalMemMiB: r.GetMaxTotalMemMib(), MaxTotalVCPU: r.GetMaxTotalVcpu()}
+	for _, p := range r.GetProfiles() {
+		out.Profiles = append(out.Profiles, vmlib.Profile{Name: p.GetName(), VCPU: p.GetVcpu(), MemMiB: p.GetMemMib(), DiskMiB: p.GetDiskMib()})
 	}
 	return out, nil
 }
@@ -296,7 +353,7 @@ func (c *FacadeClient) Create(ctx context.Context, req vmlib.CreateRequest) (vml
 		}
 		req.ID = id
 	}
-	r, err := c.c.CreateVM(ctx, &pb.CreateVMRequest{VmId: req.ID, ImageId: req.ImageID, Profile: req.Profile,
+	r, err := c.c.CreateVM(ctx, &pb.CreateVMRequest{Resources: facadeResourcesToPB(req.Resources), VmId: req.ID, ImageId: req.ImageID, Profile: req.Profile,
 		Labels: req.Labels, SshPublicKey: req.SSHPublicKey, SshKeyReference: req.SSHKeyReference})
 	if err != nil {
 		partial := vmlib.VM{ID: req.ID, ImageID: req.ImageID, Profile: req.Profile}

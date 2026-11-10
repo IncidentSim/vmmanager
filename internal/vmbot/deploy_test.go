@@ -7,14 +7,14 @@ import (
 )
 
 func TestExampleConfigIsValidAndHasOnlyPlaceholders(t *testing.T) {
-	c, err := LoadConfig("../../deployment/vmbot/vmbot.example.json")
+	c, err := LoadConfig("testdata/legacy-vmbot.example.json")
 	if err != nil {
 		t.Fatalf("example config must load: %v", err)
 	}
 	if c.Terminal.SSHUseBastion || c.Terminal.InsecureHTTPForTesting || !strings.HasPrefix(c.Terminal.PublicOrigin, "https://") {
 		t.Fatalf("example must default to direct SSH and HTTPS: %+v", c.Terminal)
 	}
-	b, _ := os.ReadFile("../../deployment/vmbot/vmbot.example.json")
+	b, _ := os.ReadFile("testdata/legacy-vmbot.example.json")
 	for _, bad := range []string{"BEGIN", ":AA", "api.telegram"} {
 		if strings.Contains(string(b), bad) {
 			t.Fatalf("example must not contain %q", bad)
@@ -23,7 +23,7 @@ func TestExampleConfigIsValidAndHasOnlyPlaceholders(t *testing.T) {
 }
 
 func TestUnitFileHardeningDirectives(t *testing.T) {
-	b, err := os.ReadFile("../../deployment/vmbot/vmbot.service")
+	b, err := os.ReadFile("testdata/legacy-vmbot.service")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,6 +15,28 @@ service VMService {
   rpc CommitVM(CommitVMRequest) returns (Image);
   rpc DeleteVM(VMRef) returns (DeleteVMResponse);
   rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
+  rpc DeleteImage(DeleteImageRequest) returns (DeleteImageResponse);
+  // GetCapabilities returns the backend's resource policy as advertised by the
+  // backend. It carries no SSH/bastion metadata (see GetSSHInfo).
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+}
+
+message GetCapabilitiesRequest {}
+
+message CapabilityProfile {
+  string name = 1;
+  uint32 vcpu = 2;
+  uint32 mem_mib = 3;
+  uint32 disk_mib = 4;
+}
+
+message GetCapabilitiesResponse {
+  // Backend VM-count cap (the control API enforces its own quotas separately).
+  uint32 max_vms = 1;
+  repeated CapabilityProfile profiles = 2;
+  // Aggregate admission caps across live VMs; 0 means not enforced.
+  uint32 max_total_mem_mib = 3;
+  uint32 max_total_vcpu = 4;
 }
 
 message CreateVMRequest {
@@ -27,6 +49,7 @@ message CreateVMRequest {
   string ssh_public_key = 5;
   // Non-secret client label echoed back in SSHInfo.key_reference.
   string ssh_key_reference = 6;
+  VMResources resources = 7;
 }
 
 message VMRef {
@@ -42,6 +65,7 @@ message VM {
   map<string, string> labels = 5;
   bool retained = 6;
   string retained_reason = 7;
+  VMResources resources = 8;
 }
 
 message ListVMsRequest {}
@@ -90,6 +114,14 @@ message DeleteVMResponse {
   bool retained = 2;
   string detail = 3;
 }
+
+message VMResources {
+  uint32 vcpu = 1;
+  uint32 mem_mib = 2;
+}
+
+message DeleteImageRequest { string id = 1; }
+message DeleteImageResponse {}
 
 message ListImagesRequest {}
 

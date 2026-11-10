@@ -1,0 +1,22 @@
+# Legacy (embedded-controller) systemd USER unit fixture, kept to test the old hardening.
+[Unit]
+Description=vmbot: Telegram single-VM bot with capability-link web terminal
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vmbot -config %h/.config/vmbot/vmbot.json
+# Restarting the bot never deletes the VM: it reconciles and keeps it.
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+MemoryMax=256M
+TasksMax=128
+# SIGTERM lets the bot close terminals and stop polling; the control-group kill
+# afterwards also reaps any ttyd/ssh left behind.
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=default.target

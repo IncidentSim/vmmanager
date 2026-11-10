@@ -1,118 +1,84 @@
-// vmbot is a Telegram bot that owns exactly one VM on a vmd facade (mTLS) and
-// exposes a revocable capability-link web terminal (ttyd -> ssh) for it. See
-// docs/vmbot.md and docs/adr/0002-telegram-single-vm-bot.md.
-//
-//	vmbot -config /path/to/vmbot.json
-//
-// Process exit never deletes the VM: a restart reconciles and keeps it.
+// vmbot is the HTTP-only Telegram frontend. It never starts DBOS, a controller,
+// a facade connection, or a terminal process. See docs/bot-api-client.md.
 package main
 
 import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
+	"io"
 	"log"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"github.com/petruekhin/vibe-firecracker/internal/vmbot"
-	"github.com/petruekhin/vibe-firecracker/vmlib/remote"
+	"github.com/petruekhin/vibe-firecracker/controlclient"
+	"github.com/petruekhin/vibe-firecracker/internal/tgbot"
 )
 
-const telegramAPI = "https://api.telegram.org"
-
 func main() {
-	cfgPath := flag.String("config", "", "path to the JSON configuration (no secrets)")
-	flag.Parse()
 	logger := log.New(os.Stderr, "vmbot: ", log.LstdFlags)
-	if err := run(*cfgPath, logger); err != nil {
-		logger.Printf("fatal: %v", err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if e := run(ctx, os.Args[1:], logger); e != nil {
+		logger.Printf("fatal: %v", e)
 		os.Exit(1)
 	}
 }
-
-func run(cfgPath string, logger *log.Logger) error {
-	if cfgPath == "" {
+func run(ctx context.Context, args []string, logger *log.Logger) error {
+	fs := flag.NewFlagSet("vmbot", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfgPath := fs.String("config", "", "path to strict frontend JSON config")
+	source := fs.String("import-legacy-offset", "", "one-time read-only import from stopped legacy state.json; exits without polling")
+	stopped := fs.Bool("legacy-stopped", false, "operator confirms legacy service stopped and disabled")
+	check := fs.Bool("check-config", false, "validate config and private credentials without network access")
+	if fs.Parse(args) != nil || fs.NArg() != 0 {
+		return errors.New("invalid arguments; use -config, -check-config, or -import-legacy-offset with -legacy-stopped")
+	}
+	if *cfgPath == "" {
 		return errors.New("-config is required")
 	}
-	cfg, err := vmbot.LoadConfig(cfgPath)
-	if err != nil {
-		return err
+	if *stopped && *source == "" || *source != "" && (!*stopped || *check) {
+		return errors.New("offset import requires -legacy-stopped and cannot be combined with -check-config")
 	}
-	token, err := cfg.ReadToken()
-	if err != nil {
-		return err
+	cfg, e := tgbot.LoadConfig(*cfgPath)
+	if e != nil {
+		return e
 	}
-	store, err := vmbot.OpenStore(cfg.StateDir)
-	if err != nil {
-		return fmt.Errorf("state: %w", err)
+	if *source != "" {
+		delivery, e := tgbot.OpenDelivery(cfg.DeliveryDir)
+		if e != nil {
+			return e
+		}
+		defer delivery.Close()
+		if e = delivery.ImportLegacy(*source, *stopped); e != nil {
+			return e
+		}
+		logger.Printf("legacy delivery offset imported; no Telegram requests sent")
+		return nil
 	}
-	defer store.Close()
-
-	tlsCfg, err := remote.ClientTLSFromFiles(cfg.Facade.CAFile, cfg.Facade.CertFile, cfg.Facade.KeyFile, cfg.Facade.ServerName)
-	if err != nil {
-		return fmt.Errorf("facade tls: %w", err)
+	token, credential, e := cfg.Secrets()
+	if e != nil {
+		return e
 	}
-	facade, err := remote.DialFacade(cfg.Facade.Addr, tlsCfg)
-	if err != nil {
-		return fmt.Errorf("facade dial: %w", err)
+	client, e := controlclient.New(cfg.APIURL, credential, nil)
+	if e != nil {
+		return e
 	}
-	defer facade.Close()
-
-	t := cfg.Terminal
-	mgr, err := vmbot.NewManager(vmbot.ManagerConfig{
-		TTYDPath: t.TTYDPath, SSHPath: t.SSHPath, SSHKeyFile: t.SSHKeyFile, StateDir: cfg.StateDir,
-		PublicOrigin: t.PublicOrigin, MaxClients: t.MaxClients, UseBastion: t.SSHUseBastion,
-	})
-	if err != nil {
-		return err
+	if *check {
+		logger.Printf("frontend configuration valid; no network requests sent")
+		return nil
 	}
-	ctl := vmbot.NewController(facade, store, mgr, vmbot.ControllerConfig{
-		ImageID: cfg.VM.ImageID, Profile: cfg.VM.Profile, PublicOrigin: t.PublicOrigin, Logger: logger,
-	})
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	if err := ctl.Recover(ctx); err != nil {
-		logger.Printf("startup reconcile incomplete (VM kept; will retry on next operation): %v", err)
+	delivery, e := tgbot.OpenDelivery(cfg.DeliveryDir)
+	if e != nil {
+		return e
 	}
-
-	ln, err := net.Listen("tcp", t.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("terminal listen: %w", err)
+	defer delivery.Close()
+	tg := tgbot.NewTelegramClient("https://api.telegram.org", token, nil)
+	bot, e := tgbot.NewBot(cfg, tg, client, delivery)
+	if e != nil {
+		return e
 	}
-	gwDone := make(chan error, 1)
-	go func() { gwDone <- vmbot.ServeGateway(ctx, ln, t.TLSCertFile, t.TLSKeyFile, mgr) }()
-
-	api := vmbot.NewTelegramClient(telegramAPI, token, &http.Client{Timeout: 45 * time.Second})
-	bot := vmbot.NewBot(cfg.AllowedUserID, api, ctl, store, logger)
-	botDone := make(chan struct{})
-	go func() { bot.Run(ctx); close(botDone) }()
-
-	logger.Printf("started (terminal gateway on %s)", t.ListenAddr)
-	var gwErr error
-	gwReceived := false
-	select {
-	case <-ctx.Done():
-	case gwErr = <-gwDone:
-		gwReceived = true
-		cancel()
-	}
-	<-botDone
-	if !gwReceived {
-		gwErr = <-gwDone
-	}
-	logger.Printf("stopped; the VM, if any, was left in place")
-	if gwErr != nil {
-		return fmt.Errorf("terminal gateway: %w", gwErr)
-	}
-	return nil
+	logger.Printf("HTTP-only frontend started; VM lifecycle remains in control API")
+	return bot.Run(ctx)
 }

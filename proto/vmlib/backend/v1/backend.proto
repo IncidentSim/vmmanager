@@ -10,6 +10,7 @@ option go_package = "github.com/petruekhin/vibe-firecracker/vmlib/gen/vmlib/back
 service HostBackend {
   rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
   rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
+  rpc DeleteImage(DeleteImageRequest) returns (DeleteImageResponse);
   rpc GetImage(GetImageRequest) returns (Image);
   rpc Prepare(PrepareRequest) returns (HostVM);
   rpc Start(VMRef) returns (HostVM);
@@ -58,6 +59,14 @@ message GuestNetwork {
   string configuration = 4;
 }
 
+message VMResources {
+  uint32 vcpu = 1;
+  uint32 mem_mib = 2;
+}
+
+message DeleteImageRequest { string id = 1; }
+message DeleteImageResponse {}
+
 message ListImagesRequest {}
 
 message Image {
@@ -82,6 +91,7 @@ message PrepareRequest {
   string profile = 3;
   // Optional OpenSSH public key line to inject into the workspace copy only.
   string ssh_public_key = 4;
+  VMResources resources = 5;
 }
 
 message VMRef {
@@ -100,6 +110,7 @@ message HostVM {
   string ssh_host_key_fingerprint = 8;
   bool public_key_provisioned = 9;
   GuestNetwork guest = 10;
+  VMResources resources = 11;
 }
 
 message ListRequest {}

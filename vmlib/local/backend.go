@@ -291,7 +291,7 @@ func New(cfg Config) (*Backend, error) {
 		if p.VCPU == 0 || p.MemMiB == 0 {
 			return nil, fmt.Errorf("profile %s needs vcpu and mem_mib", p.Name)
 		}
-		if p.MemMiB+cfg.VMMOverheadMiB > cfg.UnitMemLimitMiB {
+		if uint64(p.MemMiB)+uint64(cfg.VMMOverheadMiB) > uint64(cfg.UnitMemLimitMiB) {
 			return nil, fmt.Errorf("profile %s (%d MiB + %d overhead) exceeds the installed per-unit limit %d MiB", p.Name, p.MemMiB, cfg.VMMOverheadMiB, cfg.UnitMemLimitMiB)
 		}
 		if p.MemMiB > cfg.MaxTotalMemMiB || p.VCPU > cfg.MaxTotalVCPU {
@@ -555,7 +555,7 @@ func (b *Backend) host(m meta) vmlib.HostVM {
 	case stateLaunching, stateConfiguring:
 		state = vmlib.HostRunning // a VMM may exist; shutdown is identity-checked
 	}
-	return vmlib.HostVM{ID: m.ID, ImageID: m.ImageID, Profile: m.Profile, State: state, GuestIP: b.slotIP(m.Slot),
+	return vmlib.HostVM{ID: m.ID, ImageID: m.ImageID, Profile: m.Profile, Resources: vmlib.VMResources{VCPU: m.VCPU, MemMiB: m.MemMiB}, State: state, GuestIP: b.slotIP(m.Slot),
 		Retained: m.Retained, RetainedReason: m.Reason,
 		Guest: &vmlib.GuestNetwork{Address: b.slotIP(m.Slot) + "/30", Gateway: b.slotGW(m.Slot),
 			DNS: append([]string(nil), b.cfg.GuestDNS...), Configuration: b.cfg.GuestConfiguration}}
@@ -671,7 +671,7 @@ func (b *Backend) largestProfile() (mem, vcpu uint32) {
 
 // leasedLocked sums the PERSISTED reservations of every leased VM (retained ones
 // included). A VM without a reservation counts at the largest current profile.
-func (b *Backend) leasedLocked() (mem, vcpu uint32) {
+func (b *Backend) leasedLocked() (mem, vcpu uint64) {
 	lm, lv := b.largestProfile()
 	for _, e := range b.entries {
 		m, v := e.m.MemMiB, e.m.VCPU
@@ -681,8 +681,8 @@ func (b *Backend) leasedLocked() (mem, vcpu uint32) {
 		if v == 0 {
 			v = lv
 		}
-		mem += m
-		vcpu += v
+		mem += uint64(m)
+		vcpu += uint64(v)
 	}
 	return
 }
@@ -693,7 +693,7 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 		return vmlib.HostVM{}, gerr
 	}
 	defer leave()
-	for _, c := range [][2]string{{"vm", req.VMID}, {"image", req.ImageID}, {"profile", req.Profile}} {
+	for _, c := range [][2]string{{"vm", req.VMID}, {"image", req.ImageID}} {
 		if err := vmlib.ValidateID(c[0], c[1]); err != nil {
 			return vmlib.HostVM{}, err
 		}
@@ -701,17 +701,23 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 	if req.SSHPublicKey != "" {
 		return vmlib.HostVM{}, fmt.Errorf("%w: this backend does not provision SSH keys; use the image's preinstalled access", vmlib.ErrInvalidArgument)
 	}
-	prof, ok := b.profile(req.Profile)
-	if !ok {
-		return vmlib.HostVM{}, fmt.Errorf("%w: unknown profile %q", vmlib.ErrInvalidArgument, req.Profile)
-	}
-	src, info, err := b.imagePath(req.ImageID)
-	if err != nil {
+	if err := vmlib.ValidateResourceSelection(req.Profile, req.Resources); err != nil {
 		return vmlib.HostVM{}, err
 	}
-	if uint64(info.Size()) > uint64(prof.DiskMiB)<<20 {
-		return vmlib.HostVM{}, fmt.Errorf("%w: image larger than profile disk", vmlib.ErrInvalidArgument)
+	prof, ok := b.profile(req.Profile)
+	if req.Resources != nil {
+		prof.VCPU, prof.MemMiB = req.Resources.VCPU, req.Resources.MemMiB
+		// Explicit CPU/RAM does not expand disk authority: use the smallest profile disk bound.
+		prof.DiskMiB = b.cfg.Profiles[0].DiskMiB
+		for _, p := range b.cfg.Profiles {
+			if p.DiskMiB < prof.DiskMiB {
+				prof.DiskMiB = p.DiskMiB
+			}
+		}
+	} else if !ok {
+		return vmlib.HostVM{}, fmt.Errorf("%w: unknown profile %q", vmlib.ErrInvalidArgument, req.Profile)
 	}
+	var src string
 	if err := ctx.Err(); err != nil {
 		return vmlib.HostVM{}, err
 	}
@@ -731,17 +737,39 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 				continue // replaced while we waited; look again
 			}
 			defer old.mu.Unlock()
-			if old.m.ImageID == req.ImageID && old.m.Profile == req.Profile {
+			if old.m.ImageID == req.ImageID && old.m.Profile == req.Profile && (req.Resources == nil || (old.m.VCPU == req.Resources.VCPU && old.m.MemMiB == req.Resources.MemMiB)) {
 				return b.host(old.m), nil
 			}
 			return vmlib.HostVM{}, fmt.Errorf("%w: vm %s", vmlib.ErrAlreadyExists, req.VMID)
+		}
+		if req.Resources != nil {
+			mem, cpu := b.largestProfile()
+			if req.Resources.VCPU > cpu || req.Resources.MemMiB > mem {
+				b.mu.Unlock()
+				return vmlib.HostVM{}, fmt.Errorf("%w: CPU/RAM exceeds configured profile maxima", vmlib.ErrInvalidArgument)
+			}
+		}
+		var info os.FileInfo
+		var err error
+		src, info, err = b.imagePath(req.ImageID)
+		if err != nil {
+			b.mu.Unlock()
+			return vmlib.HostVM{}, err
+		}
+		if _, busy := b.publishing[req.ImageID]; busy {
+			b.mu.Unlock()
+			return vmlib.HostVM{}, fmt.Errorf("%w: image publication admission is reserved", vmlib.ErrResourceExhausted)
+		}
+		if uint64(info.Size()) > uint64(prof.DiskMiB)<<20 {
+			b.mu.Unlock()
+			return vmlib.HostVM{}, fmt.Errorf("%w: image larger than disk policy", vmlib.ErrInvalidArgument)
 		}
 		if len(b.entries) >= b.cfg.MaxVMs {
 			b.mu.Unlock()
 			return vmlib.HostVM{}, fmt.Errorf("%w: all %d VM slots are leased", vmlib.ErrResourceExhausted, b.cfg.MaxVMs)
 		}
 		mem, vcpu := b.leasedLocked()
-		if mem+prof.MemMiB > b.cfg.MaxTotalMemMiB || vcpu+prof.VCPU > b.cfg.MaxTotalVCPU {
+		if uint64(mem)+uint64(prof.MemMiB) > uint64(b.cfg.MaxTotalMemMiB) || uint64(vcpu)+uint64(prof.VCPU) > uint64(b.cfg.MaxTotalVCPU) {
 			b.mu.Unlock()
 			return vmlib.HostVM{}, fmt.Errorf("%w: aggregate budget (%d/%d MiB, %d/%d vCPU leased)", vmlib.ErrResourceExhausted,
 				mem, b.cfg.MaxTotalMemMiB, vcpu, b.cfg.MaxTotalVCPU)
@@ -1147,14 +1175,21 @@ func (b *Backend) Publish(_ context.Context, id, newID string) (vmlib.Image, err
 	dest := filepath.Join(b.cfg.ImagesDir, newID+".ext4")
 	if _, err := os.Lstat(dest); err == nil {
 		return vmlib.Image{}, fmt.Errorf("%w: image %s", vmlib.ErrAlreadyExists, newID)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return vmlib.Image{}, fmt.Errorf("inspect publication target: %w", err)
 	}
 	committedDir := filepath.Join(b.cfg.ImagesDir, ".committed")
 	if err := os.MkdirAll(committedDir, 0o755); err != nil {
 		return vmlib.Image{}, fmt.Errorf("committed-image catalog: %w", err)
 	}
 	marker := filepath.Join(committedDir, newID)
-	mf, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, 0o644)
+	// A marker without its final image is unresolved durable evidence, not a
+	// reusable ID. Only an exclusively created marker belongs to this attempt.
+	mf, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return vmlib.Image{}, fmt.Errorf("%w: image %s has an existing publication marker", vmlib.ErrAlreadyExists, newID)
+		}
 		return vmlib.Image{}, fmt.Errorf("write committed marker: %w", err)
 	}
 	merr := mf.Sync()
