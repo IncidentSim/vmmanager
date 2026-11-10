@@ -37,6 +37,11 @@ func abaBackend(t *testing.T) (*Backend, string) {
 	for _, p := range []string{cfg.WorkRoot, cfg.ImagesDir, cfg.RunDir} {
 		os.MkdirAll(p, 0o700)
 	}
+	os.WriteFile(filepath.Join(cfg.RunDir, ".backend.lock"), nil, 0o600)
+	uid := uint32(os.Getuid())
+	cfg.TrustedOwnerUID = &uid
+	os.Chmod(d, 0o755)
+	cfg.TrustedAncestorRoot = d
 	os.WriteFile(filepath.Join(cfg.ImagesDir, "base.ext4"), []byte("b"), 0o444)
 	b, err := New(cfg)
 	if err != nil {

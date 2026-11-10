@@ -108,6 +108,13 @@ type Config struct {
 	GuestDNS           []string
 	GuestConfiguration string
 
+	// TrustedOwnerUID is a TEST SEAM: the uid that must own the runtime tree
+	// (default nil = root). Production code (vmd) never sets it.
+	TrustedOwnerUID *uint32
+	// TrustedAncestorRoot is a TEST SEAM: ancestors ABOVE this directory are not
+	// inspected (the directory itself still is). Default "" = inspect up to "/".
+	TrustedAncestorRoot string
+
 	// StorageMount, when set, must be a real mount point (device differs from its
 	// parent) and WorkRoot and ImagesDir must live on that same device. Checked
 	// before anything is written, so a missing mount cannot fall back to the root
@@ -158,6 +165,7 @@ type Backend struct {
 	entries map[string]*entry
 	corrupt []string // unreadable workspaces: admission fails closed
 	locks   []*os.File
+	runFD   int // trusted runtime directory, opened O_NOFOLLOW; receipts are read relative to it
 
 	// Lifecycle gate: every exported operation is admitted through enter() and
 	// Close drains them before the ownership locks are released.
@@ -314,18 +322,33 @@ func New(cfg Config) (*Backend, error) {
 		}
 	}
 	cfg.WorkRoot, cfg.ImagesDir, cfg.RunDir = work, images, run
+	// The runtime tree must be root-owned and not client-writable; refuse to start
+	// (before anything is written) otherwise.
+	if err := validateRunHierarchy(run, cfg.trustedUID(), cfg.TrustedAncestorRoot); err != nil {
+		return nil, fmt.Errorf("unsafe runtime layout: %w", err)
+	}
 	if cfg.CopyFile == nil {
 		cfg.CopyFile = copyFile
 	}
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 15 * time.Second
 	}
-	b := &Backend{cfg: cfg, entries: map[string]*entry{}, closeCh: make(chan struct{}), closeDone: make(chan struct{})}
+	runFD, err := unix.Open(run, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open runtime directory: %w", err)
+	}
+	b := &Backend{cfg: cfg, runFD: runFD, entries: map[string]*entry{}, closeCh: make(chan struct{}), closeDone: make(chan struct{})}
 	b.gcond = sync.NewCond(&b.gmu)
 	sorted := append([]string(nil), roots...)
 	sort.Strings(sorted) // fixed order avoids lock-order deadlock between owners
 	for _, dir := range sorted {
-		f, err := lockDir(dir)
+		var f *os.File
+		var err error
+		if dir == run {
+			f, err = openRunLock(filepath.Join(run, ".backend.lock"), cfg.trustedUID())
+		} else {
+			f, err = lockDir(dir)
+		}
 		if err != nil {
 			b.Close()
 			return nil, err
@@ -399,6 +422,7 @@ func (b *Backend) Close() error {
 			err = cerr
 		}
 	}
+	unix.Close(b.runFD)
 	close(b.closeDone)
 	return err
 }
@@ -935,16 +959,13 @@ type receiptFile struct {
 
 // readReceipt returns (clean, present, err). Only the ORIGINAL invocation's
 // receipt counts; a responding socket or another invocation's file proves nothing.
+// The file is read only through the trusted runtime tree (see trust.go).
 func (b *Backend) readReceipt(m meta) (clean, present bool, err error) {
 	if !invocationPattern.MatchString(m.Invocation) {
 		return false, false, nil
 	}
-	path := filepath.Join(b.cfg.RunDir, fmt.Sprintf("slot-%d", m.Slot), m.Invocation+".exit.json")
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, false, nil
-	}
-	if err != nil {
+	data, present, err := b.secureReceipt(m.Slot, m.Invocation)
+	if err != nil || !present {
 		return false, false, err
 	}
 	var r receiptFile

@@ -210,6 +210,21 @@ class UnitContractTests(unittest.TestCase):
         self.assertLessEqual(cfg["max_total_mem_mib"], 2048)
         self.assertLessEqual(cfg["max_total_vcpu"], 1)
 
+    def test_runtime_tree_is_root_owned_and_only_the_lock_is_client_writable(self):
+        rows = [l.split() for l in (HERE / "firecracker-vms.tmpfiles.conf").read_text().splitlines()
+                if l.strip() and not l.startswith("#")]
+        by_path = {r[1]: r for r in rows}
+        d = by_path["/run/firecracker-vms"]
+        self.assertEqual((d[0], d[2], d[3], d[4]), ("d", "0755", "root", "root"))
+        self.assertEqual(int(d[2], 8) & 0o022, 0, "runtime parent must not be group/other writable")
+        lock = by_path["/run/firecracker-vms/.backend.lock"]
+        self.assertEqual((lock[0], lock[2], lock[3], lock[4]), ("f", "0660", "root", "@CLIENT_GROUP@"))
+        self.assertEqual(len(rows), 2, "nothing else may be made client-writable")
+        u = unit("firecracker-vm@.service")
+        mode = int(values(u, "Service", "RuntimeDirectoryMode")[0], 8)
+        self.assertEqual(mode & 0o022, 0, "slot directories must not be group/other writable")
+        self.assertEqual(values(u, "Service", "User"), ["root"])
+
     def test_scripts_have_valid_syntax(self):
         for name in ("fc-vm-network.sh",):
             subprocess.run(["bash", "-n", str(HERE / name)], check=True)

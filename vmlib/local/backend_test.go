@@ -100,6 +100,15 @@ func newRig(t *testing.T, max int) *rig {
 			t.Fatal(err)
 		}
 	}
+	// Production: the operator precreates this root-owned file (tmpfiles.d); the
+	// runtime directory itself is never writable by the unprivileged backend.
+	if err := os.WriteFile(filepath.Join(r.run, ".backend.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uid := uint32(os.Getuid())
+	if err := os.Chmod(d, 0o755); err != nil { // the ancestor floor must satisfy the production rule
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(r.images, "base.ext4"), []byte("BASE-IMAGE-CONTENT"), 0o444); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +118,7 @@ func newRig(t *testing.T, max int) *rig {
 		SSHUser:  "root", Bastion: &vmlib.Bastion{Host: "bastion.example.test", Port: 22, User: "jump"},
 		Launcher: r.launcher, VMM: r.vmm, MinFreeMiB: 0,
 		MaxTotalMemMiB: 4096, MaxTotalVCPU: 16, UnitMemLimitMiB: 768, VMMOverheadMiB: 64,
-		GuestPrefix: "172.30",
+		GuestPrefix: "172.30", TrustedOwnerUID: &uid, TrustedAncestorRoot: d, // test seams: tests run unprivileged
 	}
 	return r
 }

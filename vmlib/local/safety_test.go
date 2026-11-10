@@ -343,7 +343,7 @@ func TestNonMountpointStorageFailsBeforeAnythingIsWritten(t *testing.T) {
 		b.Close()
 		t.Fatal("accepted a storage path that is not a mount point (root-fs fallback)")
 	}
-	for _, p := range []string{filepath.Join(r.root, "vms"), filepath.Join(r.root, ".backend.lock"), filepath.Join(r.run, ".backend.lock"), filepath.Join(r.images, ".backend.lock")} {
+	for _, p := range []string{filepath.Join(r.root, "vms"), filepath.Join(r.root, ".backend.lock"), filepath.Join(r.images, ".backend.lock")} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Fatalf("wrote %s before validating the mount", p)
 		}

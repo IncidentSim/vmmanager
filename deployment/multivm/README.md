@@ -79,7 +79,7 @@ tests against canned `ip` output.
 ## Proposed activation order (operator)
 
 1. Build `vmd`, `vm-launcher`, `vm-helper`, `vm-helper-client` (`make vmd vm-launcher vm-helper vm-helper-client`).
-2. Choose and install `/etc/firecracker-vms/pool.conf`.
+2. Choose and install `/etc/firecracker-vms/pool.conf` and the tmpfiles.d entry (see "Runtime tree trust"), then `systemd-tmpfiles --create`.
 3. Create jail, `.../storage/vms/{work,images}`; install binaries (root-owned) to
    `/usr/local/libexec/{fc-vm-launcher,fc-vm-network,fc-vm-helper,fc-vm-helper-client}`.
 4. Render `@CLIENT_GROUP@` and install the four unit files; `daemon-reload`;
@@ -87,6 +87,27 @@ tests against canned `ip` output.
 5. PKI outside Git; run `vmd` as the unprivileged user with the helper path
    `/usr/local/libexec/fc-vm-helper-client`.
 6. Operator runs `scripts/integration/multi-vm.sh` (see `docs/verification.md`).
+
+## Runtime tree trust (exit receipts are the proof of exit)
+
+`vmd` believes an exit receipt only if its whole path is root-owned and not
+writable by group or others and no component is a symlink; it reads receipts
+through `openat(O_NOFOLLOW)` descriptors. The runtime parent `/run/firecracker-vms`
+is therefore **root-owned 0755 and never client-writable** (a writable parent would
+let `vmd` replace whole slot directories and forge receipts). The only writable
+object is the lock file `.backend.lock` (`root:<group> 0660`), which the operator
+**precreates**; `vmd` opens it and never creates it. Install
+`firecracker-vms.tmpfiles.conf` as `/etc/tmpfiles.d/firecracker-vms.conf` (replace
+`@CLIENT_GROUP@`) and run `systemd-tmpfiles --create` as root **before** starting
+`vmd`; /run is a tmpfs so this recurs at every boot. `vmd` refuses to start, before
+writing anything, if the parent, any ancestor, an existing slot directory or the
+lock file is unsafe. After the first VM start, check as an operator:
+
+```sh
+stat -c '%U:%G %a %n' /run/firecracker-vms /run/firecracker-vms/slot-* /run/firecracker-vms/slot-*/*.exit.json
+# expect root:root 755 / root:<group> 750 / root:* 640 -- systemd's handling of
+# RuntimeDirectory= sub-directories was not exercised by the author.
+```
 
 ## Restart behaviour of vmd
 

@@ -30,6 +30,9 @@ import (
 type deps struct {
 	Launcher local.Launcher
 	VMM      local.VMM
+	// TrustedOwnerUID is a test seam for unprivileged runs; production leaves it nil (root).
+	TrustedOwnerUID     *uint32
+	TrustedAncestorRoot string
 }
 
 func main() {
@@ -81,7 +84,8 @@ func buildLocal(l *localConfig, d deps) (*local.Backend, error) {
 	return local.New(local.Config{WorkRoot: l.WorkRoot, ImagesDir: l.ImagesDir, RunDir: l.RunDir, MaxVMs: l.MaxVMs,
 		Profiles: profiles, SSHUser: l.SSHUser, Bastion: bastion, Launcher: launcher, VMM: vmm, MinFreeMiB: l.MinFreeMiB,
 		StorageMount: l.StorageMount, MaxTotalMemMiB: l.MaxTotalMemMiB, MaxTotalVCPU: l.MaxTotalVCPU,
-		UnitMemLimitMiB: l.UnitMemLimitMiB, VMMOverheadMiB: l.VMMOverheadMiB, GuestDNS: l.GuestDNS, GuestPrefix: l.GuestPrefix, PoolConf: l.PoolConf})
+		UnitMemLimitMiB: l.UnitMemLimitMiB, VMMOverheadMiB: l.VMMOverheadMiB, GuestDNS: l.GuestDNS, GuestPrefix: l.GuestPrefix, PoolConf: l.PoolConf,
+		TrustedOwnerUID: d.TrustedOwnerUID, TrustedAncestorRoot: d.TrustedAncestorRoot})
 }
 
 // run_ serves until ctx is cancelled. Cancelling ctx stops listeners only; it

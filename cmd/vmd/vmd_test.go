@@ -91,6 +91,9 @@ func TestRunCombinedModeEndToEnd(t *testing.T) {
 		os.MkdirAll(p, 0o700)
 	}
 	os.WriteFile(filepath.Join(images, "base.ext4"), []byte("BASE"), 0o444)
+	os.WriteFile(filepath.Join(run, ".backend.lock"), nil, 0o600)
+	uid := uint32(os.Getuid())
+	os.Chmod(d, 0o755)
 	beCA, faCA := pkitest.NewCA(t, "backend-ca"), pkitest.NewCA(t, "facade-ca")
 	bsCA, bsCert, bsKey := writePKI(t, d, "bs", beCA, true)
 	fsCA, fsCert, fsKey := writePKI(t, d, "fs", faCA, true)
@@ -106,7 +109,7 @@ func TestRunCombinedModeEndToEnd(t *testing.T) {
 	ready := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- run_(ctx, cfg, deps{Launcher: fakeLauncher{}, VMM: fakeVMM{run: run}}, func(a map[string]string) {
+		done <- run_(ctx, cfg, deps{Launcher: fakeLauncher{}, VMM: fakeVMM{run: run}, TrustedOwnerUID: &uid, TrustedAncestorRoot: d}, func(a map[string]string) {
 			mu.Lock()
 			addrs = a
 			mu.Unlock()
