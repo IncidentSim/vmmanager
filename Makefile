@@ -6,7 +6,7 @@ BUILD_DIR ?= .
 IMAGE ?= images/ubuntu-postgres.ext4
 FC_SOCKET ?= /run/firecracker-builder/main.sock
 
-.PHONY: build remote-client test vet check shell-syntax run verify demo proto proto-check
+.PHONY: build remote-client test vet check shell-syntax run verify demo proto proto-check vmd vmctl vm-launcher
 
 build:
 	mkdir -p "$(BUILD_DIR)"
@@ -18,13 +18,18 @@ remote-client:
 
 test:
 	$(GO) test -race -cover ./...
-	$(PYTHON) -m unittest -v test_verify_image.py test_project_layout.py deployment/test_mtls.py
+	$(PYTHON) -m unittest -v test_verify_image.py test_project_layout.py deployment/test_mtls.py deployment/multivm/test_helper.py
 
 vet:
 	$(GO) vet ./...
 
 shell-syntax:
-	@for script in scripts/*.sh deployment/*.sh; do bash -n "$$script" || exit; done
+	@for script in scripts/*.sh scripts/integration/*.sh deployment/*.sh deployment/multivm/*.sh; do bash -n "$$script" || exit; done
+
+# New multi-VM applications (build only; no install, no sudo).
+vmd vmctl vm-launcher:
+	mkdir -p "$(BUILD_DIR)"
+	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/$@" ./cmd/$@
 
 proto:
 	bash scripts/gen-proto.sh
