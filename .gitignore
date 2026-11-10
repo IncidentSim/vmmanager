@@ -8,4 +8,5 @@ verification-systemd.json
 verification-socket.json
 recordings/
 __pycache__/
+.tools/
 

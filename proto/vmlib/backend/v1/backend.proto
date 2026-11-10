@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package vmlib.backend.v1;
+
+option go_package = "example.com/firecracker-postgres-builder/vmlib/gen/vmlib/backend/v1;backendv1";
+
+// HostBackend is the narrow set of host operations required by the VM lifecycle
+// facade. Every identifier is opaque and validated by the server; no request
+// carries a filesystem path, command, interface name, IP, MAC or socket path.
+service HostBackend {
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
+  rpc GetImage(GetImageRequest) returns (Image);
+  rpc Prepare(PrepareRequest) returns (HostVM);
+  rpc Start(VMRef) returns (HostVM);
+  rpc Inspect(VMRef) returns (HostVM);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc RequestShutdown(VMRef) returns (HostVM);
+  // WaitExit returns only after the original VMM's exit receipt is valid, or
+  // when the RPC deadline expires (DEADLINE_EXCEEDED; VM is NOT considered exited).
+  rpc WaitExit(VMRef) returns (ExitReceipt);
+  rpc Publish(PublishRequest) returns (Image);
+  rpc Release(VMRef) returns (ReleaseResponse);
+}
+
+message CapabilitiesRequest {}
+
+message Profile {
+  string name = 1;
+  uint32 vcpu = 2;
+  uint32 mem_mib = 3;
+  uint32 disk_mib = 4;
+}
+
+message Bastion {
+  string host = 1;
+  uint32 port = 2;
+  string user = 3;
+}
+
+message CapabilitiesResponse {
+  uint32 max_vms = 1;
+  repeated Profile profiles = 2;
+  Bastion bastion = 3;
+  string ssh_user = 4;
+  // image-preinstalled | provision-public-key
+  string ssh_auth_mode = 5;
+}
+
+message ListImagesRequest {}
+
+message Image {
+  string id = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+  // True for server-managed read-only base images.
+  bool base = 4;
+}
+
+message ListImagesResponse {
+  repeated Image images = 1;
+}
+
+message GetImageRequest {
+  string id = 1;
+}
+
+message PrepareRequest {
+  string vm_id = 1;
+  string image_id = 2;
+  string profile = 3;
+  // Optional OpenSSH public key line to inject into the workspace copy only.
+  string ssh_public_key = 4;
+}
+
+message VMRef {
+  string vm_id = 1;
+}
+
+message HostVM {
+  string vm_id = 1;
+  string image_id = 2;
+  string profile = 3;
+  // prepared | running | exiting | exited | retained
+  string state = 4;
+  string guest_ip = 5;
+  bool retained = 6;
+  string retained_reason = 7;
+  string ssh_host_key_fingerprint = 8;
+  bool public_key_provisioned = 9;
+}
+
+message ListRequest {}
+
+message ListResponse {
+  repeated HostVM vms = 1;
+}
+
+message ExitReceipt {
+  string vm_id = 1;
+  bool clean = 2;
+  string detail = 3;
+}
+
+message PublishRequest {
+  string vm_id = 1;
+  string new_image_id = 2;
+}
+
+message ReleaseResponse {
+  // True when the disk was deleted and leases freed; false when retained.
+  bool released = 1;
+  string detail = 2;
+}
