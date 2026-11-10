@@ -14,6 +14,11 @@ fails if committed code differs).
 | Remote backend/facade | error mapping to sentinels, ID/path/key rejection before the backend is called, local / facade-over-remote-backend / combined composition, separate trust domains |
 | Local backend | slot-derived resources, admission cap, symlink/oversize/profile rejection, replacement-VMM identity refusal, original-receipt requirement, no-replace publication, release only with proof, restart reconciliation fails closed, corrupt metadata blocks admission - through fake launcher/VMM seams |
 | Ownership and recovery | second owner over the same / overlapping / symlinked roots rejected; close and reopen reconcile; restart + Stop/Commit/Delete use identity-checked shutdown; unknown identity fails closed; ambiguous launcher failure keeps lease and slot; stale Release cannot delete a re-created workspace (deterministic hook test) |
+| Close lifecycle | a blocking `CopyFile` held across `Close` (second owner refused until drained, late failure cleanup cannot touch the new owner's workspace), a concurrent Close/Prepare/Start/Publish/Release stress with a byte-exact tree fingerprint after Close returns, `WaitExit` released by Close |
+| Receipt trust | writable runtime parent/ancestor, untrusted owner (test seam), missing/symlink/world-writable/directory run lock, unsafe existing slot dirs, forged receipts (symlinked slot dir, symlinked receipt, group/world-writable receipt or slot dir, receipt as a directory) refused by WaitExit/Release/Publish; owner/mode rules over synthetic `stat` data (chown is not possible unprivileged) |
+| Reservations, publish | profile edits across a restart (memory and vCPU) and legacy/unknown-profile metadata counted conservatively; two publishers of one target with a deterministic hook, marker survives, classification survives reopen |
+| Stale reads | a parked `Get` raced against Stop/Commit/Delete and several parked readers, under `-race` |
+| Shipped policy | the real `vmd.example.json` through the real parser and backend admits two guests and refuses a third; the offline integration test derives its cap from the same file |
 | Data races | concurrent Get/List/SSHInfo against Stop/Commit/Delete with a delayed receipt under `-race` |
 | Durability, admission | marker-before-image publication, classification survives restart, aggregate memory/vCPU caps, profile vs unit-limit, storage-mount guard before any write |
 | Privilege boundary | one-line protocol validation, pool.conf parsing, idle-unit-only handler (fake `systemctl`), client refusal of anything but `start-slot N` |
@@ -30,6 +35,9 @@ fails if committed code differs).
   `systemd-analyze verify` checks syntax and dependency wiring only; it does not run
   the jail, the `Requires=`/`After=` start/stop order, `AssertPathIsMountPoint`, the
   socket activation or the network script against a real kernel.
+* Root ownership of the real runtime tree: the owner checks are exercised only with
+  synthetic `stat` data and a test uid seam. systemd's handling of `RuntimeDirectory=`
+  sub-directories (modes/owners) and `systemd-tmpfiles` are not exercised.
 * That the guest base honours `Guest.Configuration` (MAC-derived address) in practice.
 * Real cgroup budget enforcement and the shared 20 GiB storage bound.
 * The privilege path by which `vmd` may invoke the helper (operator-defined).

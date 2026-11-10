@@ -344,3 +344,44 @@ are unchanged and remain the fallback.
   only after publication; until then `make consumer-smoke` proves importability
   through a local `replace`, and the portable clients cross-build for
   darwin/windows.
+
+## Amendments after the second independent review
+
+* **Close drains.** Every exported local-backend operation is admitted through a
+  lifecycle gate. `Close()` stops new admissions (`local.ErrClosed`), wakes blocking
+  waits (`WaitExit` returns `ErrClosed`), waits for every admitted operation to
+  finish and only then unlocks the ownership roots. A closed owner therefore cannot
+  run late cleanup against a workspace a new owner created. `Close` can block for as
+  long as an admitted operation does (a `Start` past its durable launch intent always
+  runs to completion, bounded by its own timeouts); cancelling the operation's
+  context is how a caller shortens that. Internal helpers never re-enter the gate, so
+  nested calls cannot deadlock against `Close`.
+* **Reservations are persisted.** Metadata records the memory and vCPU a VM was
+  admitted with. Admission sums those values, `Start` configures the VMM with them,
+  and metadata without a reservation, or naming a retired profile, is counted at the
+  largest current profile, never zero. Editing a profile cannot change what a live
+  VM is counted or run as.
+* **Publish reserves the target.** The target image id is reserved under the table
+  lock across all VM entries; a second publisher of an in-flight id is refused with
+  `ErrAlreadyExists`, and a rollback removes only the artifacts of the publisher
+  that holds the reservation.
+* **Stale reads are dropped.** `Service` records carry a version; a backend read is
+  applied only if no lifecycle operation changed the record since the read began, and
+  once the original exit is known no read moves the VM back to running. Introspection
+  still never waits for a lifecycle operation.
+* **Admission vs execution.** `max_total_vcpu` counts virtual CPUs and the shipped
+  value admits two 1-vCPU guests; execution remains capped by the shared slice's
+  `CPUQuota=100%`. The shipped policy is tested through the real example file.
+* **Receipt trust.** Exit receipts are the proof that a VMM is gone, so they are
+  believed only through a trusted tree: the runtime directory, its ancestors and its
+  slot directories are root-owned and not group/other writable (sticky ancestors
+  allowed), receipts are regular, root-owned and not group/other writable, and they
+  are read through `openat(O_NOFOLLOW)` descriptors. Any violation is an error, never
+  "absent". The runtime parent is **never** client-writable: the run lock is a
+  root-owned group-writable file the operator precreates (tmpfiles.d) and the backend
+  only opens. `vmd` refuses to start, before writing anything, on an unsafe layout.
+  Unprivileged tests use two documented seams (`TrustedOwnerUID`,
+  `TrustedAncestorRoot`) that `vmd` never sets.
+* **Routes.** The network script inspects every routing table, parses route types and
+  table annotations explicitly, and excludes only default routes and the slot's own
+  interface routes.

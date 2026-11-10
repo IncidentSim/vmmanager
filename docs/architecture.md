@@ -62,7 +62,10 @@ written once for local, remote-backend and remote-facade composition.
 * Anything uncertain (shutdown, identity, configuration, restart) sets
   `retained` on the VM and keeps the lease; `Delete` then returns
   `vmlib.ErrRetained`. Check `VM.Retained` / `RetainedReason`.
-* A local backend owns its roots exclusively until `Close()`; `Close` never stops VMs.
+* A local backend owns its roots exclusively until `Close()`. `Close` stops admitting
+  operations (`local.ErrClosed`), waits for the admitted ones, then unlocks; it never
+  stops VMs, so it can block as long as an in-flight operation (cancel its context to
+  shorten it).
   A second backend over the same (or overlapping/symlinked) roots fails at `New`.
 * `Create` over the facade takes a client-allocated ID; after a failed or lost
   response, `Get`/`Delete` that ID. `VM.Retained` is a flag over the lifecycle state.
