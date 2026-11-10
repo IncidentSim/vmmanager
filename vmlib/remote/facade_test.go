@@ -263,3 +263,38 @@ func TestRetainedDeleteKeepsStructuredResultOverRPC(t *testing.T) {
 		t.Fatalf("retained state not queryable: %v %+v", gerr, vm)
 	}
 }
+
+// A remote client waits for readiness with ITS prober (it cannot dial the
+// host-private guest); the default must not be mistaken for authenticated SSH.
+func TestFacadeClientWaitSSHReadyUsesClientSideProber(t *testing.T) {
+	svc, _ := vmlib.NewService(vmlibtest.New(1, "base"))
+	f := serveFacade(t, svc)
+	calls := 0
+	cfg, _ := remote.ClientTLSFromPEM(f.ca.CertPEM, f.client.CertPEM, f.client.KeyPEM, host)
+	c, err := remote.DialFacade(f.addr, cfg,
+		remote.WithSSHProber(func(_ context.Context, i vmlib.SSHInfo) error {
+			calls++
+			if calls < 3 || i.ProxyJump() == "" {
+				return errors.New("not yet")
+			}
+			return nil
+		}), remote.WithPollInterval(time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ctx := context.Background()
+	if _, err := c.Create(ctx, vmlib.CreateRequest{ID: "w1", ImageID: "base", Profile: "small"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := c.WaitSSHReady(ctx, "w1")
+	if err != nil || !info.Ready || calls != 3 {
+		t.Fatalf("%v %+v calls=%d", err, info, calls)
+	}
+	if _, err := c.Stop(ctx, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.WaitSSHReady(ctx, "w1"); !errors.Is(err, vmlib.ErrNotStopped) {
+		t.Fatalf("readiness of a stopped VM: %v", err)
+	}
+}

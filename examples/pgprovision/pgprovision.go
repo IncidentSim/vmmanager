@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -19,8 +20,32 @@ import (
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
-// Script runs IN THE GUEST (same steps as the legacy builder), never on the host.
-const Script = `set -euxo pipefail
+// ScriptFor renders the guest-side provisioning script. It runs IN THE GUEST
+// (never on the host). The base image's address comes from the MAC (or from the
+// caller for an "external" base), but it has no default route or resolver, so the
+// script installs both from the structured metadata the server returned; without
+// usable metadata it refuses instead of guessing.
+func ScriptFor(info vmlib.SSHInfo) (string, error) {
+	g := info.Guest
+	if g == nil {
+		return "", errors.New("server returned no guest network metadata; cannot configure route/DNS")
+	}
+	if net.ParseIP(g.Gateway) == nil {
+		return "", fmt.Errorf("invalid guest gateway %q", g.Gateway)
+	}
+	if len(g.DNS) == 0 {
+		return "", errors.New("server policy provides no DNS for the guest (set guest_dns); package installation would fail")
+	}
+	var resolv strings.Builder
+	for _, d := range g.DNS {
+		if net.ParseIP(d) == nil {
+			return "", fmt.Errorf("invalid DNS address %q", d)
+		}
+		fmt.Fprintf(&resolv, "nameserver %s\\n", d)
+	}
+	return fmt.Sprintf(`set -euxo pipefail
+ip route replace default via %s dev eth0
+printf '%s' > /etc/resolv.conf
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=3 update
 apt-get -o Acquire::Retries=3 install -y postgresql
@@ -30,7 +55,8 @@ runuser -u postgres -- psql -Atqc 'SHOW server_version;'
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 sync
-`
+`, g.Gateway, resolv.String()), nil
+}
 
 type Options struct {
 	BaseImage, Profile, OutputImage string
@@ -75,7 +101,11 @@ func Build(ctx context.Context, l vmlib.Lifecycle, ready ReadyFunc, run Runner, 
 	if err != nil {
 		return vmlib.Image{}, err
 	}
-	if err = run.RunScript(ctx, info, Script); err != nil {
+	script, serr := ScriptFor(info)
+	if serr != nil {
+		return vmlib.Image{}, serr
+	}
+	if err = run.RunScript(ctx, info, script); err != nil {
 		return vmlib.Image{}, fmt.Errorf("guest provisioning failed: %w", err)
 	}
 	img, err = l.Commit(ctx, vm.ID, o.OutputImage)

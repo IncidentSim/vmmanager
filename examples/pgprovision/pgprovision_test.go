@@ -50,6 +50,54 @@ func TestBuildProvisionsThenCommitsNewImageAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestScriptConfiguresRouteAndDNSFromGuestMetadata(t *testing.T) {
+	s, _ := setup(t)
+	r := &recorder{}
+	if _, err := pgprovision.Build(context.Background(), s, s.WaitSSHReady, r, pgprovision.Options{BaseImage: "base", Profile: "small", OutputImage: "pg"}); err != nil {
+		t.Fatal(err)
+	}
+	script := r.scripts[0]
+	g := r.infos[0].Guest
+	if g == nil {
+		t.Fatal("SSHInfo carries no guest network metadata")
+	}
+	for _, want := range []string{"ip route replace default via " + g.Gateway + " dev eth0", "nameserver " + g.DNS[0]} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script lacks %q:\n%s", want, script)
+		}
+	}
+	if strings.Index(script, "ip route replace") > strings.Index(script, "apt-get") {
+		t.Fatal("network must be configured before apt-get")
+	}
+}
+
+func TestBuildRefusesWithoutUsableGuestNetworkMetadata(t *testing.T) {
+	s, b := setup(t)
+	b.GuestDNS = nil // server policy provides no DNS
+	r := &recorder{}
+	_, err := pgprovision.Build(context.Background(), s, s.WaitSSHReady, r, pgprovision.Options{BaseImage: "base", Profile: "small", OutputImage: "pg"})
+	if err == nil || len(r.scripts) != 0 || b.Published != 0 {
+		t.Fatalf("%v scripts=%d published=%d", err, len(r.scripts), b.Published)
+	}
+	if b.Count() != 0 {
+		t.Fatal("builder VM leaked")
+	}
+}
+
+func TestScriptRejectsUnsafeMetadata(t *testing.T) {
+	for _, g := range []*vmlib.GuestNetwork{
+		nil,
+		{Gateway: "10.0.0.1; reboot", DNS: []string{"1.1.1.1"}},
+		{Gateway: "10.0.0.1", DNS: []string{"1.1.1.1\nnameserver 6.6.6.6"}},
+		{Gateway: "not-an-ip", DNS: []string{"1.1.1.1"}},
+		{Gateway: "10.0.0.1", DNS: nil},
+	} {
+		if _, err := pgprovision.ScriptFor(vmlib.SSHInfo{Guest: g}); err == nil {
+			t.Errorf("accepted %+v", g)
+		}
+	}
+}
+
 func TestFailedProvisioningNeverPublishes(t *testing.T) {
 	s, b := setup(t)
 	r := &recorder{err: errors.New("apt failed")}

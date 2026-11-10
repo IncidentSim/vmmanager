@@ -28,6 +28,8 @@ type Backend struct {
 	StartErr error
 	// StartUncertainErr, when set, makes Start run the VM then return an error.
 	StartUncertainErr error
+	// GuestDNS is advertised in guest network metadata (default 1.1.1.1; nil = none).
+	GuestDNS []string
 	// OnStart runs inside Start (before returning); useful for races.
 	OnStart func(vmID string)
 
@@ -57,6 +59,7 @@ func New(maxVMs int, baseImages ...string) *Backend {
 		ips:      map[int]bool{},
 		exitHold: map[string]chan struct{}{},
 		AutoExit: true,
+		GuestDNS: []string{"1.1.1.1"},
 	}
 	for _, id := range baseImages {
 		b.images[id] = vmlib.Image{ID: id, SizeBytes: 1 << 20, SHA256: "base-" + id, Base: true}
@@ -134,7 +137,9 @@ func (b *Backend) Prepare(_ context.Context, r vmlib.PrepareRequest) (vmlib.Host
 	b.Prepared++
 	v := &fakeVM{slot: slot, exit: make(chan struct{})}
 	v.host = vmlib.HostVM{ID: r.VMID, ImageID: r.ImageID, Profile: r.Profile, State: vmlib.HostPrepared,
-		GuestIP: fmt.Sprintf("172.16.%d.2", slot+1), PublicKeyProvisioned: r.SSHPublicKey != ""}
+		GuestIP: fmt.Sprintf("172.16.%d.2", slot+1), PublicKeyProvisioned: r.SSHPublicKey != "",
+		Guest: &vmlib.GuestNetwork{Address: fmt.Sprintf("172.16.%d.2/30", slot+1), Gateway: fmt.Sprintf("172.16.%d.1", slot+1),
+			DNS: append([]string(nil), b.GuestDNS...), Configuration: "mac-derived"}}
 	b.vms[r.VMID] = v
 	return v.host, nil
 }

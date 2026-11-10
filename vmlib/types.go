@@ -230,6 +230,10 @@ type Lifecycle interface {
 	Get(ctx context.Context, id string) (VM, error)
 	List(ctx context.Context) ([]VM, error)
 	SSHInfo(ctx context.Context, id string) (SSHInfo, error)
+	// WaitSSHReady returns once the implementation's prober succeeds. What that
+	// proves depends on the prober (see WaitReady); it is not implied to be an
+	// authenticated login unless an SSH prober is configured.
+	WaitSSHReady(ctx context.Context, id string) (SSHInfo, error)
 	Stop(ctx context.Context, id string) (VM, error)
 	Commit(ctx context.Context, id, newImageID string) (Image, error)
 	Delete(ctx context.Context, id string) (DeleteResult, error)

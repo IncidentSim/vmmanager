@@ -371,30 +371,9 @@ func (s *Service) SSHInfo(ctx context.Context, id string) (SSHInfo, error) {
 
 // WaitSSHReady polls the configured prober until it succeeds, ctx ends, or the
 // VM stops. With the default prober "ready" means only "the TCP port accepted a
-// connection"; see WithSSHProber.
+// connection"; see WaitReady and WithSSHProber.
 func (s *Service) WaitSSHReady(ctx context.Context, id string) (SSHInfo, error) {
-	for {
-		vm, err := s.Get(ctx, id)
-		if err != nil {
-			return SSHInfo{}, err
-		}
-		if vm.State != StateRunning {
-			return SSHInfo{}, fmt.Errorf("%w: VM %s is %s", ErrNotStopped, id, vm.State)
-		}
-		info, err := s.SSHInfo(ctx, id)
-		if err != nil {
-			return SSHInfo{}, err
-		}
-		if perr := s.prober(ctx, info); perr == nil {
-			info.Ready = true
-			return info, nil
-		}
-		select {
-		case <-ctx.Done():
-			return SSHInfo{}, fmt.Errorf("waiting for SSH on %s: %w", id, ctx.Err())
-		case <-time.After(s.poll):
-		}
-	}
+	return WaitReady(ctx, s, id, s.prober, s.poll)
 }
 
 // stopLocked requests graceful shutdown and waits for the receipt. rec.op held.

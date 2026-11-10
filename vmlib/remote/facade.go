@@ -236,13 +236,32 @@ func withDeleteMetadata(base error, res vmlib.DeleteResult) error {
 // FacadeClient implements vmlib.Lifecycle over generated gRPC+mTLS. It needs no
 // KVM, Firecracker SDK or host access.
 type FacadeClient struct {
-	conn *grpc.ClientConn
-	c    pb.VMServiceClient
+	conn   *grpc.ClientConn
+	c      pb.VMServiceClient
+	prober vmlib.SSHProber
+	poll   time.Duration
 }
 
 var _ vmlib.Lifecycle = (*FacadeClient)(nil)
 
-func DialFacade(addr string, cfg *tls.Config) (*FacadeClient, error) {
+// ClientOption configures a FacadeClient.
+type ClientOption func(*FacadeClient)
+
+// WithSSHProber sets the CLIENT-side readiness probe used by WaitSSHReady. A
+// remote client usually cannot dial the host-private guest, so pass something
+// that goes through the bastion, e.g. vmlib.SSHCommandProber{...}.Probe.
+func WithSSHProber(p vmlib.SSHProber) ClientOption { return func(c *FacadeClient) { c.prober = p } }
+
+// WithPollInterval sets the WaitSSHReady polling period.
+func WithPollInterval(d time.Duration) ClientOption { return func(c *FacadeClient) { c.poll = d } }
+
+// WaitSSHReady polls with the client-side prober (default: TCP dial, which only
+// helps where the guest address is routable from this process).
+func (c *FacadeClient) WaitSSHReady(ctx context.Context, id string) (vmlib.SSHInfo, error) {
+	return vmlib.WaitReady(ctx, c, id, c.prober, c.poll)
+}
+
+func DialFacade(addr string, cfg *tls.Config, clientOpts ...ClientOption) (*FacadeClient, error) {
 	opts, err := dialOptions(cfg)
 	if err != nil {
 		return nil, err
@@ -251,7 +270,11 @@ func DialFacade(addr string, cfg *tls.Config) (*FacadeClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FacadeClient{conn: conn, c: pb.NewVMServiceClient(conn)}, nil
+	c := &FacadeClient{conn: conn, c: pb.NewVMServiceClient(conn), prober: vmlib.TCPProber, poll: time.Second}
+	for _, o := range clientOpts {
+		o(c)
+	}
+	return c, nil
 }
 
 func (c *FacadeClient) Close() error { return c.conn.Close() }
