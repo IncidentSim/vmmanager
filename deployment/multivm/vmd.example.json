@@ -14,7 +14,7 @@
       "ssh_user": "root",
       "min_free_mib": 1024,
       "max_total_mem_mib": 1024,
-      "max_total_vcpu": 1,
+      "max_total_vcpu": 2,
       "unit_mem_limit_mib": 768,
       "vmm_overhead_mib": 64,
       "profiles": [

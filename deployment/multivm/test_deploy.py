@@ -208,7 +208,9 @@ class UnitContractTests(unittest.TestCase):
             self.assertLessEqual(p["mem_mib"], cfg["max_total_mem_mib"])
         # slice budget: aggregate guests must fit the legacy 2 GiB shared slice
         self.assertLessEqual(cfg["max_total_mem_mib"], 2048)
-        self.assertLessEqual(cfg["max_total_vcpu"], 1)
+        # max_total_vcpu counts VIRTUAL CPUs for admission; execution is still capped
+        # by the slice's CPUQuota=100% (one CPU of time). It must admit max_vms guests.
+        self.assertGreaterEqual(cfg["max_total_vcpu"], cfg["max_vms"] * cfg["profiles"][0]["vcpu"])
 
     def test_runtime_tree_is_root_owned_and_only_the_lock_is_client_writable(self):
         rows = [l.split() for l in (HERE / "firecracker-vms.tmpfiles.conf").read_text().splitlines()

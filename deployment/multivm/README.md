@@ -57,8 +57,11 @@ and each profile must satisfy `mem_mib + vmm_overhead_mib <= unit_mem_limit_mib`
 `deployment/resources.md`), so that 2 GiB / 1 CPU is shared with the legacy VMM,
 not multiplied. The slice is a ceiling that kills on overrun; `vmd` is what refuses
 excess work earlier. Keep `max_total_mem_mib` plus VMM overhead and any legacy guest
-inside 2 GiB; do not run a legacy build concurrently. With one vCPU of quota, two
-guests share it.
+inside 2 GiB; do not run a legacy build concurrently. `max_total_vcpu` counts
+**virtual** CPUs for admission (the shipped `2` lets two 1-vCPU guests run
+concurrently, which the integration flow needs); it is not a CPU-time budget. Actual
+execution stays bounded by the slice's `CPUQuota=100%` (one CPU of time shared by
+both guests), so concurrent guests are slower, not blocked.
 
 ## Storage
 

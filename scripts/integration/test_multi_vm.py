@@ -4,6 +4,7 @@ A fake vmctl enforces max_vms=2 exactly like the real backend (a stopped VM keep
 its lease until deleted) and a fake ssh keeps per-VM "disk" state. This proves the
 script's ORDER and admission behaviour only; it boots nothing.
 """
+import json
 import os
 import subprocess
 import tempfile
@@ -11,6 +12,14 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "multi-vm.sh"
+EXAMPLE = Path(__file__).resolve().parents[2] / "deployment" / "multivm" / "vmd.example.json"
+
+
+def shipped_cap():
+    """How many guests the SHIPPED vmd policy admits at once."""
+    cfg = json.loads(EXAMPLE.read_text())["backend"]["local"]
+    p = cfg["profiles"][0]
+    return min(cfg["max_vms"], cfg["max_total_vcpu"] // p["vcpu"], cfg["max_total_mem_mib"] // p["mem_mib"])
 
 FAKE_VMCTL = r'''#!/usr/bin/env bash
 set -euo pipefail
@@ -74,7 +83,9 @@ esac
 
 
 class IntegrationScriptTests(unittest.TestCase):
-    def run_script(self, max_vms=2, confirm=True):
+    def run_script(self, max_vms=None, confirm=True):
+        if max_vms is None:
+            max_vms = shipped_cap()
         d = tempfile.mkdtemp()
         state = Path(d, "state")
         state.mkdir()
@@ -105,8 +116,11 @@ class IntegrationScriptTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(calls, [])
 
-    def test_runs_under_a_two_vm_cap_by_deleting_the_committed_source_first(self):
-        proc, calls, state = self.run_script(max_vms=2)
+    def test_shipped_policy_admits_the_two_descendants_the_flow_needs(self):
+        self.assertGreaterEqual(shipped_cap(), 2, "the shipped example policy cannot run two simultaneous VMs")
+
+    def test_runs_under_the_shipped_cap_by_deleting_the_committed_source_first(self):
+        proc, calls, state = self.run_script()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         verbs = [c.split()[1] for c in calls if c.startswith("vmctl")]
         delete_src = next(i for i, c in enumerate(calls) if c.startswith("vmctl delete") and "-src" in c)

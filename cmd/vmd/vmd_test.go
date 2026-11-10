@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -161,5 +162,44 @@ func TestRunCombinedModeEndToEnd(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("vmd did not stop on context cancel")
+	}
+}
+
+// Finding 5: the policy we SHIP must actually admit the two concurrent guests the
+// integration flow needs (and refuse a third). This loads the real example file.
+func TestShippedExamplePolicyAdmitsTwoSimultaneousVMsAndRejectsAThird(t *testing.T) {
+	data, err := os.ReadFile("../../deployment/multivm/vmd.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := parseConfig(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := *cfg.Backend.Local
+	d := t.TempDir()
+	os.Chmod(d, 0o755)
+	l.WorkRoot, l.ImagesDir, l.RunDir = filepath.Join(d, "work"), filepath.Join(d, "images"), filepath.Join(d, "run")
+	l.StorageMount, l.PoolConf = "", "" // host-specific; covered by the backend tests
+	for _, p := range []string{l.WorkRoot, l.ImagesDir, l.RunDir} {
+		os.MkdirAll(p, 0o700)
+	}
+	os.WriteFile(filepath.Join(l.RunDir, ".backend.lock"), nil, 0o600)
+	os.WriteFile(filepath.Join(l.ImagesDir, "base.ext4"), []byte("BASE"), 0o444)
+	uid := uint32(os.Getuid())
+	b, err := buildLocal(&l, deps{Launcher: fakeLauncher{}, VMM: fakeVMM{run: l.RunDir}, TrustedOwnerUID: &uid, TrustedAncestorRoot: d})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	prof := l.Profiles[0].Name
+	ctx := context.Background()
+	for _, id := range []string{"v1", "v2"} {
+		if _, err := b.Prepare(ctx, vmlib.PrepareRequest{VMID: id, ImageID: "base", Profile: prof}); err != nil {
+			t.Fatalf("the shipped policy refuses concurrent VM %s: %v", id, err)
+		}
+	}
+	if _, err := b.Prepare(ctx, vmlib.PrepareRequest{VMID: "v3", ImageID: "base", Profile: prof}); !errors.Is(err, vmlib.ErrResourceExhausted) {
+		t.Fatalf("a third VM must be refused: %v", err)
 	}
 }
