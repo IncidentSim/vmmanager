@@ -3,7 +3,8 @@
 ## Install and start outside the application
 
 Prepare the base image, SSH key, static Firecracker executable and matching kernel
-in `assets/` first. The host must have KVM/TUN and IPv4 forwarding enabled. The
+in `assets/` first using the explicit administrator command
+`sudo ask-exec bash deployment/prepare-ubuntu.sh` from the repository root. The host must have KVM/TUN and IPv4 forwarding enabled. The
 network helper refuses an unrelated existing `tap-fcpg` or `172.16.0.0/30` route.
 
 ```bash
@@ -58,7 +59,7 @@ the same completion guarantee to this example client.
 
 ```bash
 ./image-builder -socket /run/firecracker-builder/main.sock -output images/new.ext4
-FC_SOCKET=/run/firecracker-builder/main.sock bash run-image.sh images/new.ext4
+make run FC_SOCKET=/run/firecracker-builder/main.sock IMAGE=images/new.ext4
 ```
 
 If the socket is unavailable or the VMM is busy, the client errors before copying

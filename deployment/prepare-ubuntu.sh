@@ -2,8 +2,8 @@
 # Linux x86_64 only. Downloads Firecracker and its upstream CI Ubuntu rootfs,
 # injects a demo SSH key and creates an ext4 disk for the Go image builder.
 set -euo pipefail
-cd "$(dirname "$0")"
-[[ $(id -u) == 0 ]] || { echo 'Run via sudo ask-exec bash ./prepare-ubuntu.sh' >&2; exit 1; }
+cd "$(dirname "$0")/.."
+[[ $(id -u) == 0 ]] || { echo 'Run via sudo ask-exec bash deployment/prepare-ubuntu.sh' >&2; exit 1; }
 
 if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
   echo 'This example requires an x86_64 Linux host.' >&2

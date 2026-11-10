@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot a disposable workspace copy through the unprivileged service client.
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 IMAGE=${1:-images/ubuntu-postgres.ext4}
 SOCKET=${FC_SOCKET:-/run/firecracker-builder/main.sock}
 [[ -f "$IMAGE" ]] || { echo "Image not found: $IMAGE" >&2; exit 1; }

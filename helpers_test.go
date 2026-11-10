@@ -7,7 +7,7 @@ import (
 )
 
 func TestHelpersUseOnlySocketAndPreflightCopies(t *testing.T) {
-	for _, name := range []string{"run-image.sh", "verify-image.py", "demo-lifecycle.sh"} {
+	for _, name := range []string{"scripts/run-image.sh", "verify-image.py", "scripts/demo-lifecycle.sh"} {
 		b, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
@@ -19,7 +19,7 @@ func TestHelpersUseOnlySocketAndPreflightCopies(t *testing.T) {
 		if !strings.Contains(text, "FC_SOCKET") || !strings.Contains(text, "-socket") {
 			t.Errorf("%s missing socket option", name)
 		}
-		if name == "run-image.sh" {
+		if name == "scripts/run-image.sh" {
 			check := strings.Index(text, "--check-ready")
 			copy := strings.Index(text, "cp --reflink")
 			if check < 0 || check > copy {
@@ -30,7 +30,7 @@ func TestHelpersUseOnlySocketAndPreflightCopies(t *testing.T) {
 }
 
 func TestImageHelpersUseServiceRunner(t *testing.T) {
-	for _, name := range []string{"run-image.sh", "verify-image.py"} {
+	for _, name := range []string{"scripts/run-image.sh", "verify-image.py"} {
 		b, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)

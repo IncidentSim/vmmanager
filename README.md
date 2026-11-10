@@ -20,7 +20,7 @@ below run as **amnezia**, without sudo. The service runs permanently in the
 background, with `Restart=always`, `RestartSec=1`, `RemainAfterExit=no` and
 `RuntimeDirectoryPreserve=restart`. The client only connects to an existing API
 socket: it never starts, stops, restarts or inspects host services. Networking
-is a deployment concern. Do not run `network.sh` from clients.
+is a deployment concern. Do not run `deployment/network.sh` from clients.
 
 - Host API socket: `/run/firecracker-builder/main.sock`, root:amnezia and group
   writable. This socket is privileged: only trusted local clients may access it.
@@ -42,18 +42,18 @@ static TAP/MAC/IP and demo SSH credentials, not a multi-tenant build platform.
 
 ## Build and use
 
-Requirements: installed deployment, Go 1.22+, Python 3, OpenSSH client, coreutils,
+Requirements: installed deployment, Go 1.22+, Make, Python 3, OpenSSH client, coreutils,
 working host KVM, guest Internet access, and sufficient disk space. Prepare a
 matching Ubuntu base rootfs and SSH key in `assets/` using the administrator's
-artifact preparation workflow (`prepare-ubuntu.sh`); ensure these resulting
+artifact preparation workflow (`deployment/prepare-ubuntu.sh`); ensure these resulting
 files are accessible to amnezia. Install the matching kernel in the fixed
 service location during deployment.
 
 ```bash
-go build -o image-builder .
+make build
 ./image-builder -base assets/ubuntu-base.ext4 -ssh-key assets/id_ed25519 \
   -socket /run/firecracker-builder/main.sock -output images/ubuntu-postgres.ext4
-bash ./run-image.sh images/ubuntu-postgres.ext4
+make run IMAGE=images/ubuntu-postgres.ext4
 ```
 
 The builder first checks the existing API with a 2-second timeout and requires
@@ -67,7 +67,7 @@ to a temporary file **in the output directory**, syncs it, and atomically rename
 it with no-replace semantics. Workspace and output may be different filesystems.
 An existing output, even one created concurrently, is never overwritten.
 
-The shell wrapper makes its own disposable workspace copy. From another terminal:
+`make run` calls `scripts/run-image.sh`, which makes its own disposable workspace copy. From another terminal:
 
 ```bash
 ssh -i assets/id_ed25519 -o StrictHostKeyChecking=accept-new root@172.16.0.2
@@ -94,7 +94,7 @@ this is a trusted-user service, not per-user authorization or a public API.
 On the Linux builder host, as the normal unprivileged application user:
 
 ```bash
-go build -o image-builder .
+make build
 ./image-builder -serve -listen 0.0.0.0:19443 \
   -tls-ca /secure/ca.pem -tls-cert /secure/server.pem -tls-key /secure/server.key \
   -job-dir /home/amnezia/build-jobs \
@@ -113,7 +113,7 @@ Firewalling, PKI issuance/rotation and process supervision remain operator tasks
 On macOS or another client machine (standard library only, no KVM dependencies):
 
 ```bash
-go build -o remote-client ./cmd/remote-client
+make remote-client
 ./remote-client -endpoint https://builder.example:19443 \
   -tls-ca /secure/ca.pem -tls-cert /secure/client.pem -tls-key /secure/client.key
 # Add -output ./ubuntu-postgres.ext4 to download after success.
@@ -213,11 +213,13 @@ systemctl --no-ask-password show \
 ## Verification
 
 ```bash
-go test -race -cover ./...
-go vet ./...
-python3 -m unittest -v test_verify_image.py
-bash -n run-image.sh demo-lifecycle.sh
+make check
 ```
+
+`make check` runs Go race/coverage tests, Python tests (including temporary mTLS
+certificate generation), Go vet and Bash syntax checks. It needs OpenSSL 3 but
+does not start a VM or modify host services. `make run`, `make verify` and
+`make demo` rebuild the local runner and use the already-deployed VMM.
 
 Unit tests need neither root nor KVM: they check jail path validation, file
 permissions, stable locking, per-process receipts/cleanup/cancellation, official SDK
@@ -227,11 +229,10 @@ The Python subprocess regression sends real SIGTERM and verifies runner cleanup.
 Real KVM integration, after deployment and image creation:
 
 ```bash
-python3 ./verify-image.py
-# Optional:
-FC_VERIFY_IMAGE=images/ubuntu-postgres.ext4 \
-FC_VERIFY_REPORT=verification.json python3 ./verify-image.py
-bash ./demo-lifecycle.sh
+make verify
+# Optional image/report/socket overrides:
+FC_VERIFY_REPORT=verification.json make verify IMAGE=images/ubuntu-postgres.ext4
+make demo
 ```
 
 The verifier runs unprivileged, copies the image into the shared workspace,

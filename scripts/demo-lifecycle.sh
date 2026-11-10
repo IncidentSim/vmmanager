@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run as the authorized unprivileged user after service installation.
 set -Eeuo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 SOCKET=${FC_SOCKET:-/run/firecracker-builder/main.sock}
 OUT="$PWD/images/ubuntu-postgres-demo.ext4"
 REPORT="$PWD/recordings/demo-verification.json"

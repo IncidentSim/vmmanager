@@ -232,7 +232,7 @@ sync
 		return err
 	}
 	fmt.Printf("Built %s\n", output)
-	fmt.Println("Boot a disposable copy with run-image.sh; the service supplies the fixed guest kernel.")
+	fmt.Println("Boot a disposable copy with make run IMAGE=path/to/image.ext4; the service supplies the fixed guest kernel.")
 	return nil
 }
 

@@ -1,6 +1,7 @@
 assets/
 images/
 image-builder
+/remote-client
 verification.json
 verification-sdk.json
 verification-systemd.json
