@@ -128,6 +128,25 @@ Stop/Commit and Delete/Delete converge on one underlying action and return the
 same result. Resource admission is atomic and cap-bounded (a VM slot count and
 aggregate memory/vCPU budget), so races cannot over-allocate or reuse a TAP/IP.
 
+**Settled-creation barrier (added with ADR 0002).** `Get` never answers
+`NotFound` for a VM whose Create is still running or whose identity is retained;
+it reports `preparing`/retained. `Delete` first validates the ID and then
+**reserves it atomically under the Service lock at the start (Delete intent)**: from
+that moment no successor Create for the ID is admitted, even if this Delete later
+fails or is cancelled. It then waits on the VM's operation lock (re-checking under
+the Service lock that no Create raced the lookup), so a successful `Delete` proves
+any in-flight Create has settled and that no same-ID replacement can be mistaken
+for the record it captured (no ABA). Reservations are non-expiring in-memory
+tombstones: IDs are single-use per `Service` instance and forgotten on restart; a
+later Create is refused with `ErrAlreadyExists`. Only syntactically valid IDs are
+recorded, but memory grows by one small entry per distinct ID a (trusted) operator
+ever deletes; this trade-off is accepted because expiry would reopen the
+resurrection window. A settled record whose VM the backend
+no longer knows is cleared by `Delete`. An ambiguous `Prepare` failure is released
+only when the backend reports the VM as prepared; otherwise the record stays
+retained and `Delete` keeps returning `ErrRetained` (an outstanding backend
+Prepare cannot be cancelled by this protocol; recovery is operator-driven).
+
 **Retained unsafe disks are explicit.** Any path where identity, shutdown or
 configuration is uncertain sets `retained=true` with a reason and holds the
 lease; Delete returns a typed `ErrRetained`. Nothing frees a disk on uncertain

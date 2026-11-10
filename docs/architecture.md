@@ -17,6 +17,7 @@ Plan: [`plans/vm-library.md`](plans/vm-library.md).
 | `cmd/vmctl` | facade CLI client (JSON, `ssh`/Ansible output) | no |
 | `cmd/vm-launcher` | per-slot launcher + receipt writer (proposed, runs in jail) | host |
 | `cmd/vm-helper`, `cmd/vm-helper-client` | root side / unprivileged side of the one-request `start-slot N` boundary (proposed) | host |
+| `cmd/vmbot`, `internal/vmbot` | Telegram single-VM bot + capability-link ttyd terminal, a normal facade client ([ADR 0002](adr/0002-telegram-single-vm-bot.md), [`vmbot.md`](vmbot.md)) | no |
 | `internal/vmhelper` | protocol, strict `pool.conf` parsing, idle-unit-only handler | no |
 | `examples/pgprovision` | PostgreSQL provisioning as an application over `Lifecycle` | no |
 

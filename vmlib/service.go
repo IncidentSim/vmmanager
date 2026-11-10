@@ -48,6 +48,14 @@ type Service struct {
 
 	mu   sync.Mutex
 	recs map[string]*record
+	// tombs holds every (validated) ID for which Delete was ever attempted,
+	// whether it later succeeded, failed or was cancelled. Entries never expire
+	// for the lifetime of this Service: once Delete has started, that ID can never
+	// be admitted by Create again, so a delayed, retried or successor Create
+	// cannot resurrect it or make Delete act on a stale record. IDs are therefore
+	// single-use per Service instance (one small map entry per Delete-d ID). The
+	// set is in memory only: a Service restart forgets it.
+	tombs map[string]struct{}
 }
 
 var _ Lifecycle = (*Service)(nil)
@@ -67,6 +75,11 @@ type record struct {
 	clean        bool
 	neverStarted bool
 	deleted      bool
+	creating     bool // Create has not settled: the backend may not know the VM yet
+	// uncertainPrepare: Prepare failed ambiguously and the backend gave no proof
+	// that the request settled. The identity is kept (retained) and is never
+	// cleared merely because the backend reports NotFound.
+	uncertainPrepare bool
 }
 
 func (r *record) lock(ctx context.Context) error {
@@ -84,7 +97,7 @@ func NewService(b Backend, opts ...Option) (*Service, error) {
 	if b == nil {
 		return nil, fmt.Errorf("%w: nil backend", ErrInvalidArgument)
 	}
-	s := &Service{b: b, prober: TCPProber, poll: time.Second, recs: map[string]*record{}}
+	s := &Service{b: b, prober: TCPProber, poll: time.Second, recs: map[string]*record{}, tombs: map[string]struct{}{}}
 	for _, o := range opts {
 		o(s)
 	}
@@ -111,6 +124,10 @@ func (r *record) snapshot() VM {
 	vm.Labels = copyLabels(vm.Labels)
 	return vm
 }
+
+func (r *record) isCreating() bool { r.st.Lock(); defer r.st.Unlock(); return r.creating }
+
+func (r *record) isUncertainPrepare() bool { r.st.Lock(); defer r.st.Unlock(); return r.uncertainPrepare }
 
 func (r *record) isDeleted() bool { r.st.Lock(); defer r.st.Unlock(); return r.deleted }
 
@@ -225,15 +242,21 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (VM, error) {
 	}
 	rec := newRecord(VM{ID: req.ID, ImageID: req.ImageID, Profile: req.Profile, State: StatePreparing, Labels: copyLabels(req.Labels)})
 	rec.keyRef = req.SSHKeyReference
+	rec.creating = true
 	s.mu.Lock()
 	if _, ok := s.recs[req.ID]; ok {
 		s.mu.Unlock()
 		return VM{}, fmt.Errorf("%w: vm %s", ErrAlreadyExists, req.ID)
 	}
+	if _, dead := s.tombs[req.ID]; dead {
+		s.mu.Unlock()
+		return VM{}, fmt.Errorf("%w: vm %s was already deleted (IDs are single-use per Service)", ErrAlreadyExists, req.ID)
+	}
 	rec.op <- struct{}{} // held until creation finishes
 	s.recs[req.ID] = rec
 	s.mu.Unlock()
 	defer rec.unlock()
+	defer rec.mutate(func(r *record) { r.creating = false }) // runs before unlock: settled
 	drop := func() {
 		rec.mutate(func(r *record) { r.deleted = true })
 		s.mu.Lock()
@@ -251,13 +274,25 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (VM, error) {
 
 	host, err := s.b.Prepare(ctx, PrepareRequest{VMID: req.ID, ImageID: req.ImageID, Profile: req.Profile, SSHPublicKey: req.SSHPublicKey})
 	if err != nil {
-		drop()
-		if !errors.Is(err, ErrInvalidArgument) && !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrResourceExhausted) && !errors.Is(err, ErrAlreadyExists) {
-			dctx, cancel := detached(ctx) // ambiguous transport failure: free only if never started
-			_, _ = s.b.Release(dctx, req.ID)
-			cancel()
+		if errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrResourceExhausted) || errors.Is(err, ErrAlreadyExists) {
+			drop() // definitive refusal: nothing was prepared
+			return VM{}, err
 		}
-		return VM{}, err
+		// Ambiguous transport failure: the Prepare request may still be running
+		// on the backend, so neither Inspect NotFound nor a Release that reports
+		// "already released" proves anything. Only a VM the backend actually
+		// reports, still prepared and not started, can be released with proof.
+		dctx, cancel := detached(ctx)
+		defer cancel()
+		if h, ierr := s.b.Inspect(dctx, req.ID); ierr == nil && h.State == HostPrepared && !h.Retained {
+			if res, rerr := s.b.Release(dctx, req.ID); rerr == nil && res.Released {
+				drop()
+				return VM{}, err
+			}
+		}
+		rec.mutate(func(r *record) { r.uncertainPrepare = true })
+		retain(StateFailed, "prepare outcome uncertain; no backend proof it settled (operator recovery required)")
+		return rec.snapshot(), err
 	}
 	rec.apply(host)
 	if err := ctx.Err(); err != nil {
@@ -324,6 +359,13 @@ func (s *Service) refresh(ctx context.Context, rec *record) error {
 	ver := rec.version() // the read is only applied if no operation overtakes it
 	h, err := s.b.Inspect(ctx, id)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) && (rec.isCreating() || rec.snapshot().Retained) {
+			// Create is still running, or its outcome is unconfirmed and the
+			// identity is retained: the VM must stay visible even though the
+			// backend does not know it (yet). NotFound would be a false proof;
+			// only Delete may settle it.
+			return nil
+		}
 		return err
 	}
 	rec.applyIfUnchanged(h, ver)
@@ -515,18 +557,48 @@ func (s *Service) Commit(ctx context.Context, id, newImageID string) (Image, err
 // Delete stops the VM if needed and frees its disk and leases only when exit is
 // proven. Otherwise it reports the disk as retained with ErrRetained.
 func (s *Service) Delete(ctx context.Context, id string) (DeleteResult, error) {
-	rec, err := s.lookup(ctx, id)
-	if errors.Is(err, ErrNotFound) {
-		return DeleteResult{Deleted: true, Detail: "already deleted"}, nil
-	}
-	if err != nil {
+	if err := ValidateID("vm", id); err != nil {
 		return DeleteResult{}, err
 	}
+	// Delete INTENT spends the ID: from here no successor Create may be admitted,
+	// even if this Delete later fails or is cancelled. Without this a Create that
+	// settles and drops its record while we wait on its lock could be followed by
+	// a same-ID replacement, and we would "delete" the stale record (ABA). The
+	// Only syntactically valid IDs are recorded, but the map is NOT bounded by
+	// the number of VMs: a (trusted) operator calling Delete on arbitrarily many
+	// distinct valid IDs grows it by one small entry each for the Service's
+	// lifetime. This is a deliberate trade-off: expiring entries would reopen the
+	// resurrection window. s.mu is a leaf lock (never held across a record lock or
+	// backend call), so this cannot deadlock.
+	s.mu.Lock()
+	s.tombs[id] = struct{}{}
+	s.mu.Unlock()
+	rec, err := s.lookup(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		// lookup found no record and the backend does not know the VM, but a
+		// Create may have inserted its record since. Decide atomically with the
+		// same lock Create uses to insert and to check tombstones.
+		s.mu.Lock()
+		rec = s.recs[id]
+		if rec == nil {
+			s.tombs[id] = struct{}{}
+			s.mu.Unlock()
+			return DeleteResult{Deleted: true, Detail: "already deleted"}, nil
+		}
+		s.mu.Unlock()
+	} else if err != nil {
+		return DeleteResult{}, err
+	}
+	// Barrier: waits for an in-flight Create (or any other operation) on this VM
+	// to settle before anything is decided.
 	if err := rec.lock(ctx); err != nil {
 		return DeleteResult{}, err
 	}
 	defer rec.unlock()
 	if rec.isDeleted() {
+		s.mu.Lock()
+		s.tombs[id] = struct{}{}
+		s.mu.Unlock()
 		return DeleteResult{Deleted: true, Detail: "already deleted"}, nil
 	}
 	retain := func(reason string) (DeleteResult, error) {
@@ -534,6 +606,17 @@ func (s *Service) Delete(ctx context.Context, id string) (DeleteResult, error) {
 		return DeleteResult{Retained: true, Detail: reason}, fmt.Errorf("%w: %s", ErrRetained, reason)
 	}
 	if err := s.stopLocked(ctx, rec); err != nil {
+		if errors.Is(err, ErrNotFound) && !rec.isUncertainPrepare() {
+			// Creation has settled (we hold the operation lock) and the backend
+			// has no such VM: nothing to free. Forget the record. (An ambiguous
+			// Prepare is excluded: for it NotFound is not proof.)
+			rec.mutate(func(r *record) { r.deleted = true; r.vm.State = StateDeleted })
+			s.mu.Lock()
+			delete(s.recs, id)
+			s.tombs[id] = struct{}{}
+			s.mu.Unlock()
+			return DeleteResult{Deleted: true, Detail: "not present on backend"}, nil
+		}
 		if exited, _, _ := rec.exitInfo(); !exited {
 			return retain(err.Error())
 		}
@@ -548,6 +631,7 @@ func (s *Service) Delete(ctx context.Context, id string) (DeleteResult, error) {
 	rec.mutate(func(r *record) { r.deleted = true; r.vm.State = StateDeleted })
 	s.mu.Lock()
 	delete(s.recs, id)
+	s.tombs[id] = struct{}{}
 	s.mu.Unlock()
 	return DeleteResult{Deleted: true, Detail: res.Detail}, nil
 }

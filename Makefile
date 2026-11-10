@@ -6,7 +6,7 @@ BUILD_DIR ?= .
 IMAGE ?= images/ubuntu-postgres.ext4
 FC_SOCKET ?= /run/firecracker-builder/main.sock
 
-.PHONY: build remote-client test vet check shell-syntax run verify demo proto proto-check consumer-smoke verify-units vmd vmctl vm-launcher vm-helper vm-helper-client
+.PHONY: build remote-client test vet check shell-syntax run verify demo proto proto-check consumer-smoke verify-units vmd vmctl vm-launcher vm-helper vm-helper-client vmbot
 
 build:
 	mkdir -p "$(BUILD_DIR)"
@@ -27,7 +27,7 @@ shell-syntax:
 	@for script in scripts/*.sh scripts/integration/*.sh deployment/*.sh deployment/multivm/*.sh; do bash -n "$$script" || exit; done
 
 # New multi-VM applications (build only; no install, no sudo).
-vmd vmctl vm-launcher vm-helper vm-helper-client:
+vmd vmctl vm-launcher vm-helper vm-helper-client vmbot:
 	mkdir -p "$(BUILD_DIR)"
 	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/$@" ./cmd/$@
 
