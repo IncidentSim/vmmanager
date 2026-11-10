@@ -1,10 +1,11 @@
-# Multi-VM deployment (PROPOSED source only)
+# Multi-VM deployment templates
 
-Nothing here has been installed or run on a host. Every step needs explicit
-operator approval. It is **separate** from the active legacy
-`firecracker-builder@main.service`, which stays untouched.
+These deployment templates require explicit operator approval before installation.
+The reference deployment has been activated and exercised with real guests; see
+[the live verification report](../../docs/verification-live.md). It is **separate**
+from the active legacy `firecracker-builder@main.service`, which stays untouched.
 
-| | legacy (active) | multi-VM (proposed) |
+| | legacy | multi-VM |
 |---|---|---|
 | VMM unit | `firecracker-builder@main` | `firecracker-vm@N` (one VMM process per slot, `Restart=no`) |
 | network | `firecracker-builder-network` | `firecracker-vm-network@N` (host-root oneshot per slot) |
@@ -108,8 +109,8 @@ lock file is unsafe. After the first VM start, check as an operator:
 
 ```sh
 stat -c '%U:%G %a %n' /run/firecracker-vms /run/firecracker-vms/slot-* /run/firecracker-vms/slot-*/*.exit.json
-# expect root:root 755 / root:<group> 750 / root:* 640 -- systemd's handling of
-# RuntimeDirectory= sub-directories was not exercised by the author.
+# expect root:root 755 / root:<group> 750 / root:* 640; these modes were
+# confirmed on the reference host, but verify them after each new installation.
 ```
 
 ## Restart behaviour of vmd
@@ -129,7 +130,8 @@ remove the new units, helpers and directories. Legacy service/CLI are unaffected
 
 ## Limits (honest)
 
-* The unit and network script have only been syntax/dependency-verified, not run.
+* Units, the helper and networking have been exercised on the reference host;
+  other deployments still need their own runtime checks (see the live report).
 * Operator procedure for a retained VM whose launch outcome is unknown: confirm
   with `systemctl status firecracker-vm@N` that no unit is active, then remove that
   workspace directory by hand; `vmd` will not discard it for you.

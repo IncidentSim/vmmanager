@@ -3,7 +3,7 @@
 ## Automated (`make check`, no root, no KVM)
 
 `make check` runs `go test -race -cover ./...`, the Python unit tests (legacy
-verifier/layout/mTLS and `deployment/multivm/test_helper.py`), `go vet`, `bash -n`
+verifier/layout/mTLS, `deployment/multivm/test_deploy.py` and the offline integration-script tests), `go vet`, `bash -n`
 on all scripts, and `make proto-check` (regenerates protobuf with pinned tools and
 fails if committed code differs).
 
@@ -43,7 +43,7 @@ fails if committed code differs).
 * The privilege path by which `vmd` may invoke the helper (operator-defined).
 * Multi-tenant isolation (a non-goal) or host-key pinning.
 
-## Operator-run integration (requires approval; not executed by the author)
+## Operator-run integration (requires approval)
 
 After the operator installs the proposed units/helper and starts `vmd`:
 
@@ -59,8 +59,10 @@ bash scripts/integration/multi-vm.sh
 It checks: boot -> SSH -> external mutation -> stop -> commit new image ->
 overwrite refused -> two independent VMs -> persisted marker in both -> breakage
 in one does not affect the other -> distinct addresses -> base hash unchanged.
-Record the output with date and host in your own notes; this repository does not
-claim it passes.
+The real scenario has passed on the reference deployment. See
+[live verification report](verification-live.md) for the exercised configuration,
+evidence, deployment-discovered fixes and remaining boundaries. Other deployments
+still need their own run.
 
 ## Also verify on the host before trusting resource limits
 
