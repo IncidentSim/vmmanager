@@ -139,10 +139,16 @@ const (
 )
 
 type meta struct {
-	ID         string `json:"id"`
-	ImageID    string `json:"image_id"`
-	Profile    string `json:"profile"`
-	Slot       int    `json:"slot"`
+	ID      string `json:"id"`
+	ImageID string `json:"image_id"`
+	Profile string `json:"profile"`
+	Slot    int    `json:"slot"`
+	// MemMiB and VCPU are the reservation the VM was ADMITTED with. They are
+	// persisted so a later edit of the profile (or its removal) cannot change what
+	// a live VM is counted or configured as. Zero = metadata from before
+	// reservations existed; reconcile fills it conservatively.
+	MemMiB     uint32 `json:"mem_mib,omitempty"`
+	VCPU       uint32 `json:"vcpu,omitempty"`
 	State      string `json:"state"`
 	Invocation string `json:"invocation,omitempty"`
 	Retained   bool   `json:"retained,omitempty"`
@@ -175,6 +181,11 @@ type Backend struct {
 	closing   bool
 	closeCh   chan struct{} // closed when Close begins; wakes blocking waits
 	closeDone chan struct{} // closed once the locks are released
+
+	publishing map[string]struct{} // target image ids with a publisher in flight (guarded by mu)
+
+	// hookPublishAfterMarker is a test seam between marker creation and the copy.
+	hookPublishAfterMarker func(newID string)
 
 	// hookAfterLookup is a test seam between entry lookup and lock acquisition.
 	hookAfterLookup func(id string)
@@ -337,7 +348,7 @@ func New(cfg Config) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open runtime directory: %w", err)
 	}
-	b := &Backend{cfg: cfg, runFD: runFD, entries: map[string]*entry{}, closeCh: make(chan struct{}), closeDone: make(chan struct{})}
+	b := &Backend{cfg: cfg, runFD: runFD, entries: map[string]*entry{}, closeCh: make(chan struct{}), closeDone: make(chan struct{}), publishing: map[string]struct{}{}}
 	b.gcond = sync.NewCond(&b.gmu)
 	sorted := append([]string(nil), roots...)
 	sort.Strings(sorted) // fixed order avoids lock-order deadlock between owners
@@ -454,6 +465,15 @@ func (b *Backend) reconcile() error {
 			continue
 		}
 		e := &entry{m: m}
+		if e.m.MemMiB == 0 || e.m.VCPU == 0 {
+			lm, lv := b.largestProfile()
+			if e.m.MemMiB == 0 {
+				e.m.MemMiB = lm
+			}
+			if e.m.VCPU == 0 {
+				e.m.VCPU = lv
+			}
+		}
 		switch m.State {
 		case stateLaunching, stateConfiguring, stateRunning, stateExiting:
 			if _, done, _ := b.readReceipt(m); done {
@@ -630,18 +650,33 @@ func copyFile(src, dst string) error {
 
 // ---- admission ---------------------------------------------------------------
 
-func (b *Backend) leasedLocked() (mem, vcpu uint32) {
-	for _, e := range b.entries {
-		p, ok := b.profile(e.m.Profile)
-		if !ok { // profile removed from policy: count the largest, never zero
-			for _, q := range b.cfg.Profiles {
-				if q.MemMiB > p.MemMiB {
-					p = q
-				}
-			}
+// largestProfile is the conservative stand-in for a reservation we cannot read.
+func (b *Backend) largestProfile() (mem, vcpu uint32) {
+	for _, q := range b.cfg.Profiles {
+		if q.MemMiB > mem {
+			mem = q.MemMiB
 		}
-		mem += p.MemMiB
-		vcpu += p.VCPU
+		if q.VCPU > vcpu {
+			vcpu = q.VCPU
+		}
+	}
+	return
+}
+
+// leasedLocked sums the PERSISTED reservations of every leased VM (retained ones
+// included). A VM without a reservation counts at the largest current profile.
+func (b *Backend) leasedLocked() (mem, vcpu uint32) {
+	lm, lv := b.largestProfile()
+	for _, e := range b.entries {
+		m, v := e.m.MemMiB, e.m.VCPU
+		if m == 0 {
+			m = lm
+		}
+		if v == 0 {
+			v = lv
+		}
+		mem += m
+		vcpu += v
 	}
 	return
 }
@@ -722,7 +757,8 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 			b.mu.Unlock()
 			return vmlib.HostVM{}, fmt.Errorf("%w: insufficient workspace storage", vmlib.ErrResourceExhausted)
 		}
-		e = &entry{m: meta{ID: req.VMID, ImageID: req.ImageID, Profile: req.Profile, Slot: slot, State: statePreparing}}
+		e = &entry{m: meta{ID: req.VMID, ImageID: req.ImageID, Profile: req.Profile, Slot: slot, State: statePreparing,
+			MemMiB: prof.MemMiB, VCPU: prof.VCPU}}
 		e.mu.Lock()
 		b.entries[req.VMID] = e
 		b.mu.Unlock()
@@ -876,8 +912,6 @@ func (b *Backend) Start(ctx context.Context, id string) (vmlib.HostVM, error) {
 	if err := ctx.Err(); err != nil {
 		return vmlib.HostVM{}, err // nothing launched
 	}
-	prof, _ := b.profile(e.m.Profile)
-
 	e.m.State, e.m.Retained, e.m.Reason = stateLaunching, true, "launch requested; VMM identity not yet recorded"
 	if err := b.persist(&e.m); err != nil {
 		e.m.State, e.m.Retained, e.m.Reason = statePrepared, false, ""
@@ -900,7 +934,7 @@ func (b *Backend) Start(ctx context.Context, id string) (vmlib.HostVM, error) {
 	if err := b.mustPersist(e); err != nil {
 		return b.host(e.m), err
 	}
-	spec := MachineSpec{VCPU: prof.VCPU, MemMiB: prof.MemMiB, Kernel: "/kernel/vmlinux", BootArgs: "console=ttyS0 reboot=k panic=1 pci=off",
+	spec := MachineSpec{VCPU: e.m.VCPU, MemMiB: e.m.MemMiB, Kernel: "/kernel/vmlinux", BootArgs: "console=ttyS0 reboot=k panic=1 pci=off",
 		DiskJailPath: "/work/vms/" + id + "/disk.ext4", Tap: slotTap(e.m.Slot), MAC: b.slotMAC(e.m.Slot)}
 	if err := b.cfg.VMM.Configure(dctx, e.m.Slot, spec); err != nil {
 		e.m.Reason = "VMM configuration failed; disk retained: " + err.Error()
@@ -1078,6 +1112,20 @@ func (b *Backend) Publish(_ context.Context, id, newID string) (vmlib.Image, err
 	if err := vmlib.ValidateID("image", newID); err != nil {
 		return vmlib.Image{}, err
 	}
+	// Reserve the TARGET across all entries: two publishers of one image id must
+	// not share a marker, and a rollback may only remove its own artifacts.
+	b.mu.Lock()
+	if _, busy := b.publishing[newID]; busy {
+		b.mu.Unlock()
+		return vmlib.Image{}, fmt.Errorf("%w: image %s is being published by another operation", vmlib.ErrAlreadyExists, newID)
+	}
+	b.publishing[newID] = struct{}{}
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		delete(b.publishing, newID)
+		b.mu.Unlock()
+	}()
 	e, err := b.lockEntry(id)
 	if err != nil {
 		return vmlib.Image{}, staleToNotFound(id, err)
@@ -1113,6 +1161,9 @@ func (b *Backend) Publish(_ context.Context, id, newID string) (vmlib.Image, err
 	if merr != nil {
 		os.Remove(marker)
 		return vmlib.Image{}, fmt.Errorf("persist committed marker: %w", merr)
+	}
+	if b.hookPublishAfterMarker != nil {
+		b.hookPublishAfterMarker(newID)
 	}
 	published := false
 	defer func() {
