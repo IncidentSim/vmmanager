@@ -206,6 +206,8 @@ type Backend interface {
 	Inspect(ctx context.Context, vmID string) (HostVM, error)
 	List(ctx context.Context) ([]HostVM, error)
 	// RequestShutdown asks the guest to shut down gracefully; never kills.
+	// It may be retried while exiting/retained and must verify the ORIGINAL
+	// invocation identity on every attempt, refusing to act on a replacement.
 	RequestShutdown(ctx context.Context, vmID string) (HostVM, error)
 	// WaitExit returns only once the original VMM's exit receipt is valid.
 	WaitExit(ctx context.Context, vmID string) (ExitReceipt, error)

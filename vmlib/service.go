@@ -45,6 +45,10 @@ type Service struct {
 	b      Backend
 	prober SSHProber
 	poll   time.Duration
+	// Bound graceful shutdown even for callers without a deadline. Retry only
+	// guest-cooperative shutdown; identity and exit proof remain backend-owned.
+	shutdownTimeout time.Duration
+	shutdownRetry   time.Duration
 
 	mu   sync.Mutex
 	recs map[string]*record
@@ -97,7 +101,9 @@ func NewService(b Backend, opts ...Option) (*Service, error) {
 	if b == nil {
 		return nil, fmt.Errorf("%w: nil backend", ErrInvalidArgument)
 	}
-	s := &Service{b: b, prober: TCPProber, poll: time.Second, recs: map[string]*record{}, tombs: map[string]struct{}{}}
+	s := &Service{b: b, prober: TCPProber, poll: time.Second,
+		shutdownTimeout: 2 * time.Minute, shutdownRetry: 2 * time.Second,
+		recs: map[string]*record{}, tombs: map[string]struct{}{}}
 	for _, o := range opts {
 		o(s)
 	}
@@ -487,6 +493,8 @@ func (s *Service) stopLocked(ctx context.Context, rec *record) error {
 	if exited, _, _ := rec.exitInfo(); exited {
 		return s.exitError(rec)
 	}
+	ctx, cancel := context.WithTimeout(ctx, s.shutdownTimeout)
+	defer cancel()
 	id := rec.snapshot().ID
 	h, err := s.b.Inspect(ctx, id)
 	if err != nil {
@@ -499,16 +507,43 @@ func (s *Service) stopLocked(ctx context.Context, rec *record) error {
 		})
 		return nil
 	}
-	if h.State == HostRunning {
-		rec.mutate(func(r *record) { r.vm.State = StateStopping })
-		if _, err := s.b.RequestShutdown(ctx, id); err != nil {
-			return fmt.Errorf("request shutdown: %w", err)
-		}
-	}
 	rec.mutate(func(r *record) { r.vm.State = StateStopping })
-	receipt, err := s.b.WaitExit(ctx, id)
-	if err != nil {
-		return fmt.Errorf("exit receipt for %s not confirmed: %w", id, err)
+	var receipt ExitReceipt
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("exit receipt for %s not confirmed: %w", id, err)
+		}
+		// An accepted CAD can be ignored before guest init is ready. Exiting
+		// and retained VMs need the same retry as running ones. Every action
+		// goes through the backend's ORIGINAL invocation identity check; never
+		// signal a process directly or infer exit from a responding socket.
+		if h.State != HostExited {
+			if _, err := s.b.RequestShutdown(ctx, id); err != nil {
+				return fmt.Errorf("request shutdown: %w", err)
+			}
+		}
+		// Keep the receipt as the sole proof of exit. A per-attempt deadline
+		// permits a later cooperative request without ending this operation.
+		waitCtx, waitCancel := context.WithTimeout(ctx, s.shutdownRetry)
+		next := time.NewTimer(s.shutdownRetry)
+		receipt, err = s.b.WaitExit(waitCtx, id)
+		waitCancel()
+		if err == nil {
+			next.Stop()
+			break
+		}
+		if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			next.Stop()
+			return fmt.Errorf("exit receipt for %s not confirmed: %w", id, err)
+		}
+		// Also enforce spacing when a remote backend returns its own earlier
+		// deadline. Otherwise an immediate timeout could produce a tight loop.
+		select {
+		case <-ctx.Done():
+			next.Stop()
+			return fmt.Errorf("exit receipt for %s not confirmed: %w", id, ctx.Err())
+		case <-next.C:
+		}
 	}
 	rec.mutate(func(r *record) {
 		r.exited, r.clean = true, receipt.Clean
@@ -531,7 +566,9 @@ func (s *Service) exitError(rec *record) error {
 	return fmt.Errorf("%w: VM %s exited uncleanly", ErrNotStopped, rec.snapshot().ID)
 }
 
-// Stop gracefully stops a VM; it is idempotent and keeps the disk.
+// Stop gracefully stops a VM; it is idempotent and keeps the disk. Shutdown
+// requests are retried every two seconds for at most two minutes (or until ctx
+// ends). Failure to confirm the original receipt never releases host resources.
 func (s *Service) Stop(ctx context.Context, id string) (VM, error) {
 	rec, err := s.lookup(ctx, id)
 	if err != nil {
