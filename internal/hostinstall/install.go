@@ -183,9 +183,20 @@ func Install(o Options) (*Manifest, error) {
 		}
 		for _, f := range prev.Files {
 			if !now[f.Path] {
-				_, _ = removeOwned(t, f, false)
+				// Optional asset flags select replacements, not removal intent.
+				// Keep the original digest so modified assets remain protected
+				// on uninstall, and retain ownership across repeated upgrades.
+				if (o.Firecracker == "" && f.Path == o.AssetDir+"/firecracker") ||
+					(o.Kernel == "" && f.Path == o.AssetDir+"/vmlinux") {
+					manifest.Files = append(manifest.Files, f)
+					continue
+				}
+				if _, err := removeOwned(t, f, false); err != nil {
+					return nil, err
+				}
 			}
 		}
+		sort.Slice(manifest.Files, func(i, j int) bool { return manifest.Files[i].Path < manifest.Files[j].Path })
 	}
 	dirs, err := mkdirAll(t, filepath.Dir(o.manifestAbs()), root0)
 	if err != nil {

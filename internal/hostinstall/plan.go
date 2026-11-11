@@ -38,6 +38,7 @@ var binaries = []binary{
 	{"vmapi", "vmapi", false, false},
 	{"vmbot", "vmbot", false, false},
 	{"vmctl", "vmctl", false, false},
+	{"vmhost", "vmhost", false, false},
 	{"vm-launcher", "fc-vm-launcher", true, true},
 	{"vm-network", "fc-vm-network", true, false},
 	{"vm-helper", "fc-vm-helper", true, false},
@@ -120,6 +121,7 @@ func (o Options) Plan() ([]Entry, error) {
 		plan = append(plan, Entry{Path: o.AssetDir + "/vmlinux", Mode: 0o644, Src: o.Kernel})
 	}
 	units := []unitFile{
+		{"multivm/firecracker-vms.slice", o.unitdir() + "/firecracker-vms.slice"},
 		{"multivm/firecracker-vm@.service", o.unitdir() + "/firecracker-vm@.service"},
 		{"multivm/firecracker-vm-network@.service", o.unitdir() + "/firecracker-vm-network@.service"},
 		{"multivm/fc-vm-helper@.service", o.unitdir() + "/fc-vm-helper@.service"},

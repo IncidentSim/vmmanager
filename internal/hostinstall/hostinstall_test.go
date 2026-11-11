@@ -88,7 +88,8 @@ func tree(t *testing.T, root string) []string {
 	return out
 }
 
-const wantFiles = `0644 /etc/systemd/system/fc-vm-helper.socket
+const wantFiles = `0644 /etc/systemd/system/firecracker-vms.slice
+0644 /etc/systemd/system/fc-vm-helper.socket
 0644 /etc/systemd/system/fc-vm-helper@.service
 0644 /etc/systemd/system/firecracker-vm-network@.service
 0644 /etc/systemd/system/firecracker-vm@.service
@@ -96,6 +97,7 @@ const wantFiles = `0644 /etc/systemd/system/fc-vm-helper.socket
 0755 /usr/local/bin/vmapi
 0755 /usr/local/bin/vmbot
 0755 /usr/local/bin/vmctl
+0755 /usr/local/bin/vmhost
 0755 /usr/local/libexec/fc-vm-helper
 0755 /usr/local/libexec/fc-vm-helper-client
 0755 /usr/local/libexec/fc-vm-launcher
@@ -106,6 +108,7 @@ const wantFiles = `0644 /etc/systemd/system/fc-vm-helper.socket
 0644 /usr/local/share/doc/vm-firecracker/examples/four-slot/firecracker-vms.slice
 0644 /usr/local/share/doc/vm-firecracker/examples/four-slot/pool.conf.example
 0644 /usr/local/share/doc/vm-firecracker/examples/four-slot/resources.conf
+0644 /usr/local/share/doc/vm-firecracker/examples/firecracker-vms.slice
 0644 /usr/local/share/doc/vm-firecracker/examples/pool.conf.example
 0644 /usr/local/share/doc/vm-firecracker/examples/vmapi/backend.local.example.json
 0644 /usr/local/share/doc/vm-firecracker/examples/vmapi/idle-expiry.delta.example.json
@@ -244,7 +247,7 @@ func TestInstallUninstallRoundTripPreservesUserData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.Kept) != 0 || len(rep.Removed) != 26 {
+	if len(rep.Kept) != 0 || len(rep.Removed) != 29 {
 		t.Fatalf("report: %+v", rep)
 	}
 	if after := tree(t, o.DestDir); strings.Join(after, "\n") != strings.Join(before, "\n") {
@@ -584,11 +587,12 @@ func TestRuntimeTreeIsRootOwnedAndOnlyTheLockIsClientWritable(t *testing.T) {
 			rows = append(rows, strings.Fields(l))
 		}
 	}
-	if len(rows) != 2 {
-		t.Fatalf("nothing else may be client-writable: %v", rows)
+	if len(rows) != 3 {
+		t.Fatalf("unexpected runtime entries: %v", rows)
 	}
-	eq(t, rows[0][:5], "d", "/run/firecracker-vms", "0755", "root", "root")
-	eq(t, rows[1][:5], "f", "/run/firecracker-vms/.backend.lock", "0660", "root", "vmusers")
+	eq(t, rows[0][:5], "d", "/run/firecracker-vms-net", "0755", "root", "root")
+	eq(t, rows[1][:5], "d", "/run/firecracker-vms", "0755", "root", "root")
+	eq(t, rows[2][:5], "f", "/run/firecracker-vms/.backend.lock", "0660", "root", "vmusers")
 }
 
 func TestExampleConfigIsConsistentWithUnitsAndPool(t *testing.T) {

@@ -60,7 +60,7 @@ func Setup(ctx context.Context, so SetupOptions) error {
 		}
 	}
 	jail := JailRoot
-	specs := []dirSpec{{path: "/etc/firecracker-vms", mode: 0o755}, {path: jail, mode: 0o755}}
+	specs := []dirSpec{{path: "/etc/firecracker-vms", mode: 0o755}, {path: "/run/firecracker-vms-net", mode: 0o755}, {path: jail, mode: 0o755}}
 	for _, d := range []string{"bin", "kernel", "work", "run/slot", "dev/net", "proc", "sys", o.libexecdir()[1:]} {
 		specs = append(specs, dirSpec{path: jail + "/" + d, mode: 0o755})
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,7 +22,23 @@ type ExecRunner struct{}
 
 // Run implements Runner.
 func (ExecRunner) Run(ctx context.Context, stdin, name string, args ...string) (Result, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	// CommandContext resolves bare names before cmd.Env is applied. Resolve
+	// against trusted host directories explicitly, never the caller's PATH.
+	if filepath.Base(name) != name || name == "." || name == "" {
+		return Result{}, fmt.Errorf("invalid host command %q", name)
+	}
+	var executable string
+	for _, dir := range []string{"/usr/sbin", "/usr/bin", "/sbin", "/bin"} {
+		p := filepath.Join(dir, name)
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0111 != 0 {
+			executable = p
+			break
+		}
+	}
+	if executable == "" {
+		return Result{}, fmt.Errorf("trusted host command %s: %w", name, exec.ErrNotFound)
+	}
+	cmd := exec.CommandContext(ctx, executable, args...)
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C"}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)

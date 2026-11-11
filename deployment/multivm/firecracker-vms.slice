@@ -1,0 +1,8 @@
+[Unit]
+Description=Firecracker VM aggregate resource budget
+
+[Slice]
+CPUAccounting=yes
+CPUQuota=100%
+MemoryAccounting=yes
+MemoryMax=2G

@@ -166,9 +166,6 @@ func SystemdVerify(ctx context.Context, o Options, plan []Entry) (string, error)
 			return "", err
 		}
 	}
-	if err := os.WriteFile(filepath.Join(unitdir, `system-firecracker\x2dbuilder.slice`), []byte("[Unit]\nDescription=stub slice\n"), 0o644); err != nil {
-		return "", err
-	}
 	// Instance units are verified through their template copies.
 	for _, u := range units {
 		if i := strings.Index(u, "@"); i >= 0 && !strings.HasSuffix(u, "@.service") {

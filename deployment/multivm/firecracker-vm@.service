@@ -26,7 +26,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=exec
-Slice=system-firecracker\x2dbuilder.slice
+Slice=firecracker-vms.slice
 User=root
 Group=@CLIENT_GROUP@
 UMask=0007
