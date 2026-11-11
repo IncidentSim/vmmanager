@@ -1,5 +1,5 @@
-# Source-only systemd USER template for the NEW HTTP frontend.
-# Install as vmbot-http.service only after the explicit handoff documented in
+# Systemd USER unit for the HTTP frontend, installed by `vmhost install` (never enabled).
+# Enable it only after the explicit handoff documented in
 # docs/bot-api-client.md. Never run it alongside the legacy Telegram poller.
 # This template intentionally does NOT replace the old binary/config/unit paths.
 [Unit]
@@ -8,7 +8,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/vmbot-http -config %h/.config/vmbot-http/vmbot.json
+ExecStart=@BINDIR@/vmbot -config %h/.config/vmbot-http/vmbot.json
 Restart=on-failure
 RestartSec=5s
 UMask=0077

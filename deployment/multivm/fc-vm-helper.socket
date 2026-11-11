@@ -1,4 +1,4 @@
-# PROPOSED (source only): the authorization boundary for the ONLY privileged
+# The authorization boundary for the ONLY privileged
 # request, "start-slot N CPU_MILLI". Only members of @CLIENT_GROUP@ can connect; there is no
 # sudoers/polkit rule and no blanket systemctl right. Replace @CLIENT_GROUP@ with
 # the unprivileged vmapi user's primary group (a dedicated group is better).

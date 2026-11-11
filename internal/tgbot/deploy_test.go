@@ -69,7 +69,7 @@ func TestFrontendUnitTemplateHardeningAndFlags(t *testing.T) {
 	}
 	txt := string(b)
 	for _, want := range []string{"Restart=on-failure", "UMask=0077", "NoNewPrivileges=yes", "MemoryMax=", "TasksMax=",
-		"KillSignal=SIGTERM", "KillMode=control-group", "TimeoutStopSec=", "ExecStart=%h/.local/bin/vmbot-http -config %h/.config/vmbot-http/vmbot.json"} {
+		"KillSignal=SIGTERM", "KillMode=control-group", "TimeoutStopSec=", "ExecStart=@BINDIR@/vmbot -config %h/.config/vmbot-http/vmbot.json"} {
 		if !strings.Contains(txt, want) {
 			t.Errorf("unit missing %q", want)
 		}
