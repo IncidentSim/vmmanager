@@ -29,6 +29,7 @@ type Credential struct {
 	Service   bool   `json:"service,omitempty"`
 }
 type Server struct {
+	opts        Options
 	ctl         *vmbot.Controller
 	credentials []Credential
 	jwt         *JWTAuth
@@ -122,7 +123,11 @@ func NewWithJWT(c *vmbot.Controller, credentials []Credential, j *JWTAuth) (*Ser
 			return nil, errors.New("invalid shared image")
 		}
 	}
-	return &Server{ctl: c, credentials: append([]Credential{}, credentials...), jwt: j}, nil
+	s := &Server{ctl: c, credentials: append([]Credential{}, credentials...), jwt: j}
+	if err := s.Configure(Options{}); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 func respond(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -176,6 +181,9 @@ func (s *Server) authenticate(r *http.Request) (int64, int) {
 	acting := r.Header.Values("X-Acting-User-ID")
 	u := found.UserID
 	if found.Service {
+		if adminPath(r) {
+			return 0, 403
+		} // delegation credentials never authorize global administration
 		if len(acting) != 1 {
 			return 0, 403
 		}
@@ -187,7 +195,7 @@ func (s *Server) authenticate(r *http.Request) (int64, int) {
 	} else if len(acting) != 0 {
 		return 0, 403
 	}
-	if !s.ctl.ControlAllowed(u) {
+	if !s.ctl.ControlAllowed(u) && !(adminPath(r) && s.ctl.AdminAllowed(u)) {
 		return 0, 403
 	}
 	return u, 0
@@ -218,7 +226,7 @@ func (s *Server) authenticateJWT(r *http.Request, token string) (int64, int) {
 			return 0, 403
 		}
 	}
-	if !s.ctl.ControlAllowed(id) {
+	if !s.ctl.ControlAllowed(id) && !(adminPath(r) && s.ctl.AdminAllowed(id)) {
 		return 0, 403
 	}
 	return id, 0
@@ -239,7 +247,7 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if serveDocs(w, r) {
+	if s.serveDocs(w, r) {
 		return
 	}
 	if r.URL.Path == "/healthz" && r.Method == "GET" {
@@ -264,15 +272,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		problem(w, 422, "invalid_argument")
 		return
 	}
+	if adminPath(r) {
+		s.adminRoute(w, r, u)
+		return
+	}
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 2 || parts[0] != "v1" {
 		problem(w, 404, "not_found")
 		return
 	}
+	if allow := routeAllow(parts); allow != "" && !strings.Contains(", "+allow+", ", ", "+r.Method+", ") {
+		w.Header().Set("Allow", allow)
+		problem(w, 405, "method_not_allowed")
+		return
+	}
 	if r.Method == "GET" {
 		switch {
 		case len(parts) == 2 && parts[1] == "vms":
-			respond(w, 200, map[string]any{"vms": s.ctl.ControlVMs(u)})
+			respond(w, 200, map[string]any{"vms": projectVMs(s.ctl.ControlVMs(u))})
 			return
 		case len(parts) == 2 && parts[1] == "images":
 			respond(w, 200, map[string]any{"images": s.publicImages(u)})
@@ -280,7 +297,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case len(parts) == 2 && parts[1] == "capabilities":
 			bc, e := s.ctl.ControlCapabilities(r.Context(), u)
 			if e != nil {
-				fail(w, e)
+				s.fail(w, e)
 				return
 			}
 			// max_vms/max_vms_per_user are the API's owner/global quotas; the
@@ -288,12 +305,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p := s.ctl.ControlPolicy()
 			profiles := make([]map[string]any, 0, len(bc.Profiles))
 			for _, x := range bc.Profiles {
-				profiles = append(profiles, map[string]any{"name": x.Name, "vcpu": x.VCPU, "memory_mib": x.MemMiB, "disk_mib": x.DiskMiB})
+				profiles = append(profiles, map[string]any{"name": x.Name, "vcpu": x.VCPU, "cpu_limit": float64(x.Resources().EffectiveCPULimitMilli()) / 1000, "memory_mib": x.MemMiB, "disk_mib": x.DiskMiB})
 			}
 			out := map[string]any{"max_vms": p.MaxVMs, "max_vms_per_user": p.MaxVMsPerUser, "profiles": profiles,
-				"backend_max_vms": bc.MaxVMs, "ssh_public_key_supported": false}
+				"backend_max_vms": bc.MaxVMs, "ssh_public_key_supported": s.opts.Policy.SuppliedSSHKey, "ssh_generated_key_supported": s.opts.Policy.GeneratedSSHKey, "default_profile": s.opts.Policy.DefaultProfile}
+			if s.opts.Policy.TTL {
+				out["ttl"] = map[string]int64{"default_seconds": s.opts.Policy.DefaultTTLSeconds, "max_seconds": s.opts.Policy.MaxTTLSeconds}
+			}
 			if bc.MaxTotalMemMiB > 0 {
 				out["max_total_memory_mib"] = bc.MaxTotalMemMiB
+			}
+			if bc.MaxTotalCPULimitMilli > 0 {
+				out["max_total_cpu_limit"] = float64(bc.MaxTotalCPULimitMilli) / 1000
 			}
 			if bc.MaxTotalVCPU > 0 {
 				out["max_total_vcpu"] = bc.MaxTotalVCPU
@@ -303,20 +326,45 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case len(parts) == 3 && parts[1] == "vms":
 			v, e := s.ctl.ControlVM(u, parts[2])
 			if e != nil {
-				fail(w, e)
+				s.fail(w, e)
 			} else {
-				respond(w, 200, v)
+				respond(w, 200, projectVM(v))
 			}
+			return
+		case len(parts) == 4 && parts[1] == "vms" && parts[3] == "ssh-key":
+			if _, err := s.ctl.ControlVM(u, parts[2]); err != nil {
+				s.fail(w, err)
+				return
+			}
+			if s.opts.Keys == nil || !s.opts.Policy.GeneratedSSHKey {
+				problem(w, 501, "not_implemented")
+				return
+			}
+			key, err := s.opts.Keys.GeneratedKey(r.Context(), u, parts[2])
+			if err != nil {
+				s.fail(w, err)
+				return
+			}
+			respond(w, 200, map[string]string{"vm_id": parts[2], "public_key": key.PublicKey, "private_key": string(key.PrivateKeyPEM)})
 			return
 		case len(parts) == 4 && parts[1] == "vms" && parts[3] == "ssh":
 			x, e := s.ctl.ControlSSH(r.Context(), u, parts[2])
 			if e != nil {
-				fail(w, e)
+				s.fail(w, e)
 				return
 			}
 			out := map[string]any{"host": x.Host, "port": x.Port, "user": x.User, "host_key_fingerprint": x.HostKeyFingerprint, "ready": x.Ready, "auth_mode": x.AuthMode, "key_reference": x.KeyReference}
 			if x.Bastion != nil {
 				out["bastion"] = map[string]any{"host": x.Bastion.Host, "port": x.Bastion.Port, "user": x.Bastion.User}
+			}
+			if s.opts.Browser != nil {
+				// Additive: the raw SSH contract above is unchanged. A browser
+				// failure never fails /ssh.
+				res := s.browser(r.Context(), u, parts[2])
+				out["browser_status"] = res.Status
+				if res.URL != "" {
+					out["browser_url"] = res.URL
+				}
 			}
 			respond(w, 200, out)
 			return
@@ -332,7 +380,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case len(parts) == 3 && parts[1] == "operations":
 			o, e := s.ctl.ControlOperation(u, parts[2])
 			if e != nil {
-				fail(w, e)
+				s.fail(w, e)
 				return
 			}
 			out := map[string]any{"id": o.ID, "kind": o.Kind, "status": o.Status}
@@ -345,7 +393,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if o.Status == "failed" {
 				out["error"] = map[string]string{"code": o.ErrorCode, "message": "operation not confirmed"}
 			}
-			if o.Kind == "terminal" && o.Status == "succeeded" {
+			if o.Kind == "terminal" && o.Status == "succeeded" && s.opts.Browser != nil {
+				// Unified Nexterm link; no ttyd URL is produced on this path.
+				res := s.browser(r.Context(), u, o.VMID)
+				out["result"] = map[string]string{"browser_status": res.Status}
+				if res.URL != "" {
+					out["result"] = map[string]string{"url": res.URL, "browser_status": res.Status}
+				}
+			} else if o.Kind == "terminal" && o.Status == "succeeded" {
 				url, e := s.ctl.ControlTerminalURL(u, o.VMID)
 				if e == nil {
 					out["result"] = map[string]string{"url": url}
@@ -360,16 +415,34 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req := vmbot.ControlRequest{}
 	switch {
 	case r.Method == "POST" && len(parts) == 2 && parts[1] == "vms":
-		var b struct {
-			Name         string                  `json:"name"`
-			ImageID      string                  `json:"image_id"`
-			Resources    *vmbot.ControlResources `json:"resources"`
-			SSHPublicKey string                  `json:"ssh_public_key"`
-		}
-		if !decode(w, r, &b) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16*1024))
+		if err != nil {
+			validationProblem(w, []FieldError{fe("body", "too_large", "request body exceeds limit")})
 			return
 		}
-		req = vmbot.ControlRequest{Kind: "create", Name: b.Name, ImageID: b.ImageID, Resources: b.Resources, SSHPublicKey: b.SSHPublicKey}
+		keys := r.Header.Values("Idempotency-Key")
+		if len(keys) != 1 || !validIdempotencyKey(keys[0]) {
+			validationProblem(w, []FieldError{fe("Idempotency-Key", "invalid_format", "one printable Idempotency-Key of 1 to 128 bytes is required")})
+			return
+		}
+		if digests := createReplayDigests(body); len(digests) > 0 {
+			o, found, err := s.ctl.ReplayControl(u, keys[0], digests)
+			if err != nil {
+				s.fail(w, err)
+				return
+			}
+			if found {
+				s.trackBrowser(u, o.VMID)
+				respond(w, 202, map[string]any{"operation_id": o.ID, "vm_id": o.VMID, "image_id": o.ImageID})
+				return
+			}
+		}
+		b, fields := ParseCreate(body, s.opts.Policy)
+		if len(fields) > 0 {
+			validationProblem(w, fields)
+			return
+		}
+		req = vmbot.ControlRequest{Kind: "create", Name: b.Name, ImageID: b.ImageID, Profile: b.RequestedProfile, EffectiveProfile: b.Profile, IntentVersion: 1, TTLSeconds: b.TTLSeconds, SSHPublicKey: b.SSHPublicKey}
 	case r.Method == "POST" && len(parts) == 4 && parts[1] == "vms" && (parts[3] == "stop" || parts[3] == "commit" || parts[3] == "terminal"):
 		// Parsing is side-effect-free. Domain admission first resolves an
 		// owner-scoped idempotency association, even after VM deletion, and
@@ -401,14 +474,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keys := r.Header.Values("Idempotency-Key")
-	if len(keys) != 1 {
-		problem(w, 422, "invalid_argument")
+	if len(keys) != 1 || !validIdempotencyKey(keys[0]) {
+		validationProblem(w, []FieldError{fe("Idempotency-Key", "invalid_format", "one printable Idempotency-Key of 1 to 128 bytes is required")})
 		return
 	}
 	o, e := s.ctl.AcceptControl(u, keys[0], req)
 	if e != nil {
-		fail(w, e)
+		s.fail(w, e)
 		return
+	}
+	if o.Kind == "create" || o.Kind == "terminal" {
+		s.trackBrowser(u, o.VMID)
 	}
 	out := map[string]any{"operation_id": o.ID}
 	if o.VMID != "" {

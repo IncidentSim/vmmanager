@@ -26,6 +26,10 @@ import (
 
 // ManagerConfig configures the terminal backend and gateway.
 type ManagerConfig struct {
+	// Credentials selects dedicated per-VM terminal identities except for an
+	// explicit image-preinstalled per-VM policy. Missing keys never fall back.
+	Credentials                   TerminalCredentials
+	KeyRuntimeDir                 string
 	TTYDPath, SSHPath, SSHKeyFile string
 	StateDir                      string // 0700; holds ttyd sockets and per-VM known_hosts
 	PublicOrigin                  string // exact scheme://host[:port] allowed in Host/Origin
@@ -117,6 +121,7 @@ const (
 // session nor another VM can be admitted over half-cleaned resources, and
 // Revoke/Close can wait on done no matter which goroutine owns the cleanup.
 type slot struct {
+	releaseKey  func()
 	vmID, token string
 	state       slotState
 	cancel      context.CancelFunc // aborts a start in flight
@@ -138,11 +143,17 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if !filepath.IsAbs(cfg.StateDir) || strings.ContainsAny(cfg.StateDir, " \t\r\n\"'\\") {
 		return nil, errors.New("terminal config: state dir must be an absolute path without spaces or quotes")
 	}
-	if !filepath.IsAbs(cfg.SSHKeyFile) || strings.ContainsAny(cfg.SSHKeyFile, "\r\n") {
+	if (cfg.Credentials == nil || cfg.SSHKeyFile != "") && (!filepath.IsAbs(cfg.SSHKeyFile) || strings.ContainsAny(cfg.SSHKeyFile, "\r\n")) {
 		return nil, errors.New("terminal config: ssh key path")
 	}
 	if cfg.StartTimeout <= 0 {
 		cfg.StartTimeout = 10 * time.Second
+	}
+	if cfg.KeyRuntimeDir == "" {
+		cfg.KeyRuntimeDir = filepath.Join(cfg.StateDir, "terminal-keys")
+	}
+	if !filepath.IsAbs(cfg.KeyRuntimeDir) || strings.ContainsAny(cfg.KeyRuntimeDir, "\r\n") {
+		return nil, errors.New("terminal config: key runtime directory")
 	}
 	return &Manager{cfg: cfg, origin: &url.URL{Scheme: u.Scheme, Host: u.Host},
 		sess: map[string]*session{}, slots: map[string]*slot{}, pending: map[string]*slot{}}, nil
@@ -254,6 +265,9 @@ func (m *Manager) finishTermination(sl *slot, s *session) {
 	if s != nil {
 		s.terminate(m)
 	}
+	if sl.releaseKey != nil {
+		sl.releaseKey()
+	}
 	os.Remove(m.KnownHostsPath(sl.vmID))
 	os.Remove(m.sockPath(sl.vmID))
 	m.mu.Lock()
@@ -293,7 +307,25 @@ func (m *Manager) launch(ctx, sctx context.Context, sl *slot, t TerminalTarget) 
 		m.finishTermination(sl, s)
 	}()
 	kh := m.KnownHostsPath(t.VMID)
-	sshArgs, err := BuildSSHArgs(m.cfg, t, kh)
+	cfg := m.cfg
+	// Only durable per-VM image authentication may select the legacy key while
+	// access is enabled. In particular, ErrNotFound is never a policy decision.
+	if t.AuthMode == vmlib.AuthProvisionPublicKey && cfg.Credentials == nil {
+		return errors.New("terminal: dedicated VM credential unavailable")
+	}
+	if cfg.Credentials != nil && t.AuthMode != vmlib.AuthImagePreinstalled {
+		path, release, e := cfg.Credentials.TerminalKeyFile(t.VMID, cfg.KeyRuntimeDir)
+		if e != nil {
+			return errors.New("terminal: dedicated VM credential unavailable")
+		}
+		if release == nil {
+			return errors.New("terminal: invalid credential lease")
+		}
+		var once sync.Once
+		sl.releaseKey = func() { once.Do(release) }
+		cfg.SSHKeyFile = path
+	}
+	sshArgs, err := BuildSSHArgs(cfg, t, kh)
 	if err != nil {
 		return err
 	}
@@ -324,7 +356,13 @@ func (m *Manager) launch(ctx, sctx context.Context, sl *slot, t TerminalTarget) 
 	s = &session{vmID: t.VMID, token: t.Token, sock: sock, cmd: cmd, exited: make(chan struct{}), max: m.cfg.MaxClients,
 		ctx: rctx, cancel: rcancel, conns: map[net.Conn]struct{}{}}
 	s.authorize = t.authorize
-	go func() { cmd.Wait(); close(s.exited) }()
+	go func() {
+		cmd.Wait()
+		if sl.releaseKey != nil {
+			sl.releaseKey()
+		}
+		close(s.exited)
+	}()
 
 	wctx, wcancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(sctx, wcancel) // Revoke/Close abort the wait

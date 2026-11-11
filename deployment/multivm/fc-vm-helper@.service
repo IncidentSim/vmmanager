@@ -1,6 +1,6 @@
 # PROPOSED (source only): one instance per accepted connection of fc-vm-helper.socket.
 # The connection is stdin/stdout. cmd/vm-helper serves exactly one validated
-# "start-slot N" line and starts only an idle firecracker-vm@N.service.
+# "start-slot N CPU_MILLI" line; locks/checks/sets/verifies/starts an idle slot.
 [Unit]
 Description=Handle one start-slot request
 
@@ -17,8 +17,12 @@ NoNewPrivileges=yes
 ProtectHome=yes
 PrivateTmp=yes
 ProtectSystem=strict
+# Root-only persistent lock inodes shared by all accepted connections.
+# Both directories must be provisioned root-owned before socket activation.
+ReadWritePaths=/run/firecracker-vms /run/firecracker-vms-net
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX
+# conntrack talks to the kernel via netlink; no AF_INET/AF_INET6 is needed.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 LockPersonality=yes

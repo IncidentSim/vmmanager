@@ -1,0 +1,8 @@
+{
+  "nexterm": {
+    "enabled": true,
+    "url": "https://nexterm.example.org:19454",
+    "admin_credentials_file": "/var/lib/vmapi/private/nexterm-admin.json",
+    "state_file": "/var/lib/vmapi/private/nexterm-state.json"
+  }
+}

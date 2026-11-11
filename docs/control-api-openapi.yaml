@@ -66,14 +66,24 @@ components:
           properties:
             code:
               type: string
-              enum: [not_found, unauthorized, forbidden, invalid_argument, conflict, capacity, unavailable, internal]
+              enum: [validation_failed, profile_unknown, vm_expired, key_not_generated, method_not_allowed, not_implemented, not_found, unauthorized, forbidden, invalid_argument, conflict, capacity, unavailable, internal]
             message: {type: string}
+            fields:
+              type: array
+              items:
+                type: object
+                required: [field, code, message]
+                properties:
+                  field: {type: string}
+                  code: {type: string}
+                  message: {type: string}
     Resources:
       type: object
       nullable: true
-      required: [vcpu, memory_mib]
+      required: [vcpu, cpu_limit, memory_mib]
       properties:
         vcpu: {type: integer, minimum: 1}
+        cpu_limit: {type: number, minimum: 0.01, multipleOf: 0.01, description: 'CPU-time quota in CPU units, separate from guest vCPU count.'}
         memory_mib: {type: integer, minimum: 1}
     VM:
       type: object
@@ -87,6 +97,9 @@ components:
           type: string
           enum: [creating, active, stopping, stopped, committing, committed, deleting]
         resources: {$ref: "#/components/schemas/Resources"}
+        profile: {type: string}
+        ttl_seconds: {type: integer}
+        expires_at: {type: string, format: date-time}
         owner_error:
           type: boolean
           description: >-
@@ -95,6 +108,7 @@ components:
             return 503. `phase` is the lifecycle applied by the owner; accepting a
             request never changes it.
     CreateVM:
+      # Deployment inserts a configured bootable image and profile, never a fake SSH key.
       type: object
       additionalProperties: false
       required: [image_id]
@@ -106,10 +120,11 @@ components:
           pattern: '^(?!bot-)([a-z]([a-z0-9-]{0,18}[a-z0-9])?)?$'
           description: Optional label, unique per owner. Non-empty labels use 1-20 characters - lowercase ASCII letters, digits and inner hyphens, starting with a letter, ending with a letter or digit, not starting with `bot-`. Matched exactly (no trimming or case folding). Omit it or send an empty string to leave the VM unnamed.
         image_id: {type: string}
-        resources: {$ref: "#/components/schemas/Resources"}
+        profile: {type: string, description: "Profile from capabilities; defaults to default_profile."}
+        ttl_seconds: {type: integer, minimum: 1, description: "Available only when capabilities advertises ttl; defaults and maximum come from that policy."}
         ssh_public_key:
           type: string
-          description: Currently always rejected with 422 (unsupported by the local backend).
+          description: A genuine single OpenSSH public key without options. Accepted only when capabilities advertises supplied-key provisioning.
     Name:
       type: object
       additionalProperties: false
@@ -171,6 +186,13 @@ components:
             or timeout. Metadata remains available with ready=false.
         auth_mode: {type: string}
         key_reference: {type: string}
+        browser_url:
+          type: string
+          description: Nexterm ordinary-user bearer session link, present only when browser_status is ready. Never log it.
+        browser_status:
+          type: string
+          enum: [ready, pending, unsupported]
+          description: Present only with API Nexterm enabled. Pending or unsupported has no browser_url; raw SSH is unchanged and there is no ttyd fallback.
     Operation:
       type: object
       required: [id, status, kind]
@@ -183,10 +205,13 @@ components:
         result:
           type: object
           description: >
-            For a succeeded terminal operation, the result contains a URL
-            granting bearer access to the terminal.
+            For a succeeded terminal operation, url grants bearer access.
+            With Nexterm enabled, browser_status is ready, pending or unsupported;
+            url is present only when ready and equals the SSH endpoint browser_url.
+            Pending/unsupported never fall back to ttyd. Poll again to retry.
           properties:
             url: {type: string}
+            browser_status: {type: string, enum: [ready, pending, unsupported]}
         error:
           type: object
           properties:
@@ -223,6 +248,9 @@ paths:
                   max_total_memory_mib:
                     type: integer
                     description: Omitted when no aggregate memory cap is advertised.
+                  max_total_cpu_limit:
+                    type: number
+                    description: Aggregate CPU-time quota in CPU units; omitted when not advertised.
                   max_total_vcpu:
                     type: integer
                     description: Omitted when no aggregate CPU cap is advertised.
@@ -230,13 +258,22 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [name, vcpu, memory_mib, disk_mib]
+                      required: [name, vcpu, cpu_limit, memory_mib, disk_mib]
                       properties:
                         name: {type: string}
                         vcpu: {type: integer}
+                        cpu_limit: {type: number}
                         memory_mib: {type: integer}
                         disk_mib: {type: integer}
+                  default_profile: {type: string}
                   ssh_public_key_supported: {type: boolean}
+                  ssh_generated_key_supported: {type: boolean}
+                  ttl:
+                    type: object
+                    description: Omitted until durable expiry is enabled.
+                    properties:
+                      default_seconds: {type: integer}
+                      max_seconds: {type: integer}
         default: {$ref: "#/components/responses/Error"}
   /v1/vms:
     get:
@@ -330,6 +367,27 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Accepted"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/vms/{id}/ssh-key:
+    parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}]
+    get:
+      summary: Retrieve generated private key (owner-only, no-store).
+      description: Never includes supplied-key credentials. Returns 409 key_not_generated for supplied keys, 501 when unavailable; foreign and missing IDs are identical 404.
+      responses:
+        "200":
+          description: Sensitive generated key; never log or retain in workflow history.
+          headers:
+            Cache-Control:
+              schema: {type: string, enum: [no-store]}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [vm_id, public_key, private_key]
+                properties:
+                  vm_id: {type: string}
+                  public_key: {type: string}
+                  private_key: {type: string}
         default: {$ref: "#/components/responses/Error"}
   /v1/vms/{id}/ssh:
     parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}]

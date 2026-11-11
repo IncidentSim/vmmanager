@@ -158,6 +158,19 @@ class NetworkScriptTests(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("overlaps", err)
 
+    def test_cpu_pool_ceiling_is_optional_strict_and_never_evaluated(self):
+        base = "GUEST_PREFIX=10.213\nMAX_SLOTS=4\n"
+        for value in ("10", "500", "2000", "64000"):
+            rc, err, _ = self.run_check(0, self.CLEAN, pool=base + "MAX_SLOT_CPU_MILLI=" + value + "\n")
+            self.assertEqual(rc, 0, err)
+        for value in ("0", "5", "505", "64010", "01000", "1e3", "$(id)", "1+499", "999999999999999999999999999"):
+            rc, _, calls = self.run_check(0, self.CLEAN, pool=base + "MAX_SLOT_CPU_MILLI=" + value + "\n")
+            self.assertNotEqual(rc, 0, value)
+            self.assertEqual(calls, "", value)
+        rc, _, calls = self.run_check(0, self.CLEAN, pool=base + "MAX_SLOT_CPU_MILLI=500\nMAX_SLOT_CPU_MILLI=500\n")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(calls, "")
+
     def test_bad_pool_and_slots_are_rejected_without_touching_the_network(self):
         for pool in ("GUEST_PREFIX=10.213;reboot\nMAX_SLOTS=2\n", "GUEST_PREFIX=127.0\nMAX_SLOTS=2\n",
                      "GUEST_PREFIX=10.213\nMAX_SLOTS=65\n", "GUEST_PREFIX=10.213\n", "FOO=bar\nGUEST_PREFIX=10.213\nMAX_SLOTS=2\n",
@@ -180,7 +193,7 @@ class NetworkScriptTests(unittest.TestCase):
     def test_script_only_touches_its_own_interface_and_tagged_rules(self):
         code = "\n".join(l for l in NET.splitlines() if not l.strip().startswith("#"))
         self.assertNotIn("tap-fcpg", code)
-        self.assertNotIn("172.16.", code)
+        self.assertNotRegex(code, r"ip (?:addr|route) (?:add|del|replace) 172\.16\.")
         self.assertNotRegex(code, r"ip route (add|del|replace)")
         self.assertNotRegex(code, r"iptables\s+-F|iptables\s+-X|--flush")
 
@@ -225,6 +238,7 @@ class UnitContractTests(unittest.TestCase):
         self.assertEqual(values(u, "Service", "RootDirectory"), [])
         self.assertEqual(values(u, "Service", "ExecStart"), ["/usr/local/libexec/fc-vm-network up %i"])
         self.assertEqual(values(u, "Service", "ExecStop"), ["/usr/local/libexec/fc-vm-network down %i"])
+        self.assertEqual(values(u, "Service", "ExecReload"), ["/usr/local/libexec/fc-vm-network refresh %i"])
 
     def test_privilege_boundary_is_a_group_restricted_socket_not_sudo(self):
         s = unit("fc-vm-helper.socket")
@@ -268,6 +282,26 @@ class UnitContractTests(unittest.TestCase):
         # max_total_vcpu counts VIRTUAL CPUs for admission; execution is still capped
         # by the slice's CPUQuota=100% (one CPU of time). It must admit max_vms guests.
         self.assertGreaterEqual(cfg["max_total_vcpu"], cfg["max_vms"] * cfg["profiles"][0]["vcpu"])
+
+    def test_four_slot_proposal_has_an_explicit_separate_capacity_gate(self):
+        proposal = HERE / "four-slot"
+        cfg = json.loads((proposal / "backend.local.example.json").read_text())
+        pool = dict(l.split("=") for l in (proposal / "pool.conf.example").read_text().splitlines() if l and not l.startswith("#"))
+        p = cfg["profiles"][0]
+        self.assertEqual((cfg["max_vms"], int(pool["MAX_SLOTS"])), (4, 4))
+        self.assertEqual((p["name"], p["vcpu"], p["cpu_limit"], p["memory_mib"]), ("small", 1, 0.5, 500))
+        self.assertEqual(cfg["default_profile"], "small")
+        self.assertLessEqual(4 * p["cpu_limit"], cfg["max_total_cpu_limit"])
+        self.assertLessEqual(p["cpu_limit"] * 1000, int(pool["MAX_SLOT_CPU_MILLI"]))
+        self.assertLessEqual(4 * p["memory_mib"], cfg["max_total_mem_mib"])
+        self.assertLessEqual(cfg["max_total_mem_mib"] + 4 * cfg["vmm_overhead_mib"], 2560)
+        self.assertIn("MemoryMax=2560M", (proposal / "firecracker-vms.slice").read_text())
+        self.assertIn("CPUQuota=200%", (proposal / "firecracker-vms.slice").read_text())
+        self.assertIn("Slice=firecracker-vms.slice", (proposal / "resources.conf").read_text())
+        helper = unit("fc-vm-helper@.service")
+        self.assertEqual(values(helper, "Service", "ReadWritePaths"), ["/run/firecracker-vms /run/firecracker-vms-net"])
+        self.assertEqual(values(helper, "Service", "ProtectSystem"), ["strict"])
+        self.assertEqual(values(helper, "Service", "RestrictAddressFamilies"), ["AF_UNIX AF_NETLINK"])
 
     def test_runtime_tree_is_root_owned_and_only_the_lock_is_client_writable(self):
         rows = [l.split() for l in (HERE / "firecracker-vms.tmpfiles.conf").read_text().splitlines()

@@ -23,7 +23,7 @@ import (
 	"unicode/utf8"
 )
 
-const helpText = "Команды:\n/create [имя] [image_id] [vcpu memory_mib] — создать VM\n/list — все VM с кнопками\n/status [имя] — состояние VM\n/terminal [имя] — секретная ссылка\n/delete [имя] — удалить VM\n/stop [имя] — остановить VM\n/commit имя имя-образа — сохранить выключенный диск в новый образ\n/images — общий реестр образов (доступен всем)\n/deleteimage image_id — удалить образ, который создали вы\n/ssh [имя] — публичные параметры SSH\n/capabilities — лимиты и профили\n/operation id — результат операции\n/token — личный токен для HTTP API и Swagger\n\nЕсли VM несколько, укажите имя или нажмите кнопку. Остановленные и сохранённые VM тоже занимают место."
+const helpText = "Команды:\n/create [имя] [image_id] [profile] [ttl_seconds] — создать VM\n/list — все VM с кнопками\n/status [имя] — состояние VM\n/terminal [имя] — ссылка на терминал в браузере\n/delete [имя] — удалить VM\n/stop [имя] — остановить VM\n/commit имя имя-образа — сохранить выключенный диск в новый образ\n/images — общий реестр образов (доступен всем)\n/deleteimage image_id — удалить образ, который создали вы\n/ssh [имя] — параметры SSH и ссылка для входа из браузера\n/capabilities — лимиты и профили\n/operation id — результат операции\n/token — личный токен для HTTP API и Swagger\n\nЕсли VM несколько, укажите имя или нажмите кнопку. Остановленные и сохранённые VM тоже занимают место."
 
 var labelPattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,18}[a-z0-9])?$`)
 
@@ -43,7 +43,7 @@ type Bot struct {
 	signer    *jwtauth.Signer
 	tokenTTL  time.Duration
 	mu        sync.Mutex
-	names     map[int64]string // verified bootstrap username of users admitted by username
+	names     map[int64]string       // verified bootstrap username of users admitted by username
 }
 
 // apiCallTTL is the lifetime of the short per-request tokens the bot uses for
@@ -57,6 +57,10 @@ func NewBot(c Config, tg Telegram, client *controlclient.Client, delivery *Deliv
 	if tg == nil || (client == nil && c.JWT == nil) || (len(c.AllowedUserIDs) == 0 && len(c.AllowedUsernames) == 0) || c.ImageID == "" {
 		return nil, errors.New("invalid bot configuration")
 	}
+	if e := validateAdminConfig(c); e != nil {
+		return nil, e
+	}
+	c.AdminUserIDs = append([]int64(nil), c.AdminUserIDs...)
 	b := &Bot{config: c, tg: tg, client: client, Delivery: delivery, allowed: map[int64]bool{}, usernames: map[string]bool{}, names: map[int64]string{},
 		PollInterval: time.Second, WaitBudget: 40 * time.Second, RetryDelay: 3 * time.Second}
 	for _, u := range c.AllowedUserIDs {
@@ -105,7 +109,7 @@ func (b *Bot) apiToken(userID int64) (string, error) {
 	b.mu.Lock()
 	name, ok := b.names[userID]
 	b.mu.Unlock()
-	if !ok && !b.allowed[userID] {
+	if !ok && !b.allowed[userID] && !b.isAdmin(userID) {
 		return "", errors.New("user not verified")
 	}
 	tok, _, err := b.signer.Issue(userID, name, apiCallTTL, time.Now())
@@ -120,7 +124,7 @@ func (b *Bot) allowedMessage(from *User, chat Chat) bool {
 	if from == nil || from.ID <= 0 || chat.Type != "private" || chat.ID != from.ID {
 		return false
 	}
-	if b.allowed[from.ID] {
+	if b.allowed[from.ID] || b.isAdmin(from.ID) {
 		b.mu.Lock()
 		delete(b.names, from.ID)
 		b.mu.Unlock()
@@ -235,6 +239,12 @@ func (b *Bot) Handle(ctx context.Context, u Update) {
 		return
 	}
 	defer func() { _ = b.tg.AnswerCallback(ctx, q.ID, "") }()
+	if strings.HasPrefix(q.Data, "da:") {
+		if b.isAdmin(q.From.ID) && len(q.Data) == 46 {
+			b.adminConfirm(ctx, q.From.ID, strings.TrimPrefix(q.Data, "da:"))
+		}
+		return
+	}
 	action, hash, ok := strings.Cut(q.Data, ":")
 	if !ok || len(hash) != 43 || (action != "s" && action != "t" && action != "d") {
 		b.send(ctx, q.From.ID, "Неизвестная или устаревшая кнопка. /list")
@@ -258,6 +268,7 @@ func buttonData(action, id string) string {
 	h := sha256.Sum256([]byte(id))
 	return action + ":" + base64.RawURLEncoding.EncodeToString(h[:])
 }
+
 // imageLine renders one common-registry entry. Every image is usable by every
 // admitted user; /deleteimage is advertised only where the server says the
 // caller may delete it (permission, not absence of references).
@@ -337,6 +348,11 @@ func key(update int64, action string) string {
 }
 func (b *Bot) command(ctx context.Context, u, update int64, cmd string, args []string) {
 	switch cmd {
+	case "/delete_all":
+		if b.isAdmin(u) && len(args) == 0 {
+			b.adminPreview(ctx, u, update)
+		}
+		return
 	case "/start", "/help":
 		_ = b.tg.SendMessage(ctx, OutMessage{ChatID: u, Text: helpText, MainKeyboard: true})
 		return
@@ -355,11 +371,11 @@ func (b *Bot) command(ctx context.Context, u, update int64, cmd string, args []s
 		b.list(ctx, u, "")
 		return
 	case "/create":
-		if len(args) > 4 || len(args) == 3 {
-			b.send(ctx, u, "Использование: /create [имя] [image_id] [vcpu memory_mib]")
+		if len(args) > 4 {
+			b.send(ctx, u, "Использование: /create [имя] [image_id] [profile] [ttl_seconds]")
 			return
 		}
-		r := controlclient.CreateRequest{ImageID: b.config.ImageID, Resources: b.config.Resources}
+		r := controlclient.CreateRequest{ImageID: b.config.ImageID, Profile: b.config.Profile, TTLSeconds: b.config.VMTTLSeconds}
 		if len(args) > 0 {
 			if !validName(args[0]) {
 				b.send(ctx, u, "Недопустимое имя: строчные латинские буквы, цифры и «-», до 20 символов, не «bot-…».")
@@ -370,14 +386,20 @@ func (b *Bot) command(ctx context.Context, u, update int64, cmd string, args []s
 		if len(args) > 1 {
 			r.ImageID = args[1]
 		}
-		if len(args) == 4 {
-			cpu, e1 := strconv.ParseUint(args[2], 10, 32)
-			mem, e2 := strconv.ParseUint(args[3], 10, 32)
-			if e1 != nil || e2 != nil || cpu == 0 || mem == 0 {
-				b.send(ctx, u, "CPU и RAM должны быть положительными числами.")
+		if len(args) > 2 {
+			if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`).MatchString(args[2]) {
+				b.send(ctx, u, "Недопустимый профиль.")
 				return
 			}
-			r.Resources = &controlclient.Resources{VCPU: uint32(cpu), MemoryMiB: uint32(mem)}
+			r.Profile = args[2]
+		}
+		if len(args) == 4 {
+			ttl, err := strconv.ParseInt(args[3], 10, 64)
+			if err != nil || ttl < 1 {
+				b.send(ctx, u, "ttl_seconds должно быть положительным целым числом.")
+				return
+			}
+			r.TTLSeconds = ttl
 		}
 		b.send(ctx, u, "Создаю VM, это может занять некоторое время…")
 		a, e := b.client.Create(ctx, u, key(update, "create"), r)
@@ -499,7 +521,11 @@ func (b *Bot) vmAction(ctx context.Context, u, update int64, action string, v co
 			b.fail(ctx, u, e)
 			return
 		}
-		b.send(ctx, u, fmt.Sprintf("SSH: %s@%s, port %d; ready=%t\nHost key: %s", ssh.User, ssh.Host, ssh.Port, ssh.Ready, ssh.HostKeyFingerprint))
+		text := fmt.Sprintf("SSH: %s@%s, port %d; ready=%t\nHost key: %s", ssh.User, ssh.Host, ssh.Port, ssh.Ready, ssh.HostKeyFingerprint)
+		if line, ok := browserLine(ssh.BrowserURL, ssh.BrowserStatus); ok {
+			text += "\n" + line
+		}
+		b.send(ctx, u, text)
 	case "delete", "stop", "terminal":
 		var a controlclient.Accepted
 		var e error
@@ -560,15 +586,26 @@ func (b *Bot) showOperation(ctx context.Context, u int64, op controlclient.Opera
 		return
 	}
 	var result struct {
-		URL string `json:"url"`
+		URL           string `json:"url"`
+		BrowserStatus string `json:"browser_status"`
 	}
-	if json.Unmarshal(op.Result, &result) == nil && result.URL != "" {
-		link, e := url.Parse(result.URL)
-		if e != nil || link.Scheme != "https" || link.Host == "" || link.User != nil {
+	if json.Unmarshal(op.Result, &result) == nil && (result.URL != "" || result.BrowserStatus != "") {
+		if result.BrowserStatus == "" { // Nexterm disabled: legacy ttyd capability link
+			link, e := url.Parse(result.URL)
+			if e != nil || link.Scheme != "https" || link.Host == "" || link.User != nil {
+				b.fail(ctx, u, errors.New("invalid terminal URL"))
+				return
+			}
+			_ = b.tg.SendMessage(ctx, OutMessage{ChatID: u, Secret: true, Text: "Ссылка на терминал. Это секрет: любой, у кого она есть, получает shell в VM. Действует до остановки, сохранения или удаления VM.\n" + result.URL})
+			return
+		}
+		line, ok := browserLine(result.URL, result.BrowserStatus)
+		if !ok {
 			b.fail(ctx, u, errors.New("invalid terminal URL"))
 			return
 		}
-		_ = b.tg.SendMessage(ctx, OutMessage{ChatID: u, Secret: true, Text: "Ссылка на терминал. Это секрет: любой, у кого она есть, получает shell в VM. Действует до остановки, сохранения или удаления VM.\n" + result.URL})
+		// Plain (copyable) message to the owner's own private chat only.
+		b.send(ctx, u, line)
 		return
 	}
 	text := "Операция завершена. /list"
@@ -579,6 +616,25 @@ func (b *Bot) showOperation(ctx context.Context, u int64, op controlclient.Opera
 		text += "\nОбраз: " + op.ImageID
 	}
 	b.send(ctx, u, text)
+}
+// browserLine renders the unified terminal link message. ok=false means "nothing
+// to show" for an absent status, or an invalid URL. The URL is a personal
+// session secret and is never logged.
+func browserLine(rawURL, status string) (string, bool) {
+	if rawURL != "" {
+		link, e := url.Parse(rawURL)
+		if e != nil || link.Scheme != "https" || link.Host == "" || link.User != nil {
+			return "", false
+		}
+		return "Терминал в браузере (личная ссылка, не пересылайте):\n" + rawURL, true
+	}
+	switch status {
+	case "unsupported":
+		return "Терминал в браузере недоступен: VM создана с вашим SSH-ключом. Используйте обычный SSH (/ssh).", true
+	case "pending":
+		return "Терминал в браузере ещё готовится. Повторите /terminal через минуту; обычный SSH доступен через /ssh.", true
+	}
+	return "", false
 }
 func (b *Bot) lines(ctx context.Context, u int64, lines []string) {
 	if len(lines) == 0 {
@@ -606,6 +662,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		return errors.New("delivery store required")
 	}
 	for ctx.Err() == nil {
+		b.resumeAdmin(ctx)
 		ups, e := b.tg.GetUpdates(ctx, b.Delivery.Offset(), 30)
 		if e != nil {
 			if ctx.Err() != nil {

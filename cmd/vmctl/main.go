@@ -17,7 +17,7 @@
 // Commands:
 //
 //	capabilities | list | images | get ID | ssh-info [-format json|ssh|ansible] ID
-//	create -image IMG [-name N] [-vcpu N -memory-mib M] [-key K] [-no-wait]
+//	create -image IMG [-name N] [-profile P] [-ttl-seconds N] [-key K] [-no-wait]
 //	stop ID | delete ID | commit ID NEW_IMAGE_NAME | terminal ID | delete-image IMG
 //	operation ID
 //
@@ -321,16 +321,13 @@ func execute(ctx context.Context, c *controlclient.Client, user int64, args []st
 	case "create":
 		name := fs.String("name", "", "")
 		image := fs.String("image", "", "")
-		vcpu := fs.Uint("vcpu", 0, "")
-		mem := fs.Uint("memory-mib", 0, "")
+		profile := fs.String("profile", "", "")
+		ttl := fs.Int64("ttl-seconds", 0, "")
 		key, noWait := keyFlag()
-		if err := fs.Parse(rest); err != nil || fs.NArg() != 0 || *image == "" || (*vcpu == 0) != (*mem == 0) || uint64(*vcpu) > 1<<32-1 || uint64(*mem) > 1<<32-1 {
-			return usageError{"usage: create -image IMG [-name N] [-vcpu N -memory-mib M] [-key K] [-no-wait]"}
+		if err := fs.Parse(rest); err != nil || fs.NArg() != 0 || *image == "" || *ttl < 0 {
+			return usageError{"usage: create -image IMG [-name N] [-profile P] [-ttl-seconds N] [-key K] [-no-wait]"}
 		}
-		req := controlclient.CreateRequest{Name: *name, ImageID: *image}
-		if *vcpu != 0 {
-			req.Resources = &controlclient.Resources{VCPU: uint32(*vcpu), MemoryMiB: uint32(*mem)}
-		}
+		req := controlclient.CreateRequest{Name: *name, ImageID: *image, Profile: *profile, TTLSeconds: *ttl}
 		k, err := resolveKey(*key)
 		if err != nil {
 			return err

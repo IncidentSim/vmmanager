@@ -54,7 +54,7 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		}
 		return v
 	}
-	base, uid, tokf, img, keyf := need(envBaseURL), need(envUserID), need(envTokenF), need(envImage), need(envSSHKeyF)
+	base, uid, tokf, img, keyf := need(envBaseURL), need(envUserID), need(envTokenF), need(envImage), strings.TrimSpace(getenv(envSSHKeyF))
 	direct := getenv(envDirect)
 	if direct != "1" {
 		missing = append(missing, envDirect+"=1")
@@ -89,6 +89,9 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	c.Token = strings.TrimSpace(string(b))
 	if c.Token == "" || strings.ContainsAny(c.Token, " \t\r\n") {
 		return Config{}, errors.New(envTokenF + ": file must hold exactly one token")
+	}
+	if keyf == "" {
+		return c, nil // generated/supplied test keys are made per VM; no bootstrap key
 	}
 	st, err := os.Stat(keyf)
 	if err != nil || !st.Mode().IsRegular() {

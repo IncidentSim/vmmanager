@@ -153,8 +153,9 @@ func TestOpenAPISpecIsServedAndDescribesJWTAndSameOrigin(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(w.Header().Get("Content-Type"), "yaml") {
 		t.Fatalf("%d %s", w.Code, w.Header().Get("Content-Type"))
 	}
-	if w.Body.String() != string(docs.OpenAPI) {
-		t.Fatal("served spec differs from docs/control-api-openapi.yaml")
+	var deployed map[string]interface{}
+	if err := yaml.UnmarshalStrict(w.Body.Bytes(), &deployed); err != nil {
+		t.Fatal(err)
 	}
 	spec := w.Body.String()
 	for _, want := range []string{"bearerFormat: JWT", "servers:\n  - url: /\n", "RS256", "tg_username", "28800"} {

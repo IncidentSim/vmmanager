@@ -20,23 +20,27 @@ import (
 const maxResponse = 4 << 20
 
 type Resources struct {
-	VCPU      uint32 `json:"vcpu"`
-	MemoryMiB uint32 `json:"memory_mib"`
+	CPULimit  float64 `json:"cpu_limit,omitempty"`
+	VCPU      uint32  `json:"vcpu"`
+	MemoryMiB uint32  `json:"memory_mib"`
 }
 type VM struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	ImageID   string    `json:"image_id"`
-	State     string    `json:"state"`
-	Phase     string    `json:"phase"`
-	Resources Resources `json:"resources"`
+	Profile    string     `json:"profile,omitempty"`
+	TTLSeconds int64      `json:"ttl_seconds,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	ImageID    string     `json:"image_id"`
+	State      string     `json:"state"`
+	Phase      string     `json:"phase"`
+	Resources  Resources  `json:"resources"`
 	// OwnerError: the VM's durable owner workflow ended abnormally; the VM is
 	// retained and commands are refused. Omitted (false) otherwise.
 	OwnerError bool `json:"owner_error,omitempty"`
 }
 type Image struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 	// Shared: visible and bootable by every admitted user (common registry).
 	Shared bool `json:"shared"`
 	// Phase is ready or deleting (a deleting image is not bootable).
@@ -46,18 +50,28 @@ type Image struct {
 	CanDelete bool `json:"can_delete"`
 }
 type Profile struct {
-	Name      string `json:"name"`
-	VCPU      uint32 `json:"vcpu"`
-	MemoryMiB uint32 `json:"memory_mib"`
-	DiskMiB   uint32 `json:"disk_mib,omitempty"`
+	CPULimit  float64 `json:"cpu_limit,omitempty"`
+	Name      string  `json:"name"`
+	VCPU      uint32  `json:"vcpu"`
+	MemoryMiB uint32  `json:"memory_mib"`
+	DiskMiB   uint32  `json:"disk_mib,omitempty"`
+}
+type TTLPolicy struct {
+	DefaultSeconds int64 `json:"default_seconds"`
+	MaxSeconds     int64 `json:"max_seconds"`
 }
 type Capabilities struct {
-	MaxVMs        int `json:"max_vms"`
-	MaxVMsPerUser int `json:"max_vms_per_user"`
+	DefaultProfile           string     `json:"default_profile"`
+	TTL                      *TTLPolicy `json:"ttl,omitempty"`
+	SSHPublicKeySupported    bool       `json:"ssh_public_key_supported"`
+	SSHGeneratedKeySupported bool       `json:"ssh_generated_key_supported"`
+	MaxVMs                   int        `json:"max_vms"`
+	MaxVMsPerUser            int        `json:"max_vms_per_user"`
 	// BackendMaxVMs is the backend's own cap; the API quotas above stay authoritative for owners.
 	BackendMaxVMs int `json:"backend_max_vms,omitempty"`
 	// Aggregate backend caps across live VMs; zero means not enforced/advertised.
 	MaxTotalMemoryMiB uint32    `json:"max_total_memory_mib,omitempty"`
+	MaxTotalCPULimit  float64   `json:"max_total_cpu_limit,omitempty"`
 	MaxTotalVCPU      uint32    `json:"max_total_vcpu,omitempty"`
 	Profiles          []Profile `json:"profiles"`
 }
@@ -67,13 +81,21 @@ type SSH struct {
 	User               string          `json:"user"`
 	Bastion            json.RawMessage `json:"bastion,omitempty"`
 	HostKeyFingerprint string          `json:"host_key_fingerprint"`
-	Ready              bool            `json:"ready"`
+	// Ready is a bounded host-local private TCP observation, not public ingress
+	// or SSH authentication proof. Clients must connect to Host/Port themselves.
+	Ready bool `json:"ready"`
+	// BrowserURL is the unified Nexterm browser SSH link (a per-user session
+	// secret; never log it). BrowserStatus is ready|unsupported|pending; both
+	// are absent when the API has no Nexterm configured.
+	BrowserURL    string `json:"browser_url,omitempty"`
+	BrowserStatus string `json:"browser_status,omitempty"`
 }
 type CreateRequest struct {
-	Name         string     `json:"name,omitempty"`
-	ImageID      string     `json:"image_id"`
-	Resources    *Resources `json:"resources,omitempty"`
-	SSHPublicKey string     `json:"ssh_public_key,omitempty"`
+	Profile      string `json:"profile,omitempty"`
+	TTLSeconds   int64  `json:"ttl_seconds,omitempty"`
+	Name         string `json:"name,omitempty"`
+	ImageID      string `json:"image_id"`
+	SSHPublicKey string `json:"ssh_public_key,omitempty"`
 }
 type Accepted struct {
 	OperationID string `json:"operation_id"`
@@ -91,9 +113,15 @@ type Operation struct {
 }
 
 // APIError deliberately omits the server's free-form message from Error().
+type FieldError struct {
+	Field   string `json:"field"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
 type APIError struct {
-	Code   string `json:"code"`
-	Status int    `json:"-"`
+	Fields []FieldError `json:"fields,omitempty"`
+	Code   string       `json:"code"`
+	Status int          `json:"-"`
 }
 
 func (e *APIError) Error() string {
@@ -101,7 +129,7 @@ func (e *APIError) Error() string {
 }
 func safeCode(s string) string {
 	switch s {
-	case "not_found", "unauthorized", "forbidden", "invalid_argument", "conflict", "capacity", "unavailable", "internal":
+	case "validation_failed", "profile_unknown", "vm_expired", "key_not_generated", "method_not_allowed", "not_implemented", "not_found", "unauthorized", "forbidden", "invalid_argument", "conflict", "capacity", "unavailable", "internal":
 		return s
 	}
 	return "internal"
@@ -172,7 +200,7 @@ func New(base, token string, hc *http.Client) (*Client, error) {
 	return &Client{base: strings.TrimRight(base, "/"), token: token, http: &h}, nil
 }
 func validKey(s string) bool {
-	if len(s) < 1 || len(s) > 200 {
+	if len(s) < 1 || len(s) > 128 {
 		return false
 	}
 	for _, c := range s {

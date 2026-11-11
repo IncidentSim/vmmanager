@@ -28,8 +28,13 @@ func WithSSHProber(p SSHProber) Option { return func(s *Service) { s.prober = p 
 // WithPollInterval sets the WaitSSHReady polling period.
 func WithPollInterval(d time.Duration) Option { return func(s *Service) { s.poll = d } }
 
-// TCPProber is the default probe: the port accepts a TCP connection.
+// TCPProber is the default host-local probe: the private guest TCP port accepts
+// a connection. It does not prove public ingress or an authenticated SSH login.
+// Lifecycle adapters without InternalTarget preserve their prior Host/Port target.
 func TCPProber(ctx context.Context, info SSHInfo) error {
+	if info.InternalTarget != nil {
+		info.Host, info.Port = info.InternalTarget.Host, info.InternalTarget.Port
+	}
 	d := net.Dialer{Timeout: 2 * time.Second}
 	c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(info.Host, fmt.Sprint(info.Port)))
 	if err != nil {
@@ -286,7 +291,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (VM, error) {
 		})
 	}
 
-	host, err := s.b.Prepare(ctx, PrepareRequest{Resources: req.Resources, VMID: req.ID, ImageID: req.ImageID, Profile: req.Profile, SSHPublicKey: req.SSHPublicKey})
+	host, err := s.b.Prepare(ctx, PrepareRequest{DiskMiB: req.DiskMiB, Resources: req.Resources, VMID: req.ID, ImageID: req.ImageID, Profile: req.Profile, SSHPublicKey: req.SSHPublicKey})
 	if err != nil {
 		if errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrResourceExhausted) || errors.Is(err, ErrAlreadyExists) {
 			drop() // definitive refusal: nothing was prepared
@@ -447,7 +452,8 @@ func (s *Service) Capabilities(ctx context.Context) (ResourceCapabilities, error
 		return ResourceCapabilities{}, err
 	}
 	return ResourceCapabilities{MaxVMs: c.MaxVMs, Profiles: append([]Profile(nil), c.Profiles...),
-		MaxTotalMemMiB: c.MaxTotalMemMiB, MaxTotalVCPU: c.MaxTotalVCPU}, nil
+		MaxTotalMemMiB: c.MaxTotalMemMiB, MaxTotalVCPU: c.MaxTotalVCPU,
+		MaxTotalCPULimitMilli: c.MaxTotalCPULimitMilli, DefaultProfile: c.DefaultProfile}, nil
 }
 
 func (s *Service) SSHInfo(ctx context.Context, id string) (SSHInfo, error) {
@@ -467,6 +473,16 @@ func (s *Service) SSHInfo(ctx context.Context, id string) (SSHInfo, error) {
 		PublicKeyProvisioned: h.PublicKeyProvisioned, HostKeyPolicy: HostKeyAcceptNewPerVM,
 		HostKeyFingerprint: h.HostKeyFingerprint, Bastion: caps.Bastion, KeyReference: rec.keyRef,
 		Guest: h.Guest}
+	if h.GuestIP != "" {
+		info.InternalTarget = &SSHEndpoint{Host: h.GuestIP, Port: 22}
+	}
+	if h.SSHEndpoint != nil {
+		info.Host, info.Port = h.SSHEndpoint.Host, h.SSHEndpoint.Port
+		info.Bastion = nil
+	}
+	if h.SSHAuthMode != "" {
+		info.AuthMode = h.SSHAuthMode
+	}
 	if info.AuthMode == "" {
 		info.AuthMode = AuthImagePreinstalled
 	}

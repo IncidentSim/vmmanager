@@ -6,18 +6,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
+	"github.com/petruekhin/vibe-firecracker/vmlib"
+
+	"github.com/firecracker-microvm/firecracker-go-sdk/client"
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
+	"github.com/firecracker-microvm/firecracker-go-sdk/client/operations"
+	httptransport "github.com/go-openapi/runtime/client"
+	"github.com/go-openapi/strfmt"
 	"github.com/sirupsen/logrus"
 )
 
 // HelperLauncher invokes an operator-installed, root-owned helper by absolute
-// path with exactly two arguments: the fixed verb "start-slot" and a bounded
-// integer. It adds no shell, no sudo and no caller-supplied text. How the
+// path with exactly three arguments: the fixed verb "start-slot", a bounded
+// slot integer and the VMM CPU quota in millicores (the helper turns it into the
+// unit's systemd CPUQuota=). It adds no shell, no sudo and no caller-supplied text. How the
 // helper obtains privilege (and which units it can touch) is an operator
 // decision documented in deployment/multi-vm; it is not performed here.
 type HelperLauncher struct{ path string }
@@ -29,11 +38,14 @@ func NewHelperLauncher(path string) (*HelperLauncher, error) {
 	return &HelperLauncher{path: path}, nil
 }
 
-func (h *HelperLauncher) StartSlot(ctx context.Context, slot int) error {
+func (h *HelperLauncher) StartSlot(ctx context.Context, slot int, cpuMilli uint32) error {
 	if slot < 0 || slot >= maxSlots {
 		return fmt.Errorf("slot %d out of range", slot)
 	}
-	out, err := exec.CommandContext(ctx, h.path, "start-slot", strconv.Itoa(slot)).CombinedOutput()
+	if err := vmlib.ValidateCPULimitMilli(cpuMilli); err != nil {
+		return err
+	}
+	out, err := exec.CommandContext(ctx, h.path, "start-slot", strconv.Itoa(slot), strconv.FormatUint(uint64(cpuMilli), 10)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("helper start-slot %d: %w: %s", slot, err, out)
 	}
@@ -52,7 +64,25 @@ type SDKVMM struct{ RunDir string }
 var _ VMM = SDKVMM{}
 
 func (v SDKVMM) client(slot int) *firecracker.Client {
-	return firecracker.NewClient(SocketPath(v.RunDir, slot), logrus.NewEntry(logrus.New()), false)
+	logger := logrus.NewEntry(logrus.New())
+	socket := SocketPath(v.RunDir, slot)
+	// These SDK clients are short-lived. The SDK's default transport retains
+	// idle sockets indefinitely, eventually exhausting Firecracker's connection
+	// limit. Own the transport and close each connection after its response,
+	// including decoded API errors; no client cache or cleanup owner is needed.
+	transport := httptransport.New(client.DefaultHost, client.DefaultBasePath, client.DefaultSchemes)
+	transport.Transport = &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+		},
+	}
+	transport.SetLogger(logger)
+	// Keep the SDK's typed methods and timeout/context handling, replacing only
+	// their generated operations client's transport. Do not add a detached
+	// context or an http.Client.Timeout that overrides caller/SDK deadlines.
+	return firecracker.NewClient(socket, logger, false,
+		firecracker.WithOpsClient(operations.New(transport, strfmt.Default)))
 }
 
 func (v SDKVMM) Info(ctx context.Context, slot int) (VMMInfo, error) {

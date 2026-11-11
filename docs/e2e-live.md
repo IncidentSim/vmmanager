@@ -1,142 +1,186 @@
-# Live E2E tests (opt-in)
+# Real live E2E (explicit opt-in)
 
-`e2e/` contains Go tests that drive a **real, deployed** `vmapi` over its public
-HTTPS API (reusing `controlclient`) and log into real guests with the system
-`ssh` client. They create and delete real VMs and images. They are separate from
-the fake-backend tests (`make check`, `make control-smoke`), which stay unchanged.
+`e2e/` uses the current `controlclient` against a deployed HTTPS API, real
+Firecracker guests and real OpenSSH login. It is **not** a fake provisioning or
+CPU-enforcement test. Ordinary tests skip live cases before reading fixture files
+or issuing requests. No new live run is claimed by this change.
 
-Without `VMAPI_E2E=1` every live test skips; `go test ./...` only runs the pure
-harness unit tests (config validation, naming, polling, cleanup against a fake).
-
-## Run
+## Run (operator only)
 
 ```sh
 export VMAPI_E2E=1
-export VMAPI_E2E_BASE_URL=https://HOST[:PORT]       # https only, no path
-export VMAPI_E2E_USER_ID=<positive integer>          # user the token belongs to
-export VMAPI_E2E_TOKEN_FILE=/path/to/token           # file with one bearer token
-export VMAPI_E2E_BASE_IMAGE_ID=<image id>            # bootable, ready, preinstalled with the SSH key below
-export VMAPI_E2E_SSH_KEY_FILE=/path/to/id_key        # private key (mode 0600) accepted by that image
-export VMAPI_E2E_SSH_DIRECT=1                        # acknowledge the routing boundary below
-# optional:
-export VMAPI_E2E_SSH_KNOWN_HOSTS_FILE=/path/to/trusted_known_hosts   # see host-key policy
-export VMAPI_E2E_RESTART_USER_UNIT=firecracker-vmapi.service
-make e2e-live        # = go test -count=1 -p 1 -timeout 45m -v ./e2e
+export VMAPI_E2E_BASE_URL=https://HOST[:PORT]
+export VMAPI_E2E_USER_ID=123
+export VMAPI_E2E_TOKEN_FILE=/private/owner-token
+export VMAPI_E2E_BASE_IMAGE_ID=bootable-configured-image
+export VMAPI_E2E_SSH_DIRECT=1
+# Optional sole host trust source, if authenticated API fingerprint is unavailable:
+export VMAPI_E2E_SSH_KNOWN_HOSTS_FILE=/private/trusted_known_hosts
+GOMAXPROCS=2 go test -count=1 -p 1 -timeout 45m -v ./e2e
 ```
 
-`make e2e-live` refuses to run unless `VMAPI_E2E=1`. It is not part of
-`make check`. With `VMAPI_E2E=1` a missing/invalid variable is a hard failure
-(never a silent skip). Secrets are only read from files; the token and key are
-never put in Git, logs, or error messages. Output logs resource IDs only.
+The host must route directly to the guest endpoint returned by the API. The base
+image must satisfy the deployed offline SSH provisioning format (see
+`docs/ssh-access.md`) and have working sshd before boot. No shared/default SSH
+private key is used. `VMAPI_E2E_SSH_KEY_FILE` is a legacy optional setting, validated
+if present but **not used for login**. Generated identities come from the owner-only
+`GET /v1/vms/{id}/ssh-key`; supplied identities are freshly generated per test and
+their real public keys are passed to Create. Private keys exist only in private
+Go temporary directories, removed at test cleanup, and are never logged or added
+to reports. Token files are never printed.
 
-## What is tested (each test serial, bounded to 8 min; cleanup bounded to 5 min)
+Create uses `profile` and `ttl_seconds`, never public `resources`. Normal fixtures
+request min(600, advertised max TTL) seconds; tests fail if finite policy/default
+profile is absent. Very short deployment maxima may not allow long lifecycle/SSH
+fixtures to finish; this is a policy constraint, not a reason to disable TTL.
 
-| Test | Checks |
+## Public SSH / automatic guest networking
+
+`TestLiveGuestNetworkAndSlotReuse` creates two sequential disposable VMs through
+`controlclient`; each is tracked before assertions and removed through normal
+receipt-checked Delete. It checks the advertised public host/slot port/no bastion,
+automatic default route and DNS (without modifying either), two actual HTTPS 200
+responses, and timed-out guest connections to host SSH/API, metadata and a Docker
+private address. It cooperatively reboots only its own guest before Delete.
+
+In addition to the common variables above:
+
+```sh
+export VMAPI_E2E_NETWORK=1
+export VMAPI_E2E_NETWORK_HOST=185.70.184.64
+export VMAPI_E2E_NETWORK_PORT_BASE=22000
+# Optional: require the second VM to reuse the first port; needs exclusive admission.
+export VMAPI_E2E_NETWORK_REUSE=1
+# HOST-LOCAL mode only: use explicit private /16 prefix plus advertised slot.
+# Omit this when testing public SSH from an independent external machine.
+export VMAPI_E2E_NETWORK_PRIVATE_PREFIX=10.213
+GOMAXPROCS=2 go test -p 1 -count=1 -timeout 12m -v ./e2e -run '^TestLiveGuestNetworkAndSlotReuse$'
+```
+
+The host-local mode logs its limitation explicitly; it is NOT public-ingress
+acceptance. Run without the private prefix from another machine for authenticated
+public-endpoint SSH, using an operator-trusted known_hosts file for those public
+host:port tuples. Sequential same-port reuse does NOT prove stale established
+conntrack sessions cannot reach a successor. Cross-tenant live peers, IPv6/spoofed
+packets and kernel conntrack-session retirement need separate acceptance cases;
+source-level firewall/helper tests are not substitutes for them.
+
+## Acceptance coverage
+
+| Test | Real assertions |
 |---|---|
-| `TestPublicDocsHealthAndAuth` | `/healthz`; `/docs` page references only local assets, CSP present; Swagger CSS/JS/initializer/favicon served; unknown asset path not served; `/openapi.yaml` parses and is byte-identical to this checkout's `docs/control-api-openapi.yaml` (and parses equal); unauthenticated GET/POST and an invalid bearer get 401. Read-only; creates nothing. |
-| `TestLifecycleStopCommitsAndConflicts` | Create 202; same key+body replays same VM/op; same key, changed body → 409; bounded SSH readiness; real guest login + marker file; Stop → `stopped`, readiness false; Terminal on stopped → 409; two cold Commits from the stopped VM, submitted serially (first awaited before the second), both become ready; deleting the source keeps both images; base image untouched. |
-| `TestDerivativeFromCommittedImage` | marker written, stop, commit, delete source, new VM from the image reads the exact marker; deleting the in-use image → 409; after deleting the derivative the image deletes and reads 404. |
-| `TestEarlyDeleteAfterCreate` | Delete admitted right after Create; delete op succeeds, VM ends 404. |
-| `TestOptionalAPIRestart` | only with `VMAPI_E2E_RESTART_USER_UNIT`, see below. |
+| `TestPublicDocsHealthAndAuth` | Health, local Swagger assets/CSP, parsed OpenAPI equality with source after removing **only** dynamic `CreateVM.example`, unauthenticated/invalid bearer rejection, valid auth. No byte-equality claim for configured documents. |
+| `TestConfiguredSwaggerCreateExample` | Fetch published configured `components.schemas.CreateVM.example`, reject unknown body fields, execute its exact image/profile/TTL values through the authenticated SDK without repairing/replacing the example; await boot and generated-key SSH login. Missing configured example fails. |
+| `TestLifecycleStopCommitsAndConflicts` | Create/replay/conflict, stable generated key across repeated retrieval and Create replay, no-store header, actual login and marker, Stop, stopped Terminal conflict, two **sequential** cold Commits, images survive source deletion. |
+| `TestSuppliedKeyLogin` | Supply a fresh real Ed25519 public key, actual login with its matching private key, generated-key retrieval returns `409 key_not_generated`. |
+| `TestForeignKeyRetrieval` | Separately authenticated other user cannot retrieve owner keys through SDK or raw response. Requires explicit second-principal fixture below; otherwise explicit skip. |
+| `TestDerivativeFromCommittedImage` | Marker persists; derivative independently logs in using its newly retrieved generated identity; in-use image deletion conflicts, then succeeds after derivative deletion. |
+| `TestCommitCredentialHygiene` | Attach Terminal first, inspect original owner/terminal managed authorized entries over SSH; preserve a legitimate guest-added key, original non-managed lines and marker; cold Commit; derivative authenticates independently; neither original ephemeral entry survives, derivative credentials differ, old owner identity cannot log in. No rootfs/credential-store inspection. Requires documented managed entry tags; absence fails rather than claiming hygiene. Does not exercise browser/WebSocket terminal. |
+| `TestFiniteTTL` | Capture before/after HTTP Create bracket; require deadline within `[before + requested TTL - 2s, after + requested TTL + 2s]` and matching effective TTL. Poll for ID-scoped 404 with a one-minute bound, rejecting any observed disappearance before `before + requested TTL - 2s`; optional restart verifies deadline not reset (already-expired readback explicitly leaves persistence NOT proven). Requests min(30,max) seconds. |
+| `TestTTLBusyCreate` | One-second real Create, attempt to observe expired record while child operation remains pending/running; ordinary command must return `vm_expired`, then VM disappears. If no overlap can be observed, cleans fixtures then explicitly skips: busy-child deferral was **not proven**. No forced kill or backend delay injection. |
+| `TestProfileAndQuotaMetadata` | Positive quotas, generated/supplied support and default CPU cap; VM effective profile/vCPU/memory/CPU match capabilities. **Metadata is not cgroup evidence.** |
+| `TestOptionalPerUserQuotaAdmission` | Separate quota-saturation opt-in, at most four owned fixtures, one more Create returns 429 and count unchanged. Does not distinguish per-user/global/backend capacity when those bind simultaneously. |
+| `TestOptionalPhysicalCPUReadback` | Separate host opt-in and trusted VM→PID resolver; independently read actual Firecracker PID's cgroup v2 `cpu.max`, require isolated single-process cgroup and finite ratio equal to effective cap. No API JSON substituted for kernel readback. |
+| `TestEarlyDeleteAfterCreate` | Queued early deletion waits for Create then removes the owned VM. |
+| `TestOptionalAPIRestart` | Explicit user-unit restart; same VM/deadline, endpoint, key, guest boot ID and marker. Does not prove VMM process identity. |
 
-Names are `e2e<6 hex>-<tag>` (≤20 chars, API label pattern); idempotency keys are
-unique per call. At most one VM per user is live at a time per test.
+The TTL check permits an explicit two-second client/server clock skew and timestamp
+rounding tolerance, not an arbitrary shortened lifetime: a one-second deadline for
+a thirty-second request fails. Polling only constrains **observed** disappearance;
+it does not prove the exact deletion instant between reads or during restart.
+For deployment maxima shorter than the tolerance, the lower-bound timing evidence
+is necessarily weak; the requested/effective TTL and deadline bracket still apply.
 
-## Safety rules implemented
+## Separate destructive/host gates
 
-* **Capacity before side effects:** `GET /v1/capabilities`, the user's VM list and the
-  base image are checked first. If the user has no headroom (per-user / API cap) or no
-  profile fits the aggregate caps, the test **skips with a `SKIP (capacity)` message**.
-  A missing/not-ready base image fails. No global empty state is assumed; other users'
-  VMs elsewhere are not visible to the test, so a backend that is full for other
-  reasons surfaces as a 429/capacity failure from Create (the test fails, then cleans up).
-* **Cleanup:** every ID returned by an admitted Create/Commit is registered immediately,
-  *before* waiting, and kept even if the wait fails. Cleanup runs on a fresh bounded
-  context, deletes only those IDs (VMs, then images), refuses the base image, tolerates
-  404, retries image delete on 409 while a VM reference drains, and reports every error
-  with `t.Errorf` (a failed cleanup fails the test; leftovers are listed by ID).
-  Preexisting resources and the base image are never deleted.
-  A baseline of the user's VMs and images is captured in preflight; an admitted ID that is
-  empty, the base image, or preexisting is refused (never tracked, never deleted), and every
-  test-side image deletion goes through the same base/preexisting/untracked guard. A mutation
-  that unexpectedly succeeds (idempotent replay, changed-body create) has its new VM ID
-  tracked before the assertion fails. A lost/unknown mutation response is a documented limit:
-  untracked resources are never deleted.
-* No `state.json` reads, no filesystem/DB access to the service, no service control
-  by default.
-* TLS verification is the Go default (no bypass; redirects are not followed). The
-  token goes only to `BASE_URL` via `controlclient`.
+Second user (not inferred from host/private configuration):
 
-## Guest SSH: routing boundary and host-key policy
+```sh
+export VMAPI_E2E_OTHER_USER_ID=456
+export VMAPI_E2E_OTHER_TOKEN_FILE=/private/distinct-user-token
+```
 
-The test SSHes to the **host:port returned by the API**, directly. That address is a
-private guest address; it is only reachable from the deployment host (or a network
-that routes to it). Therefore run on that host and set `VMAPI_E2E_SSH_DIRECT=1`
-explicitly. Bastion metadata is not used; running from a laptop is unsupported.
+Both must identify a valid **distinct** ordinary principal. Missing both gives an
+explicit isolation skip; partial/invalid fixtures fail. No second-user mutations
+or token minting occur.
 
-Host keys: `ssh-keyscan` fetches the guest's keys, and only a key whose SHA256
-fingerprint equals `host_key_fingerprint` from the (TLS-authenticated) API is written
-into a private temporary `known_hosts`; `ssh` then runs with
-`StrictHostKeyChecking=yes`, `IdentitiesOnly`, `BatchMode`, password auth off and the
-global/user known-hosts ignored. If the API gives no `SHA256:` fingerprint or none
-matches, the test fails.
+Restart is destructive to concurrent API requests and must be separately approved:
 
-Optional `VMAPI_E2E_SSH_KNOWN_HOSTS_FILE`: an operator-trusted `known_hosts` file
-(must be a readable regular file; contents are never logged). When set it is the
-**only** host-key trust source: `ssh` uses it directly with
-`StrictHostKeyChecking=yes`, no `ssh-keyscan`, and the API fingerprint is not
-consulted (the real local backend may return it empty). Trust boundary: the
-operator vouches that the file holds the right keys for the guest `host:port`
-(use `[host]:port` entries for non-22 ports); a guest with no matching entry fails
-the SSH handshake. Nothing is auto-trusted or accepted on first use. When unset,
-the API-fingerprint matching above applies unchanged. `StrictHostKeyChecking=no` is never used. `ssh`/`ssh-keyscan`/
-`ssh-keygen` are executed directly (no shell); the remote command is a fixed string
-with a random hex marker.
+```sh
+export VMAPI_E2E_RESTART_USER_UNIT=firecracker-vmapi.service
+# additionally include a restart DURING the short-TTL fixture:
+export VMAPI_E2E_TTL_RESTART=1
+```
 
-## Optional API restart test
+Only the explicit plain unit name is passed to `systemctl --user restart`, bounded
+to 90 seconds; no sudo/system service control. `TTL_RESTART=1` without the unit
+fails when the TTL test is enabled. Deadline equality is checked if the record
+still exists; an already expired 404 explicitly skips because it is not restart-persistence
+proof. Run with enough TTL/startup margin to observe the persisted record.
 
-Runs only when `VMAPI_E2E_RESTART_USER_UNIT=NAME.service` is set (validated as a plain
-unit name). It executes `systemctl --user restart NAME.service` with a 90 s timeout
-(needs a user session, i.e. `XDG_RUNTIME_DIR`), waits for `/healthz`, then requires
-unchanged VM record, SSH host/port/fingerprint, the guest marker, and the guest's
-`/proc/sys/kernel/random/boot_id`. **Boundary:** this shows API-visible and guest-visible
-continuity (the guest was not rebooted or recreated). It does **not** prove the VMM
-process or its invocation was untouched; that needs host-side process inspection, which
-these tests deliberately do not do. No service is touched without that variable.
+Quota saturation is separately enabled with `VMAPI_E2E_QUOTA=1`. Existing owned
+VMs consume headroom but are **never deleted**. Other users' invisible occupancy
+can prevent the fixture from filling; report that failure/skip honestly.
 
-## Evidence boundary
+Physical CPU readback (on the actual deployment host only):
 
-Proves, for the deployed revision: public HTTP/Swagger/OpenAPI behaviour and equality
-with this checkout, authn rejection, idempotency/conflict semantics, real guest boot
-and authenticated on-host SSH, cold-commit data persistence, image protection, early
-delete, and cleanup of the objects the run created. Does not prove: reachability from
-other hosts, browser terminal/WebSocket use (Terminal is only checked for the 409 on a
-stopped VM), power loss, forced VMM kill, multi-user isolation, or VMM identity across
-restart. See also `docs/vm-owner-live-verification.md` for the manual acceptance record.
+```sh
+export VMAPI_E2E_HOST_READBACK=1
+export VMAPI_E2E_VMM_PID_RESOLVER=/absolute/operator-owned/read-only-vm-to-vmm-pid
+```
 
-## Verified live run
+The resolver is an explicit trusted executable, not writable by group/world,
+called directly with **one VM ID**. It must output **only** that VM's positive
+Firecracker PID, or fail. It must be read-only; never launch/restart/kill a VM or
+change a quota. The harness does not supply a guessed slot mapping, inspect
+private backend state or run sudo. Operator must independently validate this
+mapping for the deployed launcher; it is a stated trust boundary. The harness
+checks `/proc/PID/exe`, `/proc/PID/cgroup`, `/sys/fs/cgroup/.../cgroup.procs` and
+`cpu.max` itself. Unsupported cgroup v1, unreadable proc/cgroup, shared cgroup,
+unlimited CPU or wrong ratio **fail once opted in**, not pass from metadata.
+Without the gate it explicitly skips. This proves configured kernel quota for the
+operator-resolved VMM, not measured CPU throughput under stress. Root access, if
+needed to make those files readable, requires separate operator approval outside
+this harness; no automatic elevation exists.
 
-The complete opt-in suite was executed against the deployed cleanup revision
-`913ad5d`, using real Firecracker guests, the production HTTPS endpoint and a
-short-lived operator JWT read from a private file. The explicit trusted
-known-hosts file was used because this backend returns an empty host-key
-fingerprint. SSH still used `StrictHostKeyChecking=yes`.
+## Host-key policy (never relaxed)
 
-All five live tests passed, without capacity skips:
+`StrictHostKeyChecking=yes`, `IdentitiesOnly=yes`, `BatchMode=yes`, password auth
+off, agent forwarding off, no connection multiplex reuse, global known_hosts
+ignored. Without the optional trusted file, `ssh-keyscan` keys are admitted only
+when their SHA256 fingerprint equals the TLS-authenticated API fingerprint. Empty
+or mismatching fingerprints fail. With `VMAPI_E2E_SSH_KNOWN_HOSTS_FILE`, that
+operator-trusted regular file is the **only** trust source, used verbatim. There
+is no TOFU, `accept-new`, or `StrictHostKeyChecking=no`; non-22 ports need trusted
+`[host]:port` entries. TLS uses default certificate verification; redirects are
+not followed. No secrets are sent to another origin.
 
-* `TestPublicDocsHealthAndAuth`
-* `TestLifecycleStopCommitsAndConflicts`
-* `TestDerivativeFromCommittedImage`
-* `TestEarlyDeleteAfterCreate`
-* `TestOptionalAPIRestart` (explicit user-unit restart enabled)
+## Cleanup and limits
 
-`make e2e-live` exited 0 in 73.355 s. Cleanup completed for every tracked resource;
-a separate operator inspection found zero VM records and no pending/running
-operations, and the API user service remained active. No preexisting image was
-deleted. Parent also ran full uncached `GOMAXPROCS=2 GOFLAGS=-count=1 make check`
-after the E2E additions: exit 0; live tests were gated off in that ordinary check.
+Tests are serial; each has an eight-minute context and fresh five-minute cleanup
+context. Preflight snapshots this user's VM/image IDs, reads caps/base image and
+skips visibly on known capacity exhaustion. It does not assume a globally empty
+host. Every returned nonempty Create/Commit VM/image ID is tracked before waits
+or success assertions, including replay/conflict unexpected successes. All VM
+and image deletes are ID-scoped and guarded against baseline/preexisting/base
+images and untracked IDs; cleanup never performs bulk deletion. Sequential cold
+Commits remain mandatory. Errors are reported as test failures; leftover IDs are
+not silently dropped. A response lost before an ID is returned cannot safely be
+cleaned by enumeration; no broad deletion is attempted.
 
-An initial live run failed safely because it required an API fingerprint that
-this backend does not provide; all fixtures were cleaned. The operator-trusted
-known-hosts option resolves that harness mismatch without disabling SSH checks.
-These passing results are not browser WebSocket or off-host SSH evidence.
+## Verification status / remaining live evidence
+
+The new suite is compiled and its harness unit tests run with `VMAPI_E2E=0`.
+**No live endpoint, private service configuration/credentials, root actions or
+restart was used during development.** Historical five-test evidence at revision
+`913ad5d` predates these profile/TTL/personal-SSH checks and does not validate them.
+
+Remaining acceptance: operator deploys the integrated revision with supported
+image, encrypted credential store, profiles and enforced CPU cgroups; supplies
+trusted host keys/direct routing and ordinary token fixtures; runs all real SSH,
+Swagger, Commit, TTL and cleanup cases; explicitly enables second-user isolation,
+restart/TTL restart and quota gates; provides audited VM→PID readback transport.
+A busy-child overlap must actually be observed (otherwise reported unproven),
+and short-TTL restart must retain a readable unchanged deadline to count as
+persistence evidence. Browser ttyd/WebSocket use, off-host SSH, power loss,
+process-level no-preemption and global quota isolation remain outside these tests.

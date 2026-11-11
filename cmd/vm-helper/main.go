@@ -1,8 +1,8 @@
 // vm-helper is the ROOT side of the privilege boundary (proposed; source only).
 // systemd socket-activates one instance per connection (Accept=yes) with the
-// connection on stdin/stdout; it serves exactly one request line, "start-slot N",
-// and can start only an idle firecracker-vm@N.service. The authorization is the
-// socket's owner/group/mode in fc-vm-helper.socket; no sudo/polkit rule is needed.
+// connection on stdin/stdout; it serves exactly one request line, "start-slot N CPU_MILLI", sets
+// that CPUQuota on (and reads it back), then starts only an idle
+// firecracker-vm@N.service. The authorization is the socket's owner/group/mode in fc-vm-helper.socket; no sudo/polkit rule is needed.
 package main
 
 import (
@@ -19,6 +19,11 @@ const (
 	systemctl = "/usr/bin/systemctl"
 )
 
+// handlerForPool derives privileged behavior only from root-owned pool.conf.
+func handlerForPool(pool vmhelper.Pool) vmhelper.SystemdHandler {
+	return vmhelper.SystemdHandler{Systemctl: systemctl, PublicEnabled: pool.PublicIPv4 != ""}
+}
+
 func main() {
 	if len(os.Args) != 1 {
 		fmt.Fprintln(os.Stderr, "vm-helper takes no arguments")
@@ -31,7 +36,7 @@ func main() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if err := vmhelper.Serve(ctx, os.Stdin, os.Stdout, vmhelper.SystemdHandler{Systemctl: systemctl}, pool.MaxSlots); err != nil {
+	if err := vmhelper.Serve(ctx, os.Stdin, os.Stdout, handlerForPool(pool), vmhelper.Limits{Slots: pool.MaxSlots, MaxCPUMilli: pool.MaxSlotCPUMilli}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

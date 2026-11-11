@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,11 +44,13 @@ const maxSlots = 64
 
 var invocationPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
-// Launcher starts the externally installed per-slot VMM service. The slot is a
-// bounded integer chosen by this backend; nothing else crosses this seam. A
-// returned error does NOT prove that nothing was started.
+// Launcher starts the externally installed per-slot VMM service. The slot and
+// the VMM's CPU quota (millicores, the VM's persisted reservation) are chosen by
+// this backend; nothing else crosses this seam. The launcher must make the unit
+// run under exactly that CPU quota or fail. A returned error does NOT prove that
+// nothing was started.
 type Launcher interface {
-	StartSlot(ctx context.Context, slot int) error
+	StartSlot(ctx context.Context, slot int, cpuMilli uint32) error
 }
 
 // VMMInfo is what a VMM's API reports about itself.
@@ -57,10 +60,13 @@ type VMMInfo struct{ ID, State string }
 // profile and the server-owned workspace.
 type MachineSpec struct {
 	VCPU, MemMiB uint32
-	Kernel       string
-	BootArgs     string
-	DiskJailPath string
-	Tap, MAC     string
+	// CPULimitMilli is informational here: the VMM API has no CPU-time knob; the
+	// physical limit is the unit's CPUQuota applied through the Launcher.
+	CPULimitMilli uint32
+	Kernel        string
+	BootArgs      string
+	DiskJailPath  string
+	Tap, MAC      string
 }
 
 // VMM is the narrow control surface of one slot's Firecracker API socket.
@@ -73,6 +79,12 @@ type VMM interface {
 
 // Config is server policy. Clients never supply any of it.
 type Config struct {
+	// CooperativeShutdown is an optional, bounded best-effort managed-guest
+	// reboot request. It is not exit proof and is never used for legacy guests.
+	CooperativeShutdown CooperativeShutdown
+	// Access is an optional offline provisioner plus credential lifecycle hook.
+	// It is called only on exclusively owned, unmounted disk copies.
+	Access    OfflineAccess
 	WorkRoot  string // per-VM workspaces: <WorkRoot>/vms/<id>/{disk.ext4,meta.json}
 	ImagesDir string // image catalog: <id>.ext4
 	RunDir    string // launcher runtime: <RunDir>/slot-<n>/<invocation>.exit.json
@@ -80,6 +92,7 @@ type Config struct {
 	Profiles  []vmlib.Profile
 	SSHUser   string
 	Bastion   *vmlib.Bastion
+	PublicSSH *vmlib.PublicSSHConfig // operator-only; nil inherits PoolConf, or legacy routing without a pool
 	Launcher  Launcher
 	VMM       VMM
 
@@ -88,6 +101,13 @@ type Config struct {
 	// budget (see deployment/resources.md); a slice limit alone is not admission.
 	MaxTotalMemMiB uint32
 	MaxTotalVCPU   uint32
+	// MaxTotalCPULimitMilli bounds the SUM of the VMMs' CPU-time limits
+	// (millicores). It must not exceed the parent slice's CPUQuota. 0 defaults to
+	// MaxTotalVCPU*1000, i.e. the pre-cpu_limit meaning of the vCPU budget.
+	MaxTotalCPULimitMilli uint32
+	// DefaultProfile is advertised through Capabilities; "" picks "small" if it
+	// is configured, else the first profile.
+	DefaultProfile string
 	// UnitMemLimitMiB is the installed per-instance MemoryMax; every profile must
 	// satisfy MemMiB+VMMOverheadMiB <= UnitMemLimitMiB.
 	UnitMemLimitMiB uint32
@@ -100,11 +120,13 @@ type Config struct {
 	GuestPrefix string
 	// PoolConf, when set, is the root-owned pool file shared with the network
 	// script and helper; it must agree with GuestPrefix and cover MaxVMs.
+	// Its publication settings are authoritative over PublicSSH.
 	PoolConf string
 
 	// GuestDNS and GuestConfiguration are advertised to clients as guest network
 	// metadata. GuestConfiguration defaults to "mac-derived": the base image is
 	// expected to derive its /30 address from the MAC (Firecracker CI Ubuntu rootfs).
+	GuestNetwork       OfflineGuestNetwork // optional private-copy boot provisioning
 	GuestDNS           []string
 	GuestConfiguration string
 
@@ -139,16 +161,24 @@ const (
 )
 
 type meta struct {
-	ID      string `json:"id"`
-	ImageID string `json:"image_id"`
-	Profile string `json:"profile"`
-	Slot    int    `json:"slot"`
+	AccessManaged bool   `json:"access_managed,omitempty"`
+	AccessIntent  string `json:"access_intent,omitempty"`
+	ID            string `json:"id"`
+	ImageID       string `json:"image_id"`
+	Profile       string `json:"profile"`
+	Slot          int    `json:"slot"`
 	// MemMiB and VCPU are the reservation the VM was ADMITTED with. They are
 	// persisted so a later edit of the profile (or its removal) cannot change what
 	// a live VM is counted or configured as. Zero = metadata from before
 	// reservations existed; reconcile fills it conservatively.
-	MemMiB     uint32 `json:"mem_mib,omitempty"`
-	VCPU       uint32 `json:"vcpu,omitempty"`
+	MemMiB uint32 `json:"mem_mib,omitempty"`
+	VCPU   uint32 `json:"vcpu,omitempty"`
+	// CPULimitMilli is the CPU-time quota (millicores) the VMM is started under,
+	// persisted for the same reason. Zero = written before CPU limits existed;
+	// it is then counted and enforced at VCPU*1000.
+	CPULimitMilli uint32 `json:"cpu_limit_milli,omitempty"`
+	// Zero denotes an old reservation, not permission to recompute a new bound.
+	DiskMiB    uint32 `json:"disk_mib,omitempty"`
 	State      string `json:"state"`
 	Invocation string `json:"invocation,omitempty"`
 	Retained   bool   `json:"retained,omitempty"`
@@ -257,6 +287,13 @@ func lockDir(dir string) (*os.File, error) {
 // New validates policy, takes exclusive ownership of the roots and reconciles
 // existing host state, failing closed.
 func New(cfg Config) (*Backend, error) {
+	if err := cfg.PublicSSH.ValidateSlots(cfg.MaxVMs); err != nil {
+		return nil, err
+	}
+	if cfg.PublicSSH != nil {
+		policy := *cfg.PublicSSH
+		cfg.PublicSSH = &policy
+	}
 	if cfg.MaxVMs < 1 || cfg.MaxVMs > maxSlots {
 		return nil, fmt.Errorf("MaxVMs must be 1..%d", maxSlots)
 	}
@@ -269,10 +306,16 @@ func New(cfg Config) (*Backend, error) {
 	if err := vmhelper.ValidatePrefix(cfg.GuestPrefix); err != nil {
 		return nil, fmt.Errorf("GuestPrefix is required: %w", err)
 	}
+	var pool vmhelper.Pool
 	if cfg.PoolConf != "" {
-		pool, err := vmhelper.ReadPool(cfg.PoolConf)
+		var err error
+		pool, err = vmhelper.ReadPool(cfg.PoolConf)
 		if err != nil {
 			return nil, fmt.Errorf("pool configuration: %w", err)
+		}
+		cfg.PublicSSH, err = publicSSHFromPool(pool, cfg.PublicSSH, cfg.MaxVMs)
+		if err != nil {
+			return nil, err
 		}
 		if pool.Prefix != cfg.GuestPrefix || cfg.MaxVMs > pool.MaxSlots {
 			return nil, fmt.Errorf("pool file (%s, %d slots) disagrees with backend policy (%s, %d VMs)", pool.Prefix, pool.MaxSlots, cfg.GuestPrefix, cfg.MaxVMs)
@@ -281,22 +324,58 @@ func New(cfg Config) (*Backend, error) {
 	if cfg.VMMOverheadMiB == 0 {
 		cfg.VMMOverheadMiB = 64
 	}
+	if cfg.MaxTotalCPULimitMilli == 0 {
+		if cfg.MaxTotalVCPU > math.MaxUint32/vmlib.CPUMilli {
+			return nil, errors.New("MaxTotalVCPU is too large")
+		}
+		cfg.MaxTotalCPULimitMilli = cfg.MaxTotalVCPU * vmlib.CPUMilli
+	}
+	if cfg.MaxTotalCPULimitMilli == 0 || cfg.MaxTotalCPULimitMilli%vmlib.CPUQuotaStepMilli != 0 {
+		return nil, errors.New("MaxTotalCPULimitMilli must be a positive multiple of 10")
+	}
+	// Normalize into a private copy: a profile without a CPU limit (policy that
+	// predates cpu_limit) keeps meaning "the whole vCPU allowance".
+	cfg.Profiles = append([]vmlib.Profile(nil), cfg.Profiles...)
+	for i := range cfg.Profiles {
+		if cfg.Profiles[i].CPULimitMilli == 0 && cfg.Profiles[i].VCPU > 0 && cfg.Profiles[i].VCPU <= vmlib.MaxVCPU {
+			cfg.Profiles[i].CPULimitMilli = cfg.Profiles[i].VCPU * vmlib.CPUMilli
+		}
+	}
+	cfg.GuestDNS = append([]string(nil), cfg.GuestDNS...)
 	if cfg.GuestConfiguration == "" {
 		cfg.GuestConfiguration = "mac-derived"
 	}
+	seenProfiles := map[string]bool{}
 	for _, p := range cfg.Profiles {
-		if err := vmlib.ValidateID("profile", p.Name); err != nil {
-			return nil, err
+		if seenProfiles[p.Name] {
+			return nil, fmt.Errorf("duplicate profile %q", p.Name)
 		}
-		if p.VCPU == 0 || p.MemMiB == 0 {
-			return nil, fmt.Errorf("profile %s needs vcpu and mem_mib", p.Name)
+		seenProfiles[p.Name] = true
+		if cfg.PoolConf != "" {
+			if p.CPULimitMilli > pool.MaxSlotCPUMilli {
+				return nil, fmt.Errorf("profile %s exceeds pool CPU ceiling", p.Name)
+			}
+		}
+		if err := p.Validate(); err != nil {
+			return nil, err
 		}
 		if uint64(p.MemMiB)+uint64(cfg.VMMOverheadMiB) > uint64(cfg.UnitMemLimitMiB) {
 			return nil, fmt.Errorf("profile %s (%d MiB + %d overhead) exceeds the installed per-unit limit %d MiB", p.Name, p.MemMiB, cfg.VMMOverheadMiB, cfg.UnitMemLimitMiB)
 		}
-		if p.MemMiB > cfg.MaxTotalMemMiB || p.VCPU > cfg.MaxTotalVCPU {
+		if p.MemMiB > cfg.MaxTotalMemMiB || p.VCPU > cfg.MaxTotalVCPU || p.CPULimitMilli > cfg.MaxTotalCPULimitMilli {
 			return nil, fmt.Errorf("profile %s exceeds the aggregate budget", p.Name)
 		}
+	}
+	if cfg.DefaultProfile == "" {
+		cfg.DefaultProfile = cfg.Profiles[0].Name
+		for _, p := range cfg.Profiles {
+			if p.Name == "small" {
+				cfg.DefaultProfile = "small"
+			}
+		}
+	}
+	if _, err := vmlib.ResolveProfile(cfg.Profiles, cfg.DefaultProfile); err != nil {
+		return nil, fmt.Errorf("default profile: %w", err)
 	}
 	for _, p := range []string{cfg.WorkRoot, cfg.ImagesDir, cfg.RunDir} {
 		if !filepath.IsAbs(p) {
@@ -470,6 +549,10 @@ func (b *Backend) reconcile() error {
 			b.corrupt = append(b.corrupt, id)
 			continue
 		}
+		// Retained leases keep their persisted slot even after admission changes.
+		if err := b.cfg.PublicSSH.ValidateSlots(m.Slot + 1); err != nil {
+			return fmt.Errorf("persisted SSH slot %d: %w", m.Slot, err)
+		}
 		e := &entry{m: m}
 		if e.m.MemMiB == 0 || e.m.VCPU == 0 {
 			lm, lv := b.largestProfile()
@@ -479,6 +562,19 @@ func (b *Backend) reconcile() error {
 			if e.m.VCPU == 0 {
 				e.m.VCPU = lv
 			}
+		}
+		// Validate before deriving the legacy quota: an untrusted persisted
+		// vCPU count must never overflow multiplication into a small reservation.
+		if e.m.VCPU > vmlib.MaxVCPU {
+			b.corrupt = append(b.corrupt, id)
+			continue
+		}
+		if e.m.CPULimitMilli == 0 {
+			e.m.CPULimitMilli = e.m.VCPU * vmlib.CPUMilli
+		}
+		if err := (vmlib.Profile{Name: "persisted", VCPU: e.m.VCPU, MemMiB: e.m.MemMiB, CPULimitMilli: e.m.CPULimitMilli}).Validate(); err != nil {
+			b.corrupt = append(b.corrupt, id)
+			continue
 		}
 		switch m.State {
 		case stateLaunching, stateConfiguring, stateRunning, stateExiting:
@@ -555,16 +651,31 @@ func (b *Backend) host(m meta) vmlib.HostVM {
 	case stateLaunching, stateConfiguring:
 		state = vmlib.HostRunning // a VMM may exist; shutdown is identity-checked
 	}
-	return vmlib.HostVM{ID: m.ID, ImageID: m.ImageID, Profile: m.Profile, Resources: vmlib.VMResources{VCPU: m.VCPU, MemMiB: m.MemMiB}, State: state, GuestIP: b.slotIP(m.Slot),
-		Retained: m.Retained, RetainedReason: m.Reason,
+	// The persisted bit distinguishes pre-access guests from managed guests even
+	// after configuration changes or loss of a managed credential record.
+	mode := vmlib.AuthImagePreinstalled
+	if m.AccessManaged {
+		mode = vmlib.AuthProvisionPublicKey
+	}
+	var endpoint *vmlib.SSHEndpoint
+	if b.cfg.PublicSSH != nil {
+		endpoint = &vmlib.SSHEndpoint{Host: b.cfg.PublicSSH.Host, Port: b.cfg.PublicSSH.PortBase + m.Slot}
+	}
+	return vmlib.HostVM{SSHEndpoint: endpoint, SSHAuthMode: mode, ID: m.ID, ImageID: m.ImageID, Profile: m.Profile, Resources: vmlib.VMResources{VCPU: m.VCPU, CPULimitMilli: m.CPULimitMilli, MemMiB: m.MemMiB}, State: state, GuestIP: b.slotIP(m.Slot),
+		Retained: m.Retained, RetainedReason: m.Reason, PublicKeyProvisioned: m.AccessManaged && m.State != statePreparing,
 		Guest: &vmlib.GuestNetwork{Address: b.slotIP(m.Slot) + "/30", Gateway: b.slotGW(m.Slot),
 			DNS: append([]string(nil), b.cfg.GuestDNS...), Configuration: b.cfg.GuestConfiguration}}
 }
 
 func (b *Backend) Capabilities(context.Context) (vmlib.Capabilities, error) {
+	mode := vmlib.AuthImagePreinstalled
+	if b.cfg.Access != nil {
+		mode = vmlib.AuthProvisionPublicKey
+	}
 	return vmlib.Capabilities{MaxVMs: b.cfg.MaxVMs, Profiles: append([]vmlib.Profile(nil), b.cfg.Profiles...),
-		Bastion: b.cfg.Bastion, SSHUser: b.cfg.SSHUser, SSHAuthMode: vmlib.AuthImagePreinstalled,
-		MaxTotalMemMiB: b.cfg.MaxTotalMemMiB, MaxTotalVCPU: b.cfg.MaxTotalVCPU}, nil
+		Bastion: b.cfg.Bastion, SSHUser: b.cfg.SSHUser, SSHAuthMode: mode,
+		MaxTotalMemMiB: b.cfg.MaxTotalMemMiB, MaxTotalVCPU: b.cfg.MaxTotalVCPU,
+		MaxTotalCPULimitMilli: b.cfg.MaxTotalCPULimitMilli, DefaultProfile: b.cfg.DefaultProfile}, nil
 }
 
 // ---- images ----------------------------------------------------------------
@@ -671,18 +782,32 @@ func (b *Backend) largestProfile() (mem, vcpu uint32) {
 
 // leasedLocked sums the PERSISTED reservations of every leased VM (retained ones
 // included). A VM without a reservation counts at the largest current profile.
-func (b *Backend) leasedLocked() (mem, vcpu uint64) {
+func (b *Backend) leasedLocked() (mem, vcpu, cpu uint64) {
 	lm, lv := b.largestProfile()
 	for _, e := range b.entries {
-		m, v := e.m.MemMiB, e.m.VCPU
+		m, v, c := e.m.MemMiB, e.m.VCPU, e.m.CPULimitMilli
 		if m == 0 {
 			m = lm
 		}
 		if v == 0 {
 			v = lv
 		}
+		if c == 0 {
+			c = v * vmlib.CPUMilli
+		}
 		mem += uint64(m)
 		vcpu += uint64(v)
+		cpu += uint64(c)
+	}
+	return
+}
+
+// largestCPULimit is the highest configured per-VMM CPU limit.
+func (b *Backend) largestCPULimit() (milli uint32) {
+	for _, q := range b.cfg.Profiles {
+		if q.CPULimitMilli > milli {
+			milli = q.CPULimitMilli
+		}
 	}
 	return
 }
@@ -698,24 +823,14 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 			return vmlib.HostVM{}, err
 		}
 	}
-	if req.SSHPublicKey != "" {
+	if req.SSHPublicKey != "" && b.cfg.Access == nil {
 		return vmlib.HostVM{}, fmt.Errorf("%w: this backend does not provision SSH keys; use the image's preinstalled access", vmlib.ErrInvalidArgument)
+	}
+	if req.DiskMiB != 0 && (req.Resources == nil || req.Profile != "") {
+		return vmlib.HostVM{}, vmlib.ErrInvalidArgument
 	}
 	if err := vmlib.ValidateResourceSelection(req.Profile, req.Resources); err != nil {
 		return vmlib.HostVM{}, err
-	}
-	prof, ok := b.profile(req.Profile)
-	if req.Resources != nil {
-		prof.VCPU, prof.MemMiB = req.Resources.VCPU, req.Resources.MemMiB
-		// Explicit CPU/RAM does not expand disk authority: use the smallest profile disk bound.
-		prof.DiskMiB = b.cfg.Profiles[0].DiskMiB
-		for _, p := range b.cfg.Profiles {
-			if p.DiskMiB < prof.DiskMiB {
-				prof.DiskMiB = p.DiskMiB
-			}
-		}
-	} else if !ok {
-		return vmlib.HostVM{}, fmt.Errorf("%w: unknown profile %q", vmlib.ErrInvalidArgument, req.Profile)
 	}
 	var src string
 	if err := ctx.Err(); err != nil {
@@ -737,14 +852,47 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 				continue // replaced while we waited; look again
 			}
 			defer old.mu.Unlock()
-			if old.m.ImageID == req.ImageID && old.m.Profile == req.Profile && (req.Resources == nil || (old.m.VCPU == req.Resources.VCPU && old.m.MemMiB == req.Resources.MemMiB)) {
+			if old.m.State == statePreparing {
+				return vmlib.HostVM{}, errors.New("incomplete preparation retained; delete safely before retry")
+			}
+			if old.m.AccessManaged != (b.cfg.Access != nil) || old.m.AccessIntent != accessIntent(req.SSHPublicKey, b.cfg.Access != nil) {
+				return vmlib.HostVM{}, fmt.Errorf("%w: VM access intent differs", vmlib.ErrAlreadyExists)
+			}
+			if old.m.ImageID == req.ImageID && old.m.Profile == req.Profile && (req.Resources == nil || (old.m.VCPU == req.Resources.VCPU && old.m.MemMiB == req.Resources.MemMiB && old.m.CPULimitMilli == req.Resources.EffectiveCPULimitMilli())) && (req.DiskMiB == 0 || old.m.DiskMiB == req.DiskMiB) {
 				return b.host(old.m), nil
 			}
 			return vmlib.HostVM{}, fmt.Errorf("%w: vm %s", vmlib.ErrAlreadyExists, req.VMID)
 		}
+		prof, ok := b.profile(req.Profile)
 		if req.Resources != nil {
+			prof.VCPU, prof.MemMiB = req.Resources.VCPU, req.Resources.MemMiB
+			if prof.VCPU > vmlib.MaxVCPU {
+				b.mu.Unlock()
+				return vmlib.HostVM{}, fmt.Errorf("%w: vcpu exceeds %d", vmlib.ErrInvalidArgument, vmlib.MaxVCPU)
+			}
+			prof.CPULimitMilli = req.Resources.EffectiveCPULimitMilli()
+			if err := vmlib.ValidateCPULimitMilli(prof.CPULimitMilli); err != nil || prof.CPULimitMilli > prof.VCPU*vmlib.CPUMilli {
+				b.mu.Unlock()
+				return vmlib.HostVM{}, fmt.Errorf("%w: cpu_limit must be a representable limit not above the vCPU count", vmlib.ErrInvalidArgument)
+			}
+			// Explicit CPU/RAM does not expand disk authority: use the smallest profile disk bound.
+			prof.DiskMiB = b.cfg.Profiles[0].DiskMiB
+			for _, p := range b.cfg.Profiles {
+				if p.DiskMiB < prof.DiskMiB {
+					prof.DiskMiB = p.DiskMiB
+				}
+			}
+			if req.DiskMiB != 0 {
+				prof.DiskMiB = req.DiskMiB
+			}
+		} else if !ok {
+			b.mu.Unlock()
+			return vmlib.HostVM{}, fmt.Errorf("%w: unknown profile %q", vmlib.ErrInvalidArgument, req.Profile)
+		}
+		if req.Resources != nil && req.DiskMiB == 0 {
+			// Legacy unsnapshotted resource requests retain their old maxima.
 			mem, cpu := b.largestProfile()
-			if req.Resources.VCPU > cpu || req.Resources.MemMiB > mem {
+			if req.Resources.VCPU > cpu || req.Resources.MemMiB > mem || prof.CPULimitMilli > b.largestCPULimit() {
 				b.mu.Unlock()
 				return vmlib.HostVM{}, fmt.Errorf("%w: CPU/RAM exceeds configured profile maxima", vmlib.ErrInvalidArgument)
 			}
@@ -768,11 +916,12 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 			b.mu.Unlock()
 			return vmlib.HostVM{}, fmt.Errorf("%w: all %d VM slots are leased", vmlib.ErrResourceExhausted, b.cfg.MaxVMs)
 		}
-		mem, vcpu := b.leasedLocked()
-		if uint64(mem)+uint64(prof.MemMiB) > uint64(b.cfg.MaxTotalMemMiB) || uint64(vcpu)+uint64(prof.VCPU) > uint64(b.cfg.MaxTotalVCPU) {
+		mem, vcpu, cpu := b.leasedLocked()
+		if mem+uint64(prof.MemMiB) > uint64(b.cfg.MaxTotalMemMiB) || vcpu+uint64(prof.VCPU) > uint64(b.cfg.MaxTotalVCPU) ||
+			cpu+uint64(prof.CPULimitMilli) > uint64(b.cfg.MaxTotalCPULimitMilli) {
 			b.mu.Unlock()
-			return vmlib.HostVM{}, fmt.Errorf("%w: aggregate budget (%d/%d MiB, %d/%d vCPU leased)", vmlib.ErrResourceExhausted,
-				mem, b.cfg.MaxTotalMemMiB, vcpu, b.cfg.MaxTotalVCPU)
+			return vmlib.HostVM{}, fmt.Errorf("%w: aggregate budget (%d/%d MiB, %d/%d vCPU, %d/%d millicores leased)", vmlib.ErrResourceExhausted,
+				mem, b.cfg.MaxTotalMemMiB, vcpu, b.cfg.MaxTotalVCPU, cpu, b.cfg.MaxTotalCPULimitMilli)
 		}
 		used := map[int]bool{}
 		for _, x := range b.entries {
@@ -792,7 +941,8 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 			return vmlib.HostVM{}, fmt.Errorf("%w: insufficient workspace storage", vmlib.ErrResourceExhausted)
 		}
 		e = &entry{m: meta{ID: req.VMID, ImageID: req.ImageID, Profile: req.Profile, Slot: slot, State: statePreparing,
-			MemMiB: prof.MemMiB, VCPU: prof.VCPU}}
+			MemMiB: prof.MemMiB, VCPU: prof.VCPU, CPULimitMilli: prof.CPULimitMilli, DiskMiB: prof.DiskMiB,
+			AccessManaged: b.cfg.Access != nil, AccessIntent: accessIntent(req.SSHPublicKey, b.cfg.Access != nil)}}
 		e.mu.Lock()
 		b.entries[req.VMID] = e
 		b.mu.Unlock()
@@ -828,6 +978,16 @@ func (b *Backend) Prepare(ctx context.Context, req vmlib.PrepareRequest) (vmlib.
 	}
 	if err := os.Chmod(b.diskPath(req.VMID), 0o660); err != nil {
 		return fail(err)
+	}
+	if b.cfg.GuestNetwork != nil {
+		if err := b.cfg.GuestNetwork.InstallNetwork(ctx, b.diskPath(req.VMID), *b.host(e.m).Guest); err != nil {
+			return fail(fmt.Errorf("offline guest network install: %w", err))
+		}
+	}
+	if b.cfg.Access != nil {
+		if err := b.cfg.Access.Install(ctx, req.VMID, b.diskPath(req.VMID), req.SSHPublicKey); err != nil {
+			return fail(fmt.Errorf("offline SSH install: %w", err))
+		}
 	}
 	if f, err := os.OpenFile(b.diskPath(req.VMID), os.O_RDWR, 0); err == nil {
 		err = f.Sync()
@@ -953,7 +1113,7 @@ func (b *Backend) Start(ctx context.Context, id string) (vmlib.HostVM, error) {
 	}
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.cfg.ReadyTimeout+45*time.Second)
 	defer cancel()
-	if err := b.cfg.Launcher.StartSlot(dctx, e.m.Slot); err != nil {
+	if err := b.cfg.Launcher.StartSlot(dctx, e.m.Slot, e.m.CPULimitMilli); err != nil {
 		e.m.Reason = "launcher reported an error but the unit may have started; disk retained: " + err.Error()
 		_ = b.persist(&e.m)
 		return b.host(e.m), fmt.Errorf("launcher: %w", err)
@@ -968,7 +1128,7 @@ func (b *Backend) Start(ctx context.Context, id string) (vmlib.HostVM, error) {
 	if err := b.mustPersist(e); err != nil {
 		return b.host(e.m), err
 	}
-	spec := MachineSpec{VCPU: e.m.VCPU, MemMiB: e.m.MemMiB, Kernel: "/kernel/vmlinux", BootArgs: "console=ttyS0 reboot=k panic=1 pci=off",
+	spec := MachineSpec{VCPU: e.m.VCPU, MemMiB: e.m.MemMiB, CPULimitMilli: e.m.CPULimitMilli, Kernel: "/kernel/vmlinux", BootArgs: "console=ttyS0 reboot=k panic=1 pci=off",
 		DiskJailPath: "/work/vms/" + id + "/disk.ext4", Tap: slotTap(e.m.Slot), MAC: b.slotMAC(e.m.Slot)}
 	if err := b.cfg.VMM.Configure(dctx, e.m.Slot, spec); err != nil {
 		e.m.Reason = "VMM configuration failed; disk retained: " + err.Error()
@@ -1074,9 +1234,38 @@ func (b *Backend) RequestShutdown(ctx context.Context, id string) (vmlib.HostVM,
 		// Never act on a replacement process; wait for the OLD receipt instead.
 		return b.host(e.m), errors.New("VMM identity changed; refusing to signal a replacement process")
 	}
-	if err := b.cfg.VMM.CtrlAltDel(ctx, e.m.Slot); err != nil {
-		// The VMM may exit before replying; only the receipt resolves this.
-		return b.host(e.m), fmt.Errorf("request guest shutdown: %w", err)
+	cadErr := b.cfg.VMM.CtrlAltDel(ctx, e.m.Slot)
+	if e.m.AccessManaged && b.cfg.CooperativeShutdown != nil {
+		// CAD can have taken effect even on an error. Recheck the ORIGINAL
+		// invocation before any second external effect; never signal a replacement.
+		if _, done, _ := b.readReceipt(e.m); done {
+			return b.markExitedLocked(e), nil
+		}
+		info, err = b.cfg.VMM.Info(ctx, e.m.Slot)
+		if err != nil || info.ID != e.m.Invocation {
+			return b.host(e.m), errors.New("cannot confirm original VMM identity after shutdown request")
+		}
+		if ctx.Err() == nil {
+			attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_ = b.cfg.CooperativeShutdown.Reboot(attempt, e.m.ID, b.host(e.m).GuestIP, b.cfg.SSHUser)
+			cancel()
+		}
+		// An SSH ack (including EOF) is not exit proof. Recheck identity even
+		// after errors; a clean original receipt remains the only release proof.
+		if _, done, _ := b.readReceipt(e.m); done {
+			return b.markExitedLocked(e), nil
+		}
+		info, err = b.cfg.VMM.Info(ctx, e.m.Slot)
+		if err != nil || info.ID != e.m.Invocation {
+			return b.host(e.m), errors.New("cannot confirm original VMM identity after cooperative shutdown")
+		}
+		// With both optional paths attempted and identity still confirmed, keep
+		// waiting/retrying for the receipt even if either acknowledgement was
+		// lost or SSH is not ready. Disabled/legacy CAD error behavior is unchanged.
+		cadErr = nil
+	}
+	if cadErr != nil {
+		return b.host(e.m), fmt.Errorf("request guest shutdown: %w", cadErr)
 	}
 	if e.m.State == stateRunning || e.m.State == stateConfiguring {
 		e.m.State = stateExiting
@@ -1137,7 +1326,7 @@ func (b *Backend) WaitExit(ctx context.Context, id string) (vmlib.ExitReceipt, e
 // Publish makes a NEW image visible atomically. The "committed" classification
 // marker is made durable BEFORE the image appears, so an image is never visible
 // without its classification; a failure at any step publishes nothing.
-func (b *Backend) Publish(_ context.Context, id, newID string) (vmlib.Image, error) {
+func (b *Backend) Publish(ctx context.Context, id, newID string) (vmlib.Image, error) {
 	leave, gerr := b.enter()
 	if gerr != nil {
 		return vmlib.Image{}, gerr
@@ -1224,6 +1413,14 @@ func (b *Backend) Publish(_ context.Context, id, newID string) (vmlib.Image, err
 	if err := b.cfg.CopyFile(b.diskPath(id), tmpPath); err != nil {
 		return vmlib.Image{}, err
 	}
+	if e.m.AccessManaged {
+		if b.cfg.Access == nil {
+			return vmlib.Image{}, errors.New("managed SSH publication requires configured access provisioner")
+		}
+		if err := b.cfg.Access.ScrubVM(ctx, id, tmpPath); err != nil {
+			return vmlib.Image{}, fmt.Errorf("offline SSH scrub: %w", err)
+		}
+	}
 	f, err := os.OpenFile(tmpPath, os.O_RDWR, 0)
 	if err != nil {
 		return vmlib.Image{}, err
@@ -1267,6 +1464,25 @@ func (b *Backend) Release(_ context.Context, id string) (vmlib.ReleaseResult, er
 	defer leave()
 	e, err := b.lockEntry(id)
 	if errors.Is(err, vmlib.ErrNotFound) || errors.Is(err, errStale) {
+		// A stale lookup can name a replacement VM: do not delete its credentials.
+		if errors.Is(err, vmlib.ErrNotFound) && b.cfg.Access != nil {
+			b.mu.Lock()
+			if b.entries[id] == nil {
+				// An unreadable workspace is not proof of deletion. Also make
+				// absence durable before discarding its credential record.
+				if _, statErr := os.Lstat(b.vmDir(id)); !errors.Is(statErr, os.ErrNotExist) {
+					err = errors.New("workspace absence not confirmed; credentials retained")
+				} else if err = syncDir(filepath.Join(b.cfg.WorkRoot, "vms")); err == nil {
+					err = b.cfg.Access.Delete(id)
+				}
+			} else {
+				err = nil
+			}
+			b.mu.Unlock()
+			if err != nil {
+				return vmlib.ReleaseResult{}, err
+			}
+		}
 		return vmlib.ReleaseResult{Released: true, Detail: "already released"}, nil
 	}
 	if err != nil {
@@ -1287,7 +1503,14 @@ func (b *Backend) Release(_ context.Context, id string) (vmlib.ReleaseResult, er
 	if err := os.RemoveAll(b.vmDir(id)); err != nil {
 		return vmlib.ReleaseResult{}, err
 	}
-	_ = syncDir(filepath.Join(b.cfg.WorkRoot, "vms"))
+	if err := syncDir(filepath.Join(b.cfg.WorkRoot, "vms")); err != nil {
+		return vmlib.ReleaseResult{}, err
+	}
+	if b.cfg.Access != nil {
+		if err := b.cfg.Access.Delete(id); err != nil {
+			return vmlib.ReleaseResult{}, err
+		}
+	}
 	b.mu.Lock()
 	if b.entries[id] == e {
 		delete(b.entries, id)

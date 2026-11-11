@@ -1,0 +1,10 @@
+# PROPOSED ONLY: new capacity, NOT the current shared legacy budget.
+[Unit]
+Description=Approved four-slot Firecracker resource budget
+
+[Slice]
+CPUAccounting=yes
+CPUQuota=200%
+MemoryAccounting=yes
+MemoryMax=2560M
+TasksMax=256

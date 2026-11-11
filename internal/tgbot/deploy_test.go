@@ -27,7 +27,7 @@ func TestExampleConfigLoadsWithFrontendLoader(t *testing.T) {
 	if e != nil {
 		t.Fatalf("template must load: %v", e)
 	}
-	if c.Resources == nil || c.Resources.VCPU == 0 || c.Resources.MemoryMiB == 0 || !strings.HasPrefix(c.APIURL, "http://127.0.0.1") {
+	if c.Profile != "small" || c.Resources != nil || !strings.HasPrefix(c.APIURL, "http://127.0.0.1") {
 		t.Fatalf("template defaults: %+v", c)
 	}
 }

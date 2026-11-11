@@ -2,6 +2,7 @@
   "listen_addr": "127.0.0.1:8090",
   "state_dir": "/home/USER/.local/state/vmapi",
   "allowed_usernames": ["@example_user_one", "example_user_two"],
+  "admin_user_ids": [],
   "allowed_user_ids": [],
   "legacy_owner_user_id": 0,
   "jwt": {

@@ -115,6 +115,37 @@ func TestSSHReadinessHTTP(t *testing.T) {
 	}
 }
 
+func TestSSHReadinessPublicAdvertisementPrivateProbe(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	host, portText, _ := net.SplitHostPort(listener.Addr().String())
+	port, _ := strconv.Atoi(portText)
+	for _, reachable := range []bool{true, false} {
+		publicHost, publicPort := "203.0.113.10", 22000
+		privateHost, privatePort := host, port
+		if !reachable {
+			// A reachable advertised endpoint cannot manufacture private readiness.
+			publicHost, publicPort = host, port
+			privatePort = 0
+		}
+		lc := &sshLifecycle{info: vmlib.SSHInfo{Host: publicHost, Port: publicPort, User: "root", InternalTarget: &vmlib.SSHEndpoint{Host: privateHost, Port: privatePort}}, state: vmlib.StateRunning}
+		srv, _ := sshServer(t, lc, vmbot.PhaseActive)
+		code, body := call(t, srv, "GET", "/v1/vms/ssh-vm/ssh", "one", "", "", "")
+		if code != 200 || body["host"] != publicHost || body["port"] != float64(publicPort) || body["ready"] != reachable {
+			t.Fatalf("private reachability=%v HTTP %d %v", reachable, code, body)
+		}
+		if _, ok := body["bastion"]; ok {
+			t.Fatalf("public endpoint has bastion: %v", body)
+		}
+		if _, ok := body["InternalTarget"]; ok {
+			t.Fatal("internal endpoint leaked")
+		}
+	}
+}
+
 func TestSSHReadinessOwnershipBeforeEffects(t *testing.T) {
 	lc := &sshLifecycle{}
 	srv, _ := sshServer(t, lc, vmbot.PhaseActive)

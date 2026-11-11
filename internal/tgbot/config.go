@@ -16,10 +16,13 @@ import (
 )
 
 type Config struct {
+	Profile           string                   `json:"profile,omitempty"`
+	VMTTLSeconds      int64                    `json:"vm_ttl_seconds,omitempty"`
 	Version           int                      `json:"version"`
 	TelegramTokenFile string                   `json:"telegram_token_file"`
 	APIURL            string                   `json:"api_url"`
 	APITokenFile      string                   `json:"api_token_file"`
+	AdminUserIDs      []int64                  `json:"admin_user_ids,omitempty"`
 	AllowedUserIDs    []int64                  `json:"allowed_user_ids"`
 	AllowedUsernames  []string                 `json:"allowed_usernames"`
 	JWT               *JWTConfig               `json:"jwt,omitempty"`
@@ -122,6 +125,9 @@ func LoadConfig(path string) (Config, error) {
 	if c.Version != 1 || c.DeliveryDir == "" || !filepath.IsAbs(c.DeliveryDir) || c.ImageID == "" || c.TelegramTokenFile == "" || (c.APITokenFile == "" && c.JWT == nil) || (len(c.AllowedUserIDs) == 0 && len(c.AllowedUsernames) == 0) {
 		return c, errors.New("frontend config requires version 1, API, private files, delivery directory, image and users")
 	}
+	if e = validateAdminConfig(c); e != nil {
+		return c, e
+	}
 	if _, e = identity.CanonicalList(c.AllowedUsernames); e != nil {
 		return c, errors.New("invalid username allowlist")
 	}
@@ -143,8 +149,11 @@ func LoadConfig(path string) (Config, error) {
 		}
 		seen[u] = true
 	}
-	if c.Resources != nil && (c.Resources.VCPU == 0 || c.Resources.MemoryMiB == 0) {
-		return c, errors.New("invalid resources")
+	if c.Resources != nil {
+		return c, errors.New("resources was removed; configure profile instead")
+	}
+	if c.VMTTLSeconds < 0 {
+		return c, errors.New("vm_ttl_seconds must be positive when set")
 	}
 	if _, e = controlclient.New(c.APIURL, "validation", nil); e != nil {
 		return c, e

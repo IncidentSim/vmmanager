@@ -63,8 +63,8 @@ func TestCapabilitiesHTTPReflectsBackendProfilesAndCaps(t *testing.T) {
 		t.Fatalf("backend capacity must be reported separately: %v", body)
 	}
 	wantProfiles := []any{
-		map[string]any{"name": "tiny", "vcpu": float64(1), "memory_mib": float64(256), "disk_mib": float64(1024)},
-		map[string]any{"name": "wide", "vcpu": float64(4), "memory_mib": float64(3072), "disk_mib": float64(8192)},
+		map[string]any{"name": "tiny", "cpu_limit": float64(1), "vcpu": float64(1), "memory_mib": float64(256), "disk_mib": float64(1024)},
+		map[string]any{"name": "wide", "cpu_limit": float64(4), "vcpu": float64(4), "memory_mib": float64(3072), "disk_mib": float64(8192)},
 	}
 	if !reflect.DeepEqual(body["profiles"], wantProfiles) {
 		t.Fatalf("profiles: %#v", body["profiles"])

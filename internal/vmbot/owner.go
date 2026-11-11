@@ -16,8 +16,11 @@ package vmbot
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
@@ -32,6 +35,15 @@ const (
 	// ownerIdle bounds one Recv; a timeout only loops, and costs one history row.
 	ownerIdle = 6 * time.Hour
 	execOwner = "owner" // ControlOperation.Exec of every operation the owner model runs
+
+	// ownerTTLPatch guards the TTL call sequence (see vmOwner): owners whose
+	// history predates it replay the unchanged baseline sequence.
+	ownerTTLPatch = "vm-ttl-v1"
+	// ttlOpPrefix/ttlKeyPrefix identify the owner-authored expiry Delete. The key
+	// contains a space, which request keys can never contain (admission accepts
+	// only bytes 33..126), so no caller can collide with or replay it.
+	ttlOpPrefix  = "op-ttl-"
+	ttlKeyPrefix = "ttl expire:"
 )
 
 // ErrOwnerUnavailable: the VM's owner workflow is not running (terminal ERROR,
@@ -101,6 +113,20 @@ func vmOwner(ctx dbos.Context, in OwnerIn) (OwnerOut, error) {
 	if c == nil {
 		return OwnerOut{}, errors.New("no controller")
 	}
+	// Only Create owners participate in the patch. Their baseline history starts
+	// with begin, a checkpoint completed before any later call can be recorded.
+	// Adopted legacy owners can start mid-Recv with only its internal sleep at
+	// step 2 recorded: Patch would see the empty step 1 and insert a marker,
+	// shifting replay into that sleep (UnexpectedStep). They have no deadline
+	// and must retain the exact baseline call sequence, without a patch call.
+	ttl := false
+	if in.CreateOpID != "" {
+		var err error
+		ttl, err = dbos.Patch(ctx, ownerTTLPatch)
+		if err != nil {
+			return OwnerOut{}, err
+		}
+	}
 	if in.CreateOpID != "" {
 		if _, err := c.ownerHandle(ctx, in.VMID, OwnerCmd{OpID: in.CreateOpID, Kind: "create", Digest: in.CreateDigest}); err != nil {
 			return OwnerOut{}, err
@@ -108,10 +134,28 @@ func vmOwner(ctx dbos.Context, in OwnerIn) (OwnerOut, error) {
 	}
 	for {
 		c.rebuildTerminal(in.VMID) // local projection, once per process; see Start
-		cmd, err := dbos.Recv[OwnerCmd](ctx, ownerCmdTopic, ownerIdle)
+		// wait only shortens the FIRST execution of this Recv. DBOS checkpoints the
+		// Recv deadline as an absolute instant and a recovered Recv waits out that
+		// recorded deadline, so the argument never alters replayed history.
+		wait := ownerIdle
+		if ttl {
+			wait = c.ownerWait(in.VMID)
+		}
+		cmd, err := dbos.Recv[OwnerCmd](ctx, ownerCmdTopic, wait)
 		if err != nil {
 			var de *dbos.Error
 			if errors.As(err, &de) && de.Code == dbos.ErrorCodeTimeout {
+				if ttl {
+					// The deadline decision is a checkpointed step, never a clock
+					// read in the workflow body.
+					gone, err := c.ownerExpire(ctx, in.VMID)
+					if err != nil {
+						return OwnerOut{}, err
+					}
+					if gone {
+						return OwnerOut{VMID: in.VMID, Phase: "deleted"}, nil
+					}
+				}
 				continue
 			}
 			return OwnerOut{}, err
@@ -121,22 +165,12 @@ func vmOwner(ctx dbos.Context, in OwnerIn) (OwnerOut, error) {
 			// recoverable outcome. It makes the owner visibly ERROR (retained).
 			return OwnerOut{}, fmt.Errorf("unsupported owner command %q", cmd.Kind)
 		}
+		var gone bool
 		if cmd.Kind == "delete" {
-			// Admission order is the durable store order. Anything admitted before
-			// this Delete whose own message was delayed or never delivered runs
-			// first, so Delete never skips accepted work. Admission bounds this
-			// to one command; their later messages find them finished.
-			prior, err := ownerStep(ctx, "prior", 3, func(context.Context) ([]OwnerCmd, error) { return c.priorUnfinished(in.VMID, cmd.OpID), nil })
-			if err != nil {
-				return OwnerOut{}, err
-			}
-			for _, p := range prior {
-				if _, err := c.ownerHandle(ctx, in.VMID, p); err != nil {
-					return OwnerOut{}, err
-				}
-			}
+			gone, err = c.ownerDelete(ctx, in.VMID, cmd)
+		} else {
+			gone, err = c.ownerHandle(ctx, in.VMID, cmd)
 		}
-		gone, err := c.ownerHandle(ctx, in.VMID, cmd)
 		if err != nil {
 			return OwnerOut{}, err
 		}
@@ -144,6 +178,105 @@ func vmOwner(ctx dbos.Context, in OwnerIn) (OwnerOut, error) {
 			return OwnerOut{VMID: in.VMID, Phase: "deleted"}, nil
 		}
 	}
+}
+
+// ownerDelete runs a Delete after any command admitted before it. Admission
+// order is the durable store order. Anything admitted before this Delete whose
+// own message was delayed or never delivered runs first, so Delete never skips
+// accepted work. Admission bounds this to one command; their later messages find
+// them finished.
+func (c *Controller) ownerDelete(ctx dbos.Context, vmID string, cmd OwnerCmd) (bool, error) {
+	prior, err := ownerStep(ctx, "prior", 3, func(context.Context) ([]OwnerCmd, error) { return c.priorUnfinished(vmID, cmd.OpID), nil })
+	if err != nil {
+		return false, err
+	}
+	for _, p := range prior {
+		if _, err := c.ownerHandle(ctx, vmID, p); err != nil {
+			return false, err
+		}
+	}
+	return c.ownerHandle(ctx, vmID, cmd)
+}
+
+// ownerWait is the argument of one Recv: the idle period, shortened to the VM's
+// persisted deadline. expires_at is immutable once admitted, so this reads a
+// constant; the result only matters when the Recv first executes (see vmOwner).
+// Once an expiry Delete has been issued the owner no longer wakes for the passed
+// deadline (no busy loop after a failed Delete); a later attempt waits ownerIdle.
+func (c *Controller) ownerWait(vmID string) time.Duration {
+	r, ok := c.st.Snapshot().ByID(vmID)
+	if !ok || r.ExpiresAt == nil || c.expiryAttempts(vmID) > 0 {
+		return ownerIdle
+	}
+	return min(max(time.Until(*r.ExpiresAt), time.Millisecond), ownerIdle)
+}
+
+func (c *Controller) expiryAttempts(vmID string) int {
+	n := 0
+	for _, o := range c.st.Snapshot().Operations {
+		if o.VMID == vmID && strings.HasPrefix(o.ID, ttlOpPrefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// ownerExpire runs after a Recv timeout. The decision (and the deterministic
+// owner-authored Delete operation it admits) is one checkpointed step; the
+// Delete then follows the ordinary path: prior accepted work, begin, the finite
+// child, project. Nothing here preempts a child or frees anything itself.
+func (c *Controller) ownerExpire(ctx dbos.Context, vmID string) (bool, error) {
+	cmd, err := ownerStep(ctx, "expire", 3, func(context.Context) (OwnerCmd, error) { return c.planExpiry(vmID) })
+	if err != nil {
+		return false, err
+	}
+	if cmd.OpID == "" {
+		return false, nil
+	}
+	return c.ownerDelete(ctx, vmID, cmd)
+}
+
+// planExpiry decides, inside a step, whether the deadline has passed and, if so,
+// records the owner-authored Delete (idempotently: the ID is derived from the VM
+// ID and attempt number, so a retried step never admits a second one). A Delete
+// already unfinished for the VM is left to its own message.
+func (c *Controller) planExpiry(vmID string) (OwnerCmd, error) {
+	var cmd OwnerCmd
+	now := c.now()
+	err := c.st.UpdateErr(func(s *State) error {
+		r, ok := s.ByID(vmID)
+		if !ok || !expired(r, now) || r.OwnerUserID <= 0 {
+			return nil
+		}
+		attempt := 0
+		for _, o := range s.Operations {
+			if o.VMID != vmID {
+				continue
+			}
+			if o.Kind == "delete" && (o.Status == "pending" || o.Status == "running") && !strings.HasPrefix(o.ID, ttlOpPrefix) {
+				return nil
+			}
+			if strings.HasPrefix(o.ID, ttlOpPrefix) {
+				attempt++
+				if o.Status == "pending" || o.Status == "running" {
+					cmd = OwnerCmd{OpID: o.ID, Kind: "delete", Digest: o.Digest}
+					return nil // a retried step finds its own operation
+				}
+			}
+		}
+		key := fmt.Sprintf("%s%s:%d", ttlKeyPrefix, vmID, attempt+1)
+		sum := sha256.Sum256([]byte(key))
+		digest := hex.EncodeToString(sum[:])
+		op := ControlOperation{ID: fmt.Sprintf("%s%s-%d", ttlOpPrefix, strings.TrimPrefix(vmID, "bot-"), attempt+1), OwnerUserID: r.OwnerUserID,
+			Key: key, Digest: digest, Kind: "delete", VMID: vmID, Status: "pending", Exec: execOwner}
+		s.Operations = append(s.Operations, op)
+		cmd = OwnerCmd{OpID: op.ID, Kind: "delete", Digest: digest}
+		return nil
+	})
+	if err != nil {
+		return OwnerCmd{}, err
+	}
+	return cmd, nil
 }
 
 // ownerHandle runs one command to its recorded outcome: begin (validate, record
@@ -264,6 +397,13 @@ func (c *Controller) beginOp(vmID string, cmd OwnerCmd) (ownerPlan, error) {
 			reject("unavailable")
 			return nil
 		}
+		// An admitted ordinary command that only now gets its turn after the
+		// deadline is refused (durably: begin is a checkpointed step). A command
+		// already running keeps going, and Delete and Create are never refused.
+		if op.Status == "pending" && op.Kind != "create" && op.Kind != "delete" && expired(r, c.now()) {
+			reject(errCodeExpired)
+			return nil
+		}
 		from, to := "", ""
 		// A "running" op was begun by an earlier execution of this very step whose
 		// checkpoint was lost: its transitional phase is its own, so resume it.
@@ -337,10 +477,11 @@ func (c *Controller) runEffect(sctx context.Context, in EffectIn) EffectOut {
 			return out
 		}
 		if errors.Is(err, vmlib.ErrNotFound) {
-			req := vmlib.CreateRequest{ID: r.ID, ImageID: r.ImageID, Profile: c.cfg.Profile, SSHPublicKey: r.SSHPublicKey}
+			req := vmlib.CreateRequest{ID: r.ID, ImageID: r.ImageID, Profile: c.profileFor(r), SSHPublicKey: r.SSHPublicKey}
 			if r.Resources != nil {
 				req.Profile = ""
-				req.Resources = &vmlib.VMResources{VCPU: r.Resources.VCPU, MemMiB: r.Resources.MemoryMiB}
+				req.DiskMiB = r.DiskMiB
+				req.Resources = &vmlib.VMResources{VCPU: r.Resources.VCPU, MemMiB: r.Resources.MemoryMiB, CPULimitMilli: r.Resources.CPULimitMilli}
 			}
 			vm, err = c.lc.Create(qctx, req)
 			if err != nil {
@@ -366,8 +507,16 @@ func (c *Controller) runEffect(sctx context.Context, in EffectIn) EffectOut {
 	case "delete":
 		c.term.Revoke(r.ID)
 		var res vmlib.DeleteResult
-		if res, err = c.lc.Delete(qctx, r.ID); err == nil && !res.Deleted {
-			err = ErrUncertain
+		if res, err = c.lc.Delete(qctx, r.ID); err == nil {
+			if !res.Deleted || res.Retained {
+				err = ErrUncertain
+			} else if c.cfg.Credentials != nil {
+				// The lifecycle's already-absent path can skip backend Release.
+				// Keep cleanup in this existing effect step: a failed unlink must
+				// retain the domain record/quota, and an explicit Delete retry can
+				// prove absence again and repeat this idempotent cleanup.
+				err = c.cfg.Credentials.Delete(r.ID)
+			}
 		}
 	case "terminal":
 		if !c.ControlAllowed(r.OwnerUserID) || r.Phase != PhaseActive {
@@ -404,7 +553,7 @@ func resourcesOf(vm vmlib.VM) *ControlResources {
 	if vm.Resources.VCPU == 0 {
 		return nil
 	}
-	return &ControlResources{vm.Resources.VCPU, vm.Resources.MemMiB}
+	return &ControlResources{VCPU: vm.Resources.VCPU, MemoryMiB: vm.Resources.MemMiB, CPULimitMilli: vm.Resources.EffectiveCPULimitMilli()}
 }
 
 // applyOutcome is the single writer of an outcome: operation status and the VM
@@ -548,7 +697,7 @@ func (c *Controller) startOwner(in OwnerIn) error {
 	if e == nil || !e.ready.Load() {
 		return fmt.Errorf("%w: orchestration not running", ErrFailed)
 	}
-	_, err := dbos.RunWorkflow(e.ctx, vmOwner, in, dbos.WithWorkflowID(ownerWorkflowID(in.VMID)))
+	_, err := dbos.RunWorkflow(e.ctx, c.ownerBody(), in, dbos.WithWorkflowID(ownerWorkflowID(in.VMID)))
 	return err
 }
 

@@ -16,15 +16,35 @@ import (
 	"time"
 
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
+	"github.com/petruekhin/vibe-firecracker/internal/sshaccess"
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
 var ErrControlConflict = errors.New("conflicting request or resource state")
 var ErrControlForbidden = errors.New("caller is not allowed")
 
+// ErrExpired: the VM's lifetime has ended; ordinary commands are refused (the
+// owner deletes the VM once its current child settles). Maps to code vm_expired.
+var ErrExpired = errors.New("VM lifetime has expired")
+
+// errCodeExpired is the stable operation error code for a refused command.
+const errCodeExpired = "vm_expired"
+
+// Default and maximum VM lifetime when ControllerConfig leaves them unset.
+const (
+	DefaultVMTTL = 3600 * time.Second
+	MaxVMTTL     = 86400 * time.Second
+)
+
+// expired reports whether the record has a deadline that has been reached.
+func expired(r VMRecord, now time.Time) bool {
+	return r.ExpiresAt != nil && !now.Before(*r.ExpiresAt)
+}
+
 type ControlResources struct {
-	VCPU      uint32 `json:"vcpu"`
-	MemoryMiB uint32 `json:"memory_mib"`
+	VCPU          uint32 `json:"vcpu"`
+	MemoryMiB     uint32 `json:"memory_mib"`
+	CPULimitMilli uint32 `json:"cpu_limit_milli,omitempty"`
 }
 type ControlPolicy struct {
 	AllowedUsers          []int64
@@ -32,15 +52,23 @@ type ControlPolicy struct {
 	MaxVMs, MaxVMsPerUser int
 }
 type ControlRequest struct {
-	Kind         string            `json:"kind"`
-	VMID         string            `json:"vm_id,omitempty"`
-	ImageID      string            `json:"image_id,omitempty"`
-	Name         string            `json:"name,omitempty"`
-	Resources    *ControlResources `json:"resources,omitempty"`
-	SSHPublicKey string            `json:"ssh_public_key,omitempty"`
+	Kind    string `json:"kind"`
+	VMID    string `json:"vm_id,omitempty"`
+	ImageID string `json:"image_id,omitempty"`
+	Name    string `json:"name,omitempty"`
+	// IntentVersion distinguishes current HTTP semantics from legacy raw DTO digests.
+	IntentVersion int `json:"intent_version,omitempty"`
+	// EffectiveProfile is admission-only; mutable defaults never enter intent.
+	EffectiveProfile string `json:"-"`
+	// Profile is the requested profile (empty preserves omission).
+	Profile string `json:"profile,omitempty"`
+	// TTLSeconds is omitted from the digest when unset, preserving old replay.
+	TTLSeconds   int64  `json:"ttl_seconds,omitempty"`
+	SSHPublicKey string `json:"ssh_public_key,omitempty"`
 }
 type ControlOperation struct {
 	ID          string `json:"id"`
+	AdminUserID int64  `json:"admin_user_id,omitempty"`
 	OwnerUserID int64  `json:"owner_user_id"`
 	Key         string `json:"key"`
 	Digest      string `json:"digest"`
@@ -78,13 +106,21 @@ type ControlVMView struct {
 	State     string            `json:"state"`
 	Phase     string            `json:"phase"`
 	Resources *ControlResources `json:"resources"`
+	// Profile is the profile the VM was created with (absent for legacy VMs).
+	Profile string `json:"profile,omitempty"`
 	// OwnerError is true when the VM's owner workflow ended abnormally (ERROR,
 	// cancelled, retries exhausted). The VM and its capacity stay retained;
 	// commands are refused until an operator intervenes. Absent otherwise.
 	OwnerError bool `json:"owner_error,omitempty"`
+	// TTLSeconds/ExpiresAt are the persisted lifetime; absent for a legacy VM.
+	TTLSeconds int64      `json:"ttl_seconds,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 
 func validateControlState(s State) error {
+	if e := validateAdminBatches(s.AdminBatches); e != nil {
+		return e
+	}
 	ids, keys := map[string]bool{}, map[string]bool{}
 	for _, v := range s.VMs {
 		if v.OwnerUserID <= 0 {
@@ -206,7 +242,7 @@ func (c *Controller) ControlVM(u int64, id string) (ControlVMView, error) {
 	if !ok || r.OwnerUserID != u {
 		return ControlVMView{}, ErrNoVM
 	}
-	v := ControlVMView{ID: r.ID, Name: r.Label, ImageID: r.ImageID, State: r.RemoteState, Phase: r.Phase, Resources: r.Resources}
+	v := ControlVMView{ID: r.ID, Name: r.Label, ImageID: r.ImageID, State: r.RemoteState, Phase: r.Phase, Resources: r.Resources, Profile: r.Profile, TTLSeconds: r.TTLSeconds, ExpiresAt: r.ExpiresAt}
 	if st, err := c.ownerState(r.ID); err == nil && st != "" && !ownerAlive(st) && st != dbos.WorkflowStatusSuccess {
 		v.OwnerError = true
 	}
@@ -364,7 +400,15 @@ func (c *Controller) ControlSSH(ctx context.Context, u int64, id string) (vmlib.
 		v, err := c.ControlVM(u, id)
 		return err == nil && v.Phase == PhaseActive
 	}
-	if !active() || info.Host == "" || info.Port <= 0 || info.Port > 65535 {
+	// Public advertisement is not a hairpin/ingress probe target. The service
+	// supplies a backend-derived per-VM private target; older lifecycle adapters
+	// without a separate target retain their existing metadata behavior.
+	probe := info
+	if info.InternalTarget != nil {
+		probe.Host, probe.Port = info.InternalTarget.Host, info.InternalTarget.Port
+		probe.Bastion = nil
+	}
+	if !active() || probe.Host == "" || probe.Port <= 0 || probe.Port > 65535 {
 		return info, nil
 	}
 	// Bound the entire observation (state checks and one TCP connection), rather
@@ -375,7 +419,7 @@ func (c *Controller) ControlSSH(ctx context.Context, u int64, id string) (vmlib.
 	if err != nil || vm.State != vmlib.StateRunning || !active() {
 		return info, nil
 	}
-	if vmlib.TCPProber(probeCtx, info) != nil {
+	if vmlib.TCPProber(probeCtx, probe) != nil {
 		return info, nil
 	}
 	// A stop/delete may have won while the network call was in flight. Do not
@@ -388,7 +432,16 @@ func (c *Controller) ControlSSH(ctx context.Context, u int64, id string) (vmlib.
 // AcceptControl atomically reserves identities, quota, image publication and
 // destructive intent. An enqueue failure leaves pending intent for startup repair.
 func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (ControlOperation, error) {
-	if !c.ControlAllowed(u) {
+	return c.acceptControl(u, key, req, 0)
+}
+
+// acceptControl receives admin identity only from the narrow, server-authorized batch path.
+func (c *Controller) acceptControl(u int64, key string, req ControlRequest, admin int64) (ControlOperation, error) {
+	if admin != 0 {
+		if !c.AdminAllowed(admin) || req.Kind != "delete" {
+			return ControlOperation{}, ErrControlForbidden
+		}
+	} else if !c.ControlAllowed(u) {
 		return ControlOperation{}, ErrControlForbidden
 	}
 	if len(key) < 1 || len(key) > 128 {
@@ -402,12 +455,13 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 	if req.Name != "" && ValidateLabel(req.Name) != nil {
 		return ControlOperation{}, vmlib.ErrInvalidArgument
 	}
-	// Current backend supports image-preinstalled SSH authentication only.
-	if req.SSHPublicKey != "" {
+	if req.Kind != "create" && (req.Profile != "" || req.SSHPublicKey != "") {
 		return ControlOperation{}, vmlib.ErrInvalidArgument
 	}
-	if req.Resources != nil && (req.Resources.VCPU == 0 || req.Resources.MemoryMiB == 0) {
-		return ControlOperation{}, vmlib.ErrInvalidArgument
+	if req.SSHPublicKey != "" {
+		if _, err := sshaccess.ParsePublicKey(req.SSHPublicKey); err != nil {
+			return ControlOperation{}, vmlib.ErrInvalidArgument
+		}
 	}
 	b, _ := json.Marshal(req)
 	sum := sha256.Sum256(b)
@@ -438,7 +492,10 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 				return nil
 			}
 		}
-		out = ControlOperation{ID: oid, OwnerUserID: u, Key: key, Digest: digest, Kind: req.Kind, VMID: req.VMID, ImageID: req.ImageID, Status: "pending", Exec: execOwner}
+		if req.TTLSeconds < 0 || (req.TTLSeconds > 0 && req.Kind != "create") || req.TTLSeconds > int64(c.cfg.MaxTTL/time.Second) {
+			return vmlib.ErrInvalidArgument
+		}
+		out = ControlOperation{ID: oid, AdminUserID: admin, OwnerUserID: u, Key: key, Digest: digest, Kind: req.Kind, VMID: req.VMID, ImageID: req.ImageID, Status: "pending", Exec: execOwner}
 		switch req.Kind {
 		case "create":
 			if _, ok := c.controlImage(*s, u, req.ImageID); !ok {
@@ -456,17 +513,45 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 			if len(s.VMs) >= c.control.MaxVMs || count >= c.control.MaxVMsPerUser {
 				return ErrCapacity
 			}
+			profile := req.Profile
+			if profile == "" {
+				profile = req.EffectiveProfile
+			}
+			var effective *ControlResources
+			var diskMiB uint32
+			if profile != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), c.cfg.OpTimeout)
+				defer cancel()
+				caps, err := c.lc.Capabilities(ctx)
+				if err != nil {
+					return err
+				}
+				prof, err := vmlib.ResolveProfile(caps.Profiles, profile)
+				if err != nil {
+					return err
+				}
+				diskMiB = prof.DiskMiB
+				effective = &ControlResources{VCPU: prof.VCPU, MemoryMiB: prof.MemMiB, CPULimitMilli: prof.Resources().EffectiveCPULimitMilli()}
+			}
 			s.Generation++
 			name := req.Name
 			if name == "" {
 				name = fmt.Sprintf("vm-%d", s.Generation)
 			}
+			ttl := req.TTLSeconds
+			if ttl == 0 {
+				ttl = int64(c.cfg.DefaultTTL / time.Second)
+			}
+			expires := c.now().Add(time.Duration(ttl) * time.Second)
 			out.VMID = id
-			s.VMs = append(s.VMs, VMRecord{ID: id, Token: tok, Phase: PhaseCreating, Generation: s.Generation, Label: name, OwnerUserID: u, ImageID: req.ImageID, Resources: req.Resources, SSHPublicKey: req.SSHPublicKey})
+			s.VMs = append(s.VMs, VMRecord{ID: id, Token: tok, Phase: PhaseCreating, Generation: s.Generation, Label: name, OwnerUserID: u, ImageID: req.ImageID, Profile: profile, DiskMiB: diskMiB, Resources: effective, SSHPublicKey: req.SSHPublicKey, TTLSeconds: ttl, ExpiresAt: &expires})
 		case "stop", "delete", "commit", "terminal":
 			r, ok := s.ByID(req.VMID)
 			if !ok || r.OwnerUserID != u {
 				return ErrNoVM
+			}
+			if req.Kind != "delete" && expired(r, c.now()) {
+				return ErrExpired
 			}
 			// The owner serializes execution; admission only bounds the backlog:
 			// at most one unfinished command per VM, plus one Delete behind it.

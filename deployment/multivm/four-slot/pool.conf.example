@@ -1,0 +1,11 @@
+# PROPOSED ONLY: requires separately approved host capacity; choose a collision-free prefix.
+GUEST_PREFIX=10.213
+MAX_SLOTS=4
+MAX_SLOT_CPU_MILLI=500
+
+# Optional operator-only public SSH publication (disabled unless BOTH uncommented).
+# Replace 8.8.4.4 with the actual IPv4 assigned to the one default uplink.
+# PUBLIC_IPV4=8.8.4.4
+# SSH_PORT_BASE=22000
+# Slot N: PUBLIC_IPV4:(SSH_PORT_BASE+N) -> GUEST_PREFIX.N.2:22 (TCP only).
+# Reserve the whole port range; see ../NETWORK.md (four-slot) or NETWORK.md.

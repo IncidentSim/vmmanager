@@ -38,6 +38,8 @@ type suite struct {
 	tr    *tracker
 	ctx   context.Context
 	owner int64
+	caps  controlclient.Capabilities
+	keys  map[string]string
 }
 
 // newSuite skips unless VMAPI_E2E=1. Once enabled, misconfiguration is a hard
@@ -56,7 +58,7 @@ func newSuite(t *testing.T) *suite {
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
-	s := &suite{t: t, cfg: cfg, c: c, hc: hc, n: newNamer(), owner: cfg.UserID}
+	s := &suite{t: t, cfg: cfg, c: c, hc: hc, n: newNamer(), owner: cfg.UserID, keys: map[string]string{}}
 	s.tr = &tracker{user: cfg.UserID, base: cfg.BaseImageID, keySeq: s.n.key}
 	var cancel context.CancelFunc
 	s.ctx, cancel = context.WithTimeout(context.Background(), testBudget)
@@ -84,6 +86,7 @@ func (s *suite) preflight() {
 	if err != nil {
 		t.Fatalf("capabilities: %v", err)
 	}
+	s.caps = caps
 	vms, err := s.c.ListVMs(s.ctx, s.owner)
 	if err != nil {
 		t.Fatalf("list VMs: %v", err)
@@ -147,7 +150,8 @@ func (s *suite) mustWait(what, opID string) {
 // create admits a VM; the ID is registered for cleanup BEFORE waiting.
 func (s *suite) create(tag, image string) controlclient.Accepted {
 	s.t.Helper()
-	a, err := s.c.Create(s.ctx, s.owner, s.n.key("create-"+tag), controlclient.CreateRequest{Name: s.n.name(tag), ImageID: image})
+	a, err := s.c.Create(s.ctx, s.owner, s.n.key("create-"+tag), s.request(tag, image))
+	s.trackAccepted(acceptedCreate, a)
 	if err != nil {
 		s.t.Fatalf("create %s: %v", tag, err)
 	}
@@ -181,6 +185,9 @@ func (s *suite) createActive(tag, image string) controlclient.Accepted {
 
 func (s *suite) deleteVM(tag, id string) {
 	s.t.Helper()
+	if err := s.tr.mayDeleteVM(id); err != nil {
+		s.t.Fatal(err)
+	}
 	a, err := s.c.Delete(s.ctx, s.owner, id, s.n.key("del-"+tag))
 	if err != nil {
 		s.t.Fatalf("delete VM %s: %v", id, err)
@@ -201,6 +208,7 @@ func (s *suite) requireGone(get func(context.Context) error, what string) {
 func (s *suite) commit(tag, vmID string) controlclient.Accepted {
 	s.t.Helper()
 	a, err := s.c.Commit(s.ctx, s.owner, vmID, s.n.key("commit-"+tag), s.n.name(tag))
+	s.trackAccepted(acceptedCommit, a)
 	if err != nil {
 		s.t.Fatalf("commit %s: %v", tag, err)
 	}
@@ -248,7 +256,7 @@ func (s *suite) guestFor(id string) *guest {
 	if err != nil {
 		s.t.Fatalf("SSH never reported ready for %s: %v", id, err)
 	}
-	g, err := pinGuest(ctx, s.t.TempDir(), s.cfg.SSHKeyFile, s.cfg.KnownHostsFile, meta)
+	g, err := pinGuest(ctx, s.t.TempDir(), s.generatedKeyFile(id), s.cfg.KnownHostsFile, meta)
 	if err != nil {
 		s.t.Fatalf("host key pinning for %s: %v", id, err)
 	}
@@ -356,8 +364,8 @@ func TestPublicDocsHealthAndAuth(t *testing.T) {
 		t.Error("unknown asset path served")
 	}
 
-	// OpenAPI: live bytes must equal this checkout's embedded source; both must
-	// parse and describe the control API.
+	// OpenAPI schemas must match this checkout except the configured CreateVM
+	// example; executing that exact example is a separate authenticated test.
 	code, _, live := s.get("/openapi.yaml", nil)
 	if code != 200 {
 		t.Fatalf("/openapi.yaml: %d", code)
@@ -373,13 +381,30 @@ func TestPublicDocsHealthAndAuth(t *testing.T) {
 	if _, ok := paths["/v1/vms"]; !ok || liveDoc["openapi"] == nil {
 		t.Error("live OpenAPI lacks openapi version or /v1/vms")
 	}
+	removeCreateExample(liveDoc)
+	removeCreateExample(srcDoc)
 	if !reflect.DeepEqual(liveDoc, srcDoc) {
 		t.Error("live OpenAPI parses differently from docs/control-api-openapi.yaml (revision mismatch?)")
 	}
-	if !bytes.Equal(live, docs.OpenAPI) {
-		t.Error("live /openapi.yaml bytes differ from docs/control-api-openapi.yaml")
-	}
 
+	// Snapshot baseline before the negative mutation too; unexpected admissions
+	// must be tracked without ever owning preexisting resources.
+	baselineVMs, err := s.c.ListVMs(s.ctx, s.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineImages, err := s.c.Images(s.ctx, s.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var baselineVMIDs, baselineImageIDs []string
+	for _, v := range baselineVMs {
+		baselineVMIDs = append(baselineVMIDs, v.ID)
+	}
+	for _, i := range baselineImages {
+		baselineImageIDs = append(baselineImageIDs, i.ID)
+	}
+	s.tr.setBaseline(baselineVMIDs, baselineImageIDs)
 	// Unauthenticated / invalid credentials are rejected. The POST uses a
 	// nonexistent image so it can never admit work even if auth were broken.
 	for _, p := range []string{"/v1/vms", "/v1/images", "/v1/capabilities"} {
@@ -395,7 +420,12 @@ func TestPublicDocsHealthAndAuth(t *testing.T) {
 	if resp, err := s.hc.Do(req); err != nil {
 		t.Errorf("unauthenticated POST: %v", err)
 	} else {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
+		var unexpected controlclient.Accepted
+		if json.Unmarshal(body, &unexpected) == nil {
+			s.trackAccepted(acceptedCreate, unexpected)
+		}
 		if resp.StatusCode != 401 {
 			t.Errorf("unauthenticated POST /v1/vms: %d, want 401", resp.StatusCode)
 		}
@@ -420,8 +450,9 @@ func TestLifecycleStopCommitsAndConflicts(t *testing.T) {
 	s.preflight()
 
 	key := s.n.key("idem")
-	req := controlclient.CreateRequest{Name: s.n.name("life"), ImageID: s.cfg.BaseImageID}
+	req := s.request("life", s.cfg.BaseImageID)
 	a, err := s.c.Create(s.ctx, s.owner, key, req)
+	s.trackAccepted(acceptedCreate, a)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -430,6 +461,7 @@ func TestLifecycleStopCommitsAndConflicts(t *testing.T) {
 	}
 	t.Logf("admitted VM %s (op %s)", a.VMID, a.OperationID)
 	dup, err := s.c.Create(s.ctx, s.owner, key, req)
+	s.trackAccepted(acceptedCreate, dup)
 	if err == nil {
 		s.trackUnexpectedVM(dup.VMID) // before asserting: a wrong replay may admit another VM
 	}
@@ -439,6 +471,7 @@ func TestLifecycleStopCommitsAndConflicts(t *testing.T) {
 	changed := req
 	changed.Name = s.n.name("life2")
 	bad, err := s.c.Create(s.ctx, s.owner, key, changed)
+	s.trackAccepted(acceptedCreate, bad)
 	if err == nil {
 		s.trackUnexpectedVM(bad.VMID) // before asserting: success here admitted a VM
 	}
@@ -448,6 +481,25 @@ func TestLifecycleStopCommitsAndConflicts(t *testing.T) {
 	s.mustWait("create", a.OperationID)
 
 	g := s.guestFor(a.VMID)
+	beforeKey, e := s.c.SSHKey(s.ctx, s.owner, a.VMID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	replay, e := s.c.Create(s.ctx, s.owner, key, req)
+	s.trackAccepted(acceptedCreate, replay)
+	if e != nil || replay != a {
+		t.Fatal("post-retrieval replay changed admission")
+	}
+	afterKey, e := s.c.SSHKey(s.ctx, s.owner, a.VMID)
+	if e != nil || beforeKey != afterKey {
+		t.Fatal("Create replay regenerated credentials")
+	}
+	for _, path := range []string{"/v1/vms", "/v1/vms/" + a.VMID, "/v1/capabilities", "/v1/operations/" + a.OperationID} {
+		code, _, body := s.get(path, map[string]string{"Authorization": "Bearer " + s.cfg.Token})
+		if code != 200 || bytes.Contains(body, []byte("BEGIN OPENSSH PRIVATE KEY")) {
+			t.Fatal("ordinary API response contains private key or failed")
+		}
+	}
 	marker := s.writeMarker(g, "life")
 	s.readMarker(g, "life", marker)
 
@@ -455,7 +507,9 @@ func TestLifecycleStopCommitsAndConflicts(t *testing.T) {
 	if m, err := s.c.SSH(s.ctx, s.owner, a.VMID); err != nil || m.Ready {
 		t.Fatalf("SSH readiness on stopped VM: %v ready=%v", err, m.Ready)
 	}
-	if _, err := s.c.Terminal(s.ctx, s.owner, a.VMID, s.n.key("term")); !isStatus(err, 409) {
+	termAcc, termErr := s.c.Terminal(s.ctx, s.owner, a.VMID, s.n.key("term"))
+	s.trackAccepted(acceptedReferences, termAcc)
+	if err := termErr; !isStatus(err, 409) {
 		t.Fatalf("terminal on stopped VM: %v, want 409", err)
 	}
 
@@ -551,6 +605,10 @@ func TestOptionalAPIRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	keyBefore, keyErr := s.c.SSHKey(s.ctx, s.owner, a.VMID)
+	if keyErr != nil {
+		t.Fatal(keyErr)
+	}
 	sshBefore, err := s.c.SSH(s.ctx, s.owner, a.VMID)
 	if err != nil {
 		t.Fatal(err)
@@ -577,8 +635,12 @@ func TestOptionalAPIRestart(t *testing.T) {
 	}
 
 	vmAfter, err := s.c.VM(s.ctx, s.owner, a.VMID)
-	if err != nil || vmAfter != vmBefore {
-		t.Fatalf("VM changed across restart: %v before=%+v after=%+v", err, vmBefore, vmAfter)
+	if err != nil || !reflect.DeepEqual(vmAfter, vmBefore) {
+		t.Fatalf("VM changed across restart: %v", err)
+	}
+	keyAfter, keyErr := s.c.SSHKey(s.ctx, s.owner, a.VMID)
+	if keyErr != nil || keyBefore != keyAfter {
+		t.Fatal("generated key changed across API restart")
 	}
 	sshAfter, err := s.c.SSH(s.ctx, s.owner, a.VMID)
 	if err != nil || sshAfter.Host != sshBefore.Host || sshAfter.Port != sshBefore.Port || sshAfter.HostKeyFingerprint != sshBefore.HostKeyFingerprint {

@@ -202,6 +202,13 @@ func (t *tracker) admitImage(id string) error {
 	return nil
 }
 
+func (t *tracker) mayDeleteVM(id string) error {
+	if id == "" || t.preVMs[id] || !slices.Contains(t.vms, id) {
+		return errors.New("refusing to delete empty, preexisting or untracked VM")
+	}
+	return nil
+}
+
 // mayDeleteImage is the single guard for every test-side image deletion.
 func (t *tracker) mayDeleteImage(id string) error {
 	if id == t.base {
@@ -224,8 +231,8 @@ func (t *tracker) cleanup(ctx context.Context, c api, interval time.Duration) []
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 	for i := len(t.vms) - 1; i >= 0; i-- {
 		id := t.vms[i]
-		if t.preVMs[id] {
-			add("cleanup refused: tracked VM %s is preexisting", id)
+		if err := t.mayDeleteVM(id); err != nil {
+			add("cleanup refused VM %s: %v", id, err)
 			continue
 		}
 		if _, err := c.VM(ctx, t.user, id); isStatus(err, 404) {
@@ -401,7 +408,8 @@ func pinGuest(ctx context.Context, dir, keyFile, knownHostsFile string, s contro
 
 func (g *guest) sshArgs(remote string) []string {
 	return []string{
-		"-i", g.key, "-p", strconv.Itoa(g.port),
+		"-F", "/dev/null", "-i", g.key, "-p", strconv.Itoa(g.port),
+		"-o", "IdentityAgent=none", "-o", "CertificateFile=none", "-o", "PreferredAuthentications=publickey",
 		"-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
 		"-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + g.known, "-o", "GlobalKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=8", "-o", "ControlMaster=no", "-o", "ForwardAgent=no", "-o", "LogLevel=ERROR",

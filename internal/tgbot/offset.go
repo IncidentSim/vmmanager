@@ -10,9 +10,10 @@ import (
 )
 
 type deliveryState struct {
-	Version  int   `json:"version"`
-	Offset   int64 `json:"offset"`
-	Imported bool  `json:"imported"`
+	AdminReports []string `json:"admin_reports,omitempty"`
+	Version      int      `json:"version"`
+	Offset       int64    `json:"offset"`
+	Imported     bool     `json:"imported"`
 }
 type Delivery struct {
 	mu          sync.Mutex
@@ -53,15 +54,16 @@ func OpenDelivery(dir string) (*Delivery, error) {
 	}
 	b, e := privateRead(path)
 	var wire struct {
-		Version  *int   `json:"version"`
-		Offset   *int64 `json:"offset"`
-		Imported *bool  `json:"imported"`
+		AdminReports []string `json:"admin_reports,omitempty"`
+		Version      *int     `json:"version"`
+		Offset       *int64   `json:"offset"`
+		Imported     *bool    `json:"imported"`
 	}
 	if e != nil || strict(b, &wire) != nil || wire.Version == nil || *wire.Version != 1 || wire.Offset == nil || *wire.Offset < 0 || wire.Imported == nil {
 		s.Close()
 		return nil, errors.New("invalid private delivery state")
 	}
-	s.state = deliveryState{Version: *wire.Version, Offset: *wire.Offset, Imported: *wire.Imported}
+	s.state = deliveryState{Version: *wire.Version, Offset: *wire.Offset, Imported: *wire.Imported, AdminReports: wire.AdminReports}
 	s.initialized = true
 	return s, nil
 }

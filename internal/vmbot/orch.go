@@ -111,7 +111,7 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("orchestration database: %w", err)
 	}
 	dbos.RegisterWorkflow(dctx, vmbotOp, dbos.WithWorkflowName(orchWorkflow))
-	dbos.RegisterWorkflow(dctx, vmOwner, dbos.WithWorkflowName(ownerWorkflowName))
+	dbos.RegisterWorkflow(dctx, c.ownerBody(), dbos.WithWorkflowName(ownerWorkflowName))
 	dbos.RegisterWorkflow(dctx, vmEffect, dbos.WithWorkflowName(effectWorkflowName))
 	dbos.RegisterWorkflow(dctx, imageDelete, dbos.WithWorkflowName(imageWorkflowName))
 	q, err := dbos.RegisterQueue(dctx, orchQueue, dbos.WithPartitionConcurrency(1),

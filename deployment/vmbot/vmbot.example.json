@@ -3,8 +3,9 @@
   "telegram_token_file": "/home/USER/.config/vmbot-http/telegram-token",
   "api_url": "http://127.0.0.1:8090",
   "api_token_file": "/home/USER/.config/vmbot-http/control-service-token",
+  "admin_user_ids": [],
   "allowed_user_ids": [123456789],
   "delivery_dir": "/home/USER/.local/state/vmbot-http-delivery",
   "image_id": "base-image-id",
-  "resources": {"vcpu": 1, "memory_mib": 512}
+  "profile": "small"
 }

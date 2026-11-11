@@ -357,7 +357,7 @@ func TestBotNormalRequestsUsePerUserJWTNeverDelegation(t *testing.T) {
 	f := newJFix(t, []string{"alice_example"}, []int64{11}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	f.bot.Handle(ctx, from(1001, "alice_example", "/create lab ubuntu 1 512"))
+	f.bot.Handle(ctx, from(1001, "alice_example", "/create lab ubuntu small"))
 	msgs := f.tg.all()
 	if len(msgs) < 2 || !strings.Contains(msgs[len(msgs)-1].Text, "https://terminal.test/t/") {
 		t.Fatalf("create flow through per-user JWT failed: %+v", msgs)

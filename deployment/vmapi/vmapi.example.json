@@ -1,6 +1,7 @@
 {
   "listen_addr": "127.0.0.1:8090",
   "state_dir": "/home/USER/.local/state/vmapi",
+  "admin_user_ids": [],
   "allowed_user_ids": [123456789],
   "legacy_owner_user_id": 123456789,
   "shared_image_ids": ["base-image-id"],

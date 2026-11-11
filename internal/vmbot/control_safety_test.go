@@ -20,12 +20,14 @@ func TestControlSnapshotDoesNotAliasResources(t *testing.T) {
 	svc, _ := vmlib.NewService(vmlibtest.New(2, "ubuntu"))
 	c := NewController(svc, s, &controlTerms{}, ControllerConfig{})
 	c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11}, SharedImages: []string{"ubuntu"}, MaxVMs: 2, MaxVMsPerUser: 1})
-	r := &ControlResources{1, 512}
-	_, e = c.AcceptControl(11, "k", ControlRequest{Kind: "create", ImageID: "ubuntu", Resources: r})
+	_, e = c.AcceptControl(11, "k", ControlRequest{Kind: "create", ImageID: "ubuntu"})
 	if e != nil {
 		t.Fatal(e)
 	}
-	r.VCPU = 9
+	// Effective resources are written by the owner outcome, never by a request.
+	if e = s.Update(func(st *State) { st.VMs[0].Resources = &ControlResources{VCPU: 1, MemoryMiB: 512} }); e != nil {
+		t.Fatal(e)
+	}
 	s.Snapshot().VMs[0].Resources.MemoryMiB = 9999
 	v := s.Snapshot().VMs[0]
 	if v.Resources.VCPU != 1 || v.Resources.MemoryMiB != 512 {

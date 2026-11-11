@@ -19,7 +19,7 @@ func TestLocalBackendDynamicResourcesThroughEmbeddedService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := vmlib.VMResources{VCPU: 1, MemMiB: 193}
+	want := vmlib.VMResources{VCPU: 1, CPULimitMilli: 1000, MemMiB: 193}
 	v, err := fc.Create(ctx, vmlib.CreateRequest{ID: "custom", ImageID: "base", Resources: &want})
 	if err != nil || v.Resources != want {
 		t.Fatalf("create: %+v %v", v, err)

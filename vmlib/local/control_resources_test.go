@@ -20,7 +20,7 @@ func TestDynamicResourcesExactRestartAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := vmlib.VMResources{VCPU: 2, MemMiB: 600}
+	want := vmlib.VMResources{VCPU: 2, CPULimitMilli: 2000, MemMiB: 600}
 	req := vmlib.PrepareRequest{VMID: "custom", ImageID: "base", Resources: &want}
 	h, err := b.Prepare(ctx, req)
 	if err != nil {

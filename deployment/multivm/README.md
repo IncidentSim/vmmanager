@@ -11,7 +11,7 @@ from the active legacy `firecracker-builder@main.service`, which stays untouched
 | network | `firecracker-builder-network` | `firecracker-vm-network@N` (host-root oneshot per slot) |
 | runtime / jail | `/run/firecracker-builder`, `.../jail` | `/run/firecracker-vms/slot-N`, `/var/lib/firecracker-vms/jail` |
 | TAP / subnet | `tap-fcpg`, `172.16.0.0/30` | `tap-vmN`, `PREFIX.N.0/30` from **your** `pool.conf` |
-| privileged control | systemd | `fc-vm-helper.socket` -> `start-slot N` only |
+| privileged control | systemd | `fc-vm-helper.socket` -> `start-slot N CPU_MILLI` only |
 | storage | `.../storage` (20 GiB) | **same** mount, `.../storage/vms/{work,images}` |
 
 ## Pieces
@@ -27,8 +27,13 @@ from the active legacy `firecracker-builder@main.service`, which stays untouched
 * `firecracker-vm-network@.service` + `fc-vm-network.sh`: host-root oneshot,
   `RemainAfterExit`. Creates `tap-vmN`, the /30 and tagged NAT rules; **refuses any
   existing non-default route or interface address that overlaps the slot /30**
-  (a covering `172.17.0.0/16` counts) and any existing interface; removes only what
-  its marker recorded. It stays up while the slot is idle and is stopped by you
+  (a covering `172.17.0.0/16` counts). Existing valid TAPs can be safely refreshed
+  without changing their link/address or restarting VMMs. Owned chains enforce
+  IPv4 guest/host/private-network isolation and block TAP IPv6. Optional root-only
+  public SSH DNAT is disabled by default; see [NETWORK.md](NETWORK.md) for knobs,
+  approval-gated install/refresh, reuse conntrack gate and rollback. The new
+  network source is not implied deployed by the historical verification report.
+  It stays up while the slot is idle and is stopped by you
   (`systemctl stop firecracker-vm-network@N`) or at shutdown, always after the VMM
   unit (and therefore after the receipt).
 * `fc-vm-helper.socket` / `fc-vm-helper@.service` -> `cmd/vm-helper` (root) and
@@ -159,3 +164,9 @@ remove the new units, helpers and directories. Legacy service/CLI are unaffected
   trusted-operator model, not a boundary.
 * Shared preinstalled SSH keys in the base image let anyone with that key log into
   every VM derived from it.
+
+Four-slot CPU/RAM capacity changes are prepared separately in
+[`four-slot/README.md`](four-slot/README.md), not enabled by these defaults.
+Every helper request now includes its persisted CPU quota; the helper holds a
+root-only per-slot flock across idle check, runtime CPUQuota set, readback and
+start. Install the matched helper/client binaries and updated helper template.

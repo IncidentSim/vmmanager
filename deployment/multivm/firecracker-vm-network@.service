@@ -14,6 +14,8 @@ Type=oneshot
 RemainAfterExit=yes
 User=root
 ExecStart=/usr/local/libexec/fc-vm-network up %i
+# Reload refreshes owned rules only; never restart this unit with a live VMM.
+ExecReload=/usr/local/libexec/fc-vm-network refresh %i
 ExecStop=/usr/local/libexec/fc-vm-network down %i
 NoNewPrivileges=yes
 ProtectHome=yes

@@ -100,10 +100,15 @@ type Image struct {
 	Base      bool
 }
 
-// VMResources is the exact immutable CPU/RAM reservation of a VM.
+// VMResources is the exact immutable CPU/RAM reservation of a VM. VCPU is the
+// guest-visible vCPU count; CPULimitMilli is the host CPU-time ceiling of the
+// VMM in thousandths of one CPU (500 = half a CPU), physically enforced as a
+// cgroup CPUQuota. Zero CPULimitMilli means a reservation recorded before CPU
+// limits existed (see EffectiveCPULimitMilli).
 type VMResources struct {
-	VCPU   uint32
-	MemMiB uint32
+	VCPU          uint32
+	CPULimitMilli uint32
+	MemMiB        uint32
 }
 
 // ValidateResourceSelection rejects ambiguous modes and zero explicit resources.
@@ -117,9 +122,12 @@ func ValidateResourceSelection(profile string, resources *VMResources) error {
 	return ValidateID("profile", profile)
 }
 
+// Profile is one entry of the single backend profile catalogue. CPULimitMilli
+// is the per-VMM CPU-time cap (see VMResources); it is never a float.
 type Profile struct {
 	Name                  string
 	VCPU, MemMiB, DiskMiB uint32
+	CPULimitMilli         uint32
 }
 
 // GuestNetwork is how the guest is expected to be configured. It is metadata
@@ -150,6 +158,10 @@ type Capabilities struct {
 	// backend). They must not exceed the installed per-unit/slice limits.
 	MaxTotalMemMiB uint32
 	MaxTotalVCPU   uint32
+	// MaxTotalCPULimitMilli bounds the sum of per-VMM CPU-time limits.
+	MaxTotalCPULimitMilli uint32
+	// DefaultProfile names the profile used when a request names none.
+	DefaultProfile string
 }
 
 // ResourceCapabilities is the subset of backend policy exposed through the
@@ -159,20 +171,28 @@ type ResourceCapabilities struct {
 	MaxVMs   int
 	Profiles []Profile
 	// 0 = not enforced by the backend.
-	MaxTotalMemMiB uint32
-	MaxTotalVCPU   uint32
+	MaxTotalMemMiB        uint32
+	MaxTotalVCPU          uint32
+	MaxTotalCPULimitMilli uint32
+	DefaultProfile        string
 }
 
 // HostVM is a backend's view of one VM.
 type HostVM struct {
+	// SSHAuthMode is the per-VM authentication policy from durable host metadata.
+	// Empty preserves compatibility with backends that only report global policy.
+	SSHAuthMode                 string
 	Resources                   VMResources
 	ID, ImageID, Profile, State string
-	GuestIP                     string
-	Retained                    bool
-	RetainedReason              string
-	HostKeyFingerprint          string
-	PublicKeyProvisioned        bool
-	Guest                       *GuestNetwork
+	// GuestIP always remains the host-local guest address, including for shutdown.
+	GuestIP string
+	// SSHEndpoint optionally advertises the operator-configured public endpoint.
+	SSHEndpoint          *SSHEndpoint
+	Retained             bool
+	RetainedReason       string
+	HostKeyFingerprint   string
+	PublicKeyProvisioned bool
+	Guest                *GuestNetwork
 }
 
 type ExitReceipt struct {
@@ -187,6 +207,9 @@ type ReleaseResult struct {
 }
 
 type PrepareRequest struct {
+	// DiskMiB is a trusted admission snapshot, used only with Resources.
+	// Zero preserves the legacy explicit-resource disk policy. Not an HTTP input.
+	DiskMiB                uint32
 	Resources              *VMResources
 	VMID, ImageID, Profile string
 	SSHPublicKey           string
@@ -229,6 +252,8 @@ type VM struct {
 }
 
 type CreateRequest struct {
+	// DiskMiB carries an admitted disk-policy snapshot to Prepare (not public HTTP resources).
+	DiskMiB   uint32
 	Resources *VMResources
 	// ID is optional; a unique ID is generated when empty.
 	ID, ImageID, Profile string
@@ -240,6 +265,9 @@ type CreateRequest struct {
 }
 
 type SSHInfo struct {
+	// InternalTarget is backend-derived host-local access, never serialized.
+	// Host/Port remain the client-facing endpoint and may be public.
+	InternalTarget       *SSHEndpoint `json:"-"`
 	Host                 string
 	Port                 int
 	User                 string

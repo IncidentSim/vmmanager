@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -60,23 +61,32 @@ type VMRecord struct {
 	// Seq is the delete-attempt sequence (ADR 0004): the durable part of the
 	// delete workflow ID. 0 = no delete intent yet. A retry after a finished,
 	// unsuccessful attempt persists Seq+1 before a new workflow is submitted.
-	Seq          uint64            `json:"seq,omitempty"`
-	OwnerUserID  int64             `json:"owner_user_id,omitempty"`
-	ImageID      string            `json:"image_id,omitempty"`
-	Resources    *ControlResources `json:"resources,omitempty"`
-	SSHPublicKey string            `json:"ssh_public_key,omitempty"`
-	RemoteState  string            `json:"remote_state,omitempty"`
+	Seq         uint64            `json:"seq,omitempty"`
+	OwnerUserID int64             `json:"owner_user_id,omitempty"`
+	ImageID     string            `json:"image_id,omitempty"`
+	Resources   *ControlResources `json:"resources,omitempty"`
+	// DiskMiB is the immutable admission disk bound; zero retains legacy policy.
+	DiskMiB      uint32 `json:"disk_mib,omitempty"`
+	Profile      string `json:"profile,omitempty"`
+	SSHPublicKey string `json:"ssh_public_key,omitempty"`
+	RemoteState  string `json:"remote_state,omitempty"`
+	// TTLSeconds and ExpiresAt are set once at Create admission and never change
+	// (no renewal, restart does not reset them). A record without ExpiresAt is a
+	// legacy VM: it has no deadline and never receives one retroactively.
+	TTLSeconds int64      `json:"ttl_seconds,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 
 // State is persisted as state.json (schema v2).
 type State struct {
-	Control    bool               `json:"control,omitempty"`
-	Operations []ControlOperation `json:"operations,omitempty"`
-	Images     []ControlImage     `json:"images,omitempty"`
-	Version    int                `json:"version"`
-	Generation uint64             `json:"generation"` // monotonic high-water mark; never reused
-	VMs        []VMRecord         `json:"vms"`        // ascending Generation
-	Offset     int64              `json:"offset"`     // next Telegram update_id to request
+	AdminBatches []AdminBatch       `json:"admin_batches,omitempty"`
+	Control      bool               `json:"control,omitempty"`
+	Operations   []ControlOperation `json:"operations,omitempty"`
+	Images       []ControlImage     `json:"images,omitempty"`
+	Version      int                `json:"version"`
+	Generation   uint64             `json:"generation"` // monotonic high-water mark; never reused
+	VMs          []VMRecord         `json:"vms"`        // ascending Generation
+	Offset       int64              `json:"offset"`     // next Telegram update_id to request
 }
 
 // stateV1 is the previous single-VM schema, read only for migration.
@@ -374,6 +384,10 @@ func (s *Store) Snapshot() State {
 }
 
 func clone(st State) State {
+	st.AdminBatches = append([]AdminBatch{}, st.AdminBatches...)
+	for i := range st.AdminBatches {
+		st.AdminBatches[i].VMs = append([]AdminVMRef{}, st.AdminBatches[i].VMs...)
+	}
 	st.Operations = append([]ControlOperation{}, st.Operations...)
 	st.Images = append([]ControlImage{}, st.Images...)
 	st.VMs = append([]VMRecord{}, st.VMs...)
@@ -381,6 +395,10 @@ func clone(st State) State {
 		if st.VMs[n].Resources != nil {
 			r := *st.VMs[n].Resources
 			st.VMs[n].Resources = &r
+		}
+		if st.VMs[n].ExpiresAt != nil {
+			t := *st.VMs[n].ExpiresAt
+			st.VMs[n].ExpiresAt = &t
 		}
 	}
 	return st
@@ -402,6 +420,9 @@ func (s *Store) UpdateErr(mutate func(*State) error) error {
 		return err
 	}
 	if s.st.Control {
+		if e := immutableAdminBatches(s.st.AdminBatches, next.AdminBatches); e != nil {
+			return e
+		}
 		for _, old := range s.st.VMs {
 			if cur, ok := next.ByID(old.ID); ok && cur.OwnerUserID != old.OwnerUserID {
 				return errors.New("VM owner is immutable")

@@ -92,13 +92,26 @@ func TestExecutableControlFlow(t *testing.T) {
 		return o
 	}
 
-	// Create with explicit resources (public SDK, real HTTP, real DBOS).
-	res := &controlclient.Resources{VCPU: 1, MemoryMiB: 256}
-	created, e := user.Create(ctx, 11, "smoke-create", controlclient.CreateRequest{Name: "smoke", ImageID: "ubuntu", Resources: res})
+	// Create by profile (public SDK, real HTTP, real DBOS).
+	caps, e := user.Capabilities(ctx, 11)
 	if e != nil {
 		t.Fatal(e)
 	}
-	again, e := user.Create(ctx, 11, "smoke-create", controlclient.CreateRequest{Name: "smoke", ImageID: "ubuntu", Resources: res})
+	var res *controlclient.Resources
+	for _, p := range caps.Profiles {
+		if p.Name == "small" {
+			res = &controlclient.Resources{VCPU: p.VCPU, CPULimit: p.CPULimit, MemoryMiB: p.MemoryMiB}
+			break
+		}
+	}
+	if res == nil {
+		t.Fatal("configured profile absent from capabilities")
+	}
+	created, e := user.Create(ctx, 11, "smoke-create", controlclient.CreateRequest{Name: "smoke", ImageID: "ubuntu", Profile: "small"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	again, e := user.Create(ctx, 11, "smoke-create", controlclient.CreateRequest{Name: "smoke", ImageID: "ubuntu", Profile: "small"})
 	if e != nil || again.OperationID != created.OperationID || again.VMID != created.VMID {
 		t.Fatalf("idempotent replay %v %+v", e, again)
 	}

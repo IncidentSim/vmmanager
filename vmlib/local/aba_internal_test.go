@@ -15,7 +15,7 @@ import (
 
 type nopLauncher struct{}
 
-func (nopLauncher) StartSlot(context.Context, int) error { return nil }
+func (nopLauncher) StartSlot(context.Context, int, uint32) error { return nil }
 
 type nopVMM struct{}
 

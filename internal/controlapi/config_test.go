@@ -18,7 +18,7 @@ func TestConfigurationSecurity(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if c.ListenAddr != "127.0.0.1:8090" || c.MaxVMs != 2 || c.MaxVMsPerUser != 1 {
+	if c.ListenAddr != "127.0.0.1:8090" || c.MaxVMs != 2 || c.MaxVMsPerUser != 2 {
 		t.Fatal("missing defaults")
 	}
 	c.ListenAddr = "0.0.0.0:8090"

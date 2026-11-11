@@ -24,14 +24,16 @@ const inv = "0123456789abcdef0123456789abcdef"
 type fakeLauncher struct {
 	mu       sync.Mutex
 	slots    []int
+	quotas   []uint32 // CPU quota (millicores) handed over with each start
 	err      error
 	ctxErrAt []error // ctx.Err() observed at each call
 	during   func()  // runs while the (possibly started) unit is being launched
 }
 
-func (l *fakeLauncher) StartSlot(ctx context.Context, slot int) error {
+func (l *fakeLauncher) StartSlot(ctx context.Context, slot int, cpuMilli uint32) error {
 	l.mu.Lock()
 	l.slots = append(l.slots, slot)
+	l.quotas = append(l.quotas, cpuMilli)
 	l.ctxErrAt = append(l.ctxErrAt, ctx.Err())
 	during, err := l.during, l.err
 	l.mu.Unlock()

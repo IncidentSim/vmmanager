@@ -63,19 +63,19 @@ func TestBotAgainstActualControlAPI(t *testing.T) {
 	bot.PollInterval = 5 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	bot.Handle(ctx, message(100, 42, "/create lab ubuntu 1 512"))
+	bot.Handle(ctx, message(100, 42, "/create lab ubuntu small"))
 	all, e := client.ListVMs(ctx, 42)
 	if e != nil || len(all) != 1 {
 		t.Fatalf("create/list: %+v %v; messages %+v", all, e, tg.messages)
 	}
 	vm := all[0]
-	if vm.Name != "lab" || vm.Resources.VCPU != 1 || vm.Resources.MemoryMiB != 512 {
+	if vm.Name != "lab" || vm.Profile != "small" {
 		t.Fatalf("resource contract %+v", vm)
 	}
 	if len(tg.messages) < 3 || !tg.messages[len(tg.messages)-1].Secret || !strings.Contains(tg.messages[len(tg.messages)-1].Text, "https://terminal.test/t/") {
 		t.Fatalf("actual terminal result absent: %+v", tg.messages)
 	}
-	a, e := client.Create(ctx, 42, "tg:100:create", controlclient.CreateRequest{Name: "lab", ImageID: "ubuntu", Resources: &controlclient.Resources{VCPU: 1, MemoryMiB: 512}})
+	a, e := client.Create(ctx, 42, "tg:100:create", controlclient.CreateRequest{Name: "lab", ImageID: "ubuntu", Profile: "small"})
 	if e != nil || a.VMID != vm.ID {
 		t.Fatalf("idempotent HTTP replay %+v %v", a, e)
 	}

@@ -23,6 +23,8 @@ import (
 	"github.com/petruekhin/vibe-firecracker/internal/controlapi"
 	"github.com/petruekhin/vibe-firecracker/internal/identity"
 	"github.com/petruekhin/vibe-firecracker/internal/localcfg"
+	"github.com/petruekhin/vibe-firecracker/internal/nextermaccess"
+	"github.com/petruekhin/vibe-firecracker/internal/sshaccess"
 	"github.com/petruekhin/vibe-firecracker/internal/vmbot"
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
@@ -45,12 +47,19 @@ func main() {
 type backendOpener func(*localcfg.JSONConfig) (vmlib.Backend, func() error, error)
 
 func openLocalBackend(c *localcfg.JSONConfig) (vmlib.Backend, func() error, error) {
-	b, e := localcfg.Open(c, localcfg.Seams{})
+	b, credentials, e := localcfg.BuildWithAccess(c, localcfg.Seams{})
 	if e != nil {
 		return nil, nil, e
 	}
-	return b, b.Close, nil
+	return accessBackend{Backend: b, credentials: credentials}, b.Close, nil
 }
+
+type accessBackend struct {
+	vmlib.Backend
+	credentials sshaccess.Credentials
+}
+
+func (b accessBackend) AccessCredentials() sshaccess.Credentials { return b.credentials }
 
 type unavailableTerminals struct{}
 
@@ -59,6 +68,14 @@ func (unavailableTerminals) Start(context.Context, vmbot.TerminalTarget) error {
 }
 func (unavailableTerminals) Revoke(string) {}
 func (unavailableTerminals) Close()        {}
+
+// noTerminals is installed when Nexterm is enabled: terminal operations succeed
+// without spawning any ttyd/SSH helper; the browser link comes from Nexterm.
+type noTerminals struct{}
+
+func (noTerminals) Start(context.Context, vmbot.TerminalTarget) error { return nil }
+func (noTerminals) Revoke(string)                                     {}
+func (noTerminals) Close()                                            {}
 
 type degradeSetter interface{ SetDegraded(bool) }
 
@@ -98,18 +115,28 @@ func run(ctx context.Context, path string, open backendOpener) error {
 		return e
 	}
 	defer st.Close()
+	var credentials sshaccess.Credentials
+	if b, ok := backend.(interface{ AccessCredentials() sshaccess.Credentials }); ok {
+		credentials = b.AccessCredentials()
+	}
 	var term vmbot.Terminals = unavailableTerminals{}
 	var manager *vmbot.Manager
 	if cfg.Terminal.PublicOrigin != "" {
 		tc := cfg.Terminal
-		manager, e = vmbot.NewManager(vmbot.ManagerConfig{TTYDPath: tc.TTYDPath, SSHPath: tc.SSHPath, SSHKeyFile: tc.SSHKeyFile, StateDir: cfg.StateDir, PublicOrigin: tc.PublicOrigin, MaxClients: tc.MaxClients, MaxSessions: cfg.MaxVMs, UseBastion: tc.SSHUseBastion})
+		manager, e = vmbot.NewManager(vmbot.ManagerConfig{TTYDPath: tc.TTYDPath, SSHPath: tc.SSHPath, SSHKeyFile: tc.SSHKeyFile, Credentials: credentials, StateDir: cfg.StateDir, PublicOrigin: tc.PublicOrigin, MaxClients: tc.MaxClients, MaxSessions: cfg.MaxVMs, UseBastion: tc.SSHUseBastion})
 		if e != nil {
 			return errors.New("invalid terminal configuration")
 		}
 		term = manager
 	}
 	defer term.Close()
-	ctl := vmbot.NewController(svc, st, term, vmbot.ControllerConfig{Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin})
+	nxCfg := cfg.Nexterm
+	nexterm := nxCfg != nil && nxCfg.Enabled
+	ctlTerm := term
+	if nexterm {
+		ctlTerm = noTerminals{} // never spawn ttyd for new terminal requests
+	}
+	ctl := vmbot.NewController(svc, st, ctlTerm, vmbot.ControllerConfig{Credentials: credentials, Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin, DefaultTTL: time.Duration(cfg.DefaultTTLSeconds) * time.Second, MaxTTL: time.Duration(cfg.MaxTTLSeconds) * time.Second})
 	ctl.ConfigureControl(cfg.Policy())
 	var jwtAuth *controlapi.JWTAuth
 	if cfg.JWT != nil {
@@ -130,6 +157,54 @@ func run(ctx context.Context, path string, open backendOpener) error {
 	}
 	h, e := controlapi.NewWithJWT(ctl, cfg.Credentials, jwtAuth)
 	if e != nil {
+		return e
+	}
+	// The durable owner enforces TTL; SSH flags require a wired backend provider.
+	policy := cfg.PublicPolicy()
+	policy.TTL = true
+	if e = ctl.ConfigureAdmins(cfg.AdminUserIDs); e != nil {
+		return e
+	}
+	options := controlapi.Options{Policy: policy}
+	if credentials != nil {
+		caps, err := backend.Capabilities(ctx)
+		if err != nil {
+			return errors.New("cannot determine access capability")
+		}
+		if caps.SSHAuthMode == vmlib.AuthProvisionPublicKey {
+			options.Policy.SuppliedSSHKey = true
+			options.Policy.GeneratedSSHKey = true
+			options.Keys = controlapi.AccessKeys{Controller: ctl, Credentials: credentials}
+		}
+	}
+	var browser *controlapi.NextermBrowser
+	if nexterm {
+		// The API is the single owner of the Nexterm state store and admin
+		// credential; the bot only receives links over the authenticated API.
+		nc, e := nextermaccess.NewClient(nxCfg.URL, nil)
+		if e != nil {
+			return errors.New("invalid nexterm configuration")
+		}
+		nstore, e := nextermaccess.OpenStore(nxCfg.StateFile)
+		if e != nil {
+			return errors.New("cannot open nexterm state (is another process holding it?)")
+		}
+		defer nstore.Close()
+		browser, e = controlapi.NewNextermBrowser(*nxCfg, nc, nstore, ctl, options.Keys)
+		if e != nil {
+			return errors.New("invalid nexterm configuration")
+		}
+		options.Browser = browser
+		// Repair admission -> Nexterm-store crash windows, including API-only
+		// creates and JWT owners not yet seen by this bot process. Track does
+		// not grant access: all provisioning still proves live ownership.
+		for _, vm := range st.Snapshot().VMs {
+			if e = browser.Track(vm.OwnerUserID, vm.ID); e != nil {
+				return errors.New("cannot schedule nexterm recovery")
+			}
+		}
+	}
+	if e = h.Configure(options); e != nil {
 		return e
 	}
 	if e = ctl.Start(ctx); e != nil {
@@ -167,11 +242,18 @@ func run(ctx context.Context, path string, open backendOpener) error {
 			done <- srv.Serve(listener)
 		}
 	}()
+	nxDone := make(chan struct{})
+	if browser != nil {
+		go func() { defer close(nxDone); browser.Run(ctx) }()
+	} else {
+		close(nxDone)
+	}
 	select {
 	case <-ctx.Done():
 	case e = <-done:
 	}
 	cancel()
+	<-nxDone // the Nexterm store is closed only after its background work ended
 	shutdown, stop := context.WithTimeout(context.Background(), 10*time.Second)
 	defer stop()
 	_ = srv.Shutdown(shutdown)

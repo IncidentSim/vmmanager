@@ -73,6 +73,12 @@ func (*controlTerms) Close()                                      {}
 
 var _ = vmlib.ErrNotFound
 
+type refusingPrepare struct{ vmlib.Backend }
+
+func (b refusingPrepare) Prepare(context.Context, vmlib.PrepareRequest) (vmlib.HostVM, error) {
+	return vmlib.HostVM{}, vmlib.ErrResourceExhausted
+}
+
 // A backend policy refusal after durable admission must surface as a stable,
 // safe operation error code, not a blanket "unavailable".
 func TestControlOperationErrorCodeForBackendRefusal(t *testing.T) {
@@ -82,14 +88,14 @@ func TestControlOperationErrorCodeForBackendRefusal(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer st.Close()
-	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
+	svc, _ := vmlib.NewService(refusingPrepare{Backend: vmlibtest.New(3, "ubuntu")})
 	c := NewController(svc, st, &controlTerms{}, ControllerConfig{Profile: "small", OpTimeout: 2 * time.Second})
 	c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11}, SharedImages: []string{"ubuntu"}, MaxVMs: 2, MaxVMsPerUser: 1})
 	if e = c.Start(context.Background()); e != nil {
 		t.Fatal(e)
 	}
 	defer c.Close()
-	a, e := c.AcceptControl(11, "huge", ControlRequest{Kind: "create", ImageID: "ubuntu", Resources: &ControlResources{VCPU: 1, MemoryMiB: 1 << 30}})
+	a, e := c.AcceptControl(11, "huge", ControlRequest{Kind: "create", ImageID: "ubuntu", Profile: "small"})
 	if e != nil {
 		t.Fatal(e)
 	}

@@ -10,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/petruekhin/vibe-firecracker/internal/identity"
 	"github.com/petruekhin/vibe-firecracker/internal/jwtauth"
 	"github.com/petruekhin/vibe-firecracker/internal/localcfg"
+	"github.com/petruekhin/vibe-firecracker/internal/nextermaccess"
 	"github.com/petruekhin/vibe-firecracker/internal/vmbot"
 )
 
@@ -22,6 +24,7 @@ type Config struct {
 	TLSCertFile      string     `json:"tls_cert_file,omitempty"`
 	TLSKeyFile       string     `json:"tls_key_file,omitempty"`
 	StateDir         string     `json:"state_dir"`
+	AdminUserIDs     []int64    `json:"admin_user_ids,omitempty"`
 	AllowedUserIDs   []int64    `json:"allowed_user_ids"`
 	AllowedUsernames []string   `json:"allowed_usernames"`
 	JWT              *JWTConfig `json:"jwt,omitempty"`
@@ -34,10 +37,16 @@ type Config struct {
 	MaxVMs              int          `json:"max_vms"`
 	MaxVMsPerUser       int          `json:"max_vms_per_user"`
 	DefaultProfile      string       `json:"default_profile"`
+	DefaultTTLSeconds   int64        `json:"default_ttl_seconds,omitempty"`
+	MaxTTLSeconds       int64        `json:"max_ttl_seconds,omitempty"`
 	// Backend is the private single-host local backend policy: exactly the object
 	// that vmd called backend.local (see docs/control-api-backend.md). The API
 	// opens vmlib/local.Backend in-process; there is no VM transport.
 	Backend *localcfg.JSONConfig `json:"backend"`
+	// Nexterm is optional and disabled by default. When enabled the API owns the
+	// durable per-VM Nexterm lifecycle and every terminal link is a Nexterm
+	// browser link (no ttyd is spawned). See docs/nexterm-access.md.
+	Nexterm *nextermaccess.Config `json:"nexterm,omitempty"`
 	// Facade only exists to reject stale gRPC-facade configurations with a clear
 	// error instead of silently ignoring them.
 	Facade   json.RawMessage `json:"facade,omitempty"`
@@ -99,13 +108,22 @@ func LoadConfig(path string) (Config, error) {
 		c.ListenAddr = "127.0.0.1:8090"
 	}
 	if c.MaxVMs == 0 {
-		c.MaxVMs = 2
+		c.MaxVMs = 4
+		if c.Backend != nil && c.Backend.MaxVMs > 0 && c.Backend.MaxVMs < c.MaxVMs {
+			c.MaxVMs = c.Backend.MaxVMs
+		}
 	}
 	if c.MaxVMsPerUser == 0 {
-		c.MaxVMsPerUser = 1
+		c.MaxVMsPerUser = 2
 	}
 	if c.DefaultProfile == "" {
 		c.DefaultProfile = "small"
+	}
+	if c.DefaultTTLSeconds == 0 {
+		c.DefaultTTLSeconds = 3600
+	}
+	if c.MaxTTLSeconds == 0 {
+		c.MaxTTLSeconds = 86400
 	}
 	if c.Terminal.MaxClients == 0 {
 		c.Terminal.MaxClients = 4
@@ -121,6 +139,23 @@ func (c Config) Policy() vmbot.ControlPolicy {
 	return vmbot.ControlPolicy{AllowedUsers: c.AllowedUserIDs, SharedImages: c.SharedImageIDs, MaxVMs: c.MaxVMs, MaxVMsPerUser: c.MaxVMsPerUser}
 }
 func (c Config) Validate() error {
+	if e := vmbot.ValidateAdminIDs(c.AdminUserIDs); e != nil {
+		return e
+	}
+	if c.MaxTTLSeconds > int64((time.Duration(1<<63-1))/time.Second) {
+		return errors.New("max_ttl_seconds exceeds whole-second duration range")
+	}
+	policy := Policy{DefaultProfile: c.DefaultProfile, DefaultTTLSeconds: c.DefaultTTLSeconds, MaxTTLSeconds: c.MaxTTLSeconds}
+	if err := policy.Validate(); err != nil {
+		return err
+	}
+	if err := structValidator.Struct(struct {
+		MaxVMs        int `json:"max_vms" validate:"gte=1,lte=8"`
+		MaxVMsPerUser int `json:"max_vms_per_user" validate:"gte=1,ltefield=MaxVMs"`
+	}{c.MaxVMs, c.MaxVMsPerUser}); err != nil {
+		return fmtValidation("policy", err)
+	}
+
 	if len(c.Facade) != 0 {
 		return errors.New("facade gRPC configuration was removed: move the former vmd backend.local object to backend")
 	}
@@ -129,6 +164,16 @@ func (c Config) Validate() error {
 	}
 	if e := c.Backend.Validate(); e != nil {
 		return e
+	}
+	foundProfile := false
+	for _, p := range c.Backend.Profiles {
+		if p.Name == c.DefaultProfile {
+			foundProfile = true
+			break
+		}
+	}
+	if !foundProfile {
+		return errors.New("default_profile must name a backend.profiles entry")
 	}
 	if c.Backend.MaxVMs > 0 && c.MaxVMs > c.Backend.MaxVMs {
 		return errors.New("max_vms exceeds backend.max_vms")
@@ -150,6 +195,9 @@ func (c Config) Validate() error {
 	}
 	if j := c.JWT; j != nil && (!filepath.IsAbs(j.PublicKeyFile) || j.Issuer == "" || j.Audience == "") {
 		return errors.New("invalid jwt configuration")
+	}
+	if e := c.Nexterm.Validate(); e != nil {
+		return e
 	}
 	if c.ExposesAPI() && c.Terminal.PublicOrigin == "" {
 		return errors.New("expose_api_on_terminal requires the terminal gateway")

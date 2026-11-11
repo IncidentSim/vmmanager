@@ -2,6 +2,7 @@ package controlapi
 
 import (
 	"embed"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -58,7 +59,7 @@ func staticHeaders(w http.ResponseWriter, contentType string) {
 
 // serveDocs serves the public, read-only documentation routes. It reports
 // whether the path belongs to them (it then wrote the response).
-func serveDocs(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) serveDocs(w http.ResponseWriter, r *http.Request) bool {
 	p := r.URL.Path
 	var body []byte
 	var ctype string
@@ -67,6 +68,17 @@ func serveDocs(w http.ResponseWriter, r *http.Request) bool {
 		body, ctype = []byte(swaggerPage), "text/html; charset=utf-8"
 	case p == "/openapi.yaml":
 		body, ctype = docs.OpenAPI, "application/yaml; charset=utf-8"
+		if s.ctl != nil {
+			images := s.ctl.ControlPolicy().SharedImages
+			if len(images) > 0 {
+				example := map[string]any{"image_id": images[0], "profile": s.opts.Policy.DefaultProfile}
+				if s.opts.Policy.TTL {
+					example["ttl_seconds"] = s.opts.Policy.DefaultTTLSeconds
+				}
+				b, _ := json.Marshal(example)
+				body = []byte(strings.Replace(string(body), "    CreateVM:\n", "    CreateVM:\n      example: "+string(b)+"\n", 1))
+			}
+		}
 	case strings.HasPrefix(p, "/docs/assets/"):
 		name := strings.TrimPrefix(p, "/docs/assets/")
 		t, ok := assetTypes[name]

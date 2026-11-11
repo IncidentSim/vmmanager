@@ -17,7 +17,7 @@ import (
 
 type fakeLauncher struct{}
 
-func (fakeLauncher) StartSlot(context.Context, int) error { return nil }
+func (fakeLauncher) StartSlot(context.Context, int, uint32) error { return nil }
 
 const invID = "0123456789abcdef0123456789abcdef"
 
@@ -79,6 +79,7 @@ func TestAssemblePreservesEveryPolicyField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l.PoolConf = publicationPool(t, "")
 	c, err := l.Assemble(Seams{Launcher: fakeLauncher{}, VMM: fakeVMM{}})
 	if err != nil {
 		t.Fatal(err)
@@ -86,8 +87,8 @@ func TestAssemblePreservesEveryPolicyField(t *testing.T) {
 	if c.WorkRoot != "/w" || c.ImagesDir != "/i" || c.RunDir != "/r" || c.MaxVMs != 2 || c.SSHUser != "root" ||
 		c.MinFreeMiB != 7 || c.VMMOverheadMiB != 65 || c.StorageMount != "/var/lib/firecracker-builder/storage" ||
 		c.MaxTotalMemMiB != 1024 || c.MaxTotalVCPU != 1 || c.UnitMemLimitMiB != 768 || c.GuestPrefix != "10.213" ||
-		c.PoolConf != "/etc/firecracker-vms/pool.conf" || len(c.GuestDNS) != 1 || len(c.Profiles) != 1 ||
-		c.Profiles[0] != (vmlib.Profile{Name: "small", VCPU: 1, MemMiB: 256, DiskMiB: 1024}) ||
+		c.PoolConf != l.PoolConf || len(c.GuestDNS) != 1 || len(c.Profiles) != 1 ||
+		c.Profiles[0] != (vmlib.Profile{Name: "small", VCPU: 1, CPULimitMilli: 1000, MemMiB: 256, DiskMiB: 1024}) ||
 		c.Bastion == nil || *c.Bastion != (vmlib.Bastion{Host: "b", Port: 22, User: "j"}) {
 		t.Fatalf("lost policy: %+v", c)
 	}

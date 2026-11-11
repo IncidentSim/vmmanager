@@ -53,6 +53,8 @@ type apiFixture struct {
 	pending          bool
 	actor            int64
 	opVM             string
+	result           map[string]string // overrides the terminal operation result
+	ssh              map[string]any    // overrides GET /ssh body
 }
 
 func (f *apiFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +74,15 @@ func (f *apiFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"vms": all})
 		return
 	}
+	if r.Method == "GET" && strings.HasSuffix(p, "/ssh") && f.ssh != nil {
+		json.NewEncoder(w).Encode(f.ssh)
+		return
+	}
 	if r.Method == "GET" && strings.HasPrefix(p, "/v1/operations/") {
+		if f.result != nil {
+			json.NewEncoder(w).Encode(map[string]any{"id": "op1", "status": "succeeded", "kind": "terminal", "vm_id": f.opVM, "result": f.result})
+			return
+		}
 		status := "succeeded"
 		if f.pending {
 			status = "running"
@@ -208,7 +218,7 @@ func TestListPaginationAndInvalidNames(t *testing.T) {
 	if rows != 25 || len(tg.messages) != 4 {
 		t.Fatalf("rows %d messages %d", rows, len(tg.messages))
 	}
-	for _, name := range []string{"../bad", "UPPER", "bot-x", "a b c", "x;ls"} {
+	for _, name := range []string{"../bad", "UPPER", "bot-x", "a b C", "x;ls"} {
 		b.Handle(context.Background(), message(2, 42, "/create "+name))
 	}
 	if f.mutations != 0 {

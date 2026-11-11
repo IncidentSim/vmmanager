@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
@@ -28,6 +29,8 @@ var (
 // TerminalTarget is everything the terminal backend may know about a guest.
 type TerminalTarget struct {
 	VMID, Token, Host, User, ProxyJump string
+	// AuthMode comes from the backend's per-VM SSH policy, never the caller.
+	AuthMode string
 	// authorize is a live domain-state fence. A start can outlive its command's
 	// active-state check; publication and new HTTP/WS access must revalidate.
 	authorize func() bool
@@ -40,12 +43,24 @@ type Terminals interface {
 	Close()
 }
 
+// CredentialDeleter removes per-VM credentials idempotently after proven deletion.
+// It deliberately exposes no secret-bearing reads to the durable controller.
+type CredentialDeleter interface {
+	Delete(vmID string) error
+}
+
 type ControllerConfig struct {
+	// Credentials is shared with backend access and terminals. Nil disables cleanup
+	// for legacy installations without per-VM credentials.
+	Credentials  CredentialDeleter
 	Profile      string
 	PublicOrigin string
 	OpTimeout    time.Duration // bounds one Create/Delete RPC
 	QueryTimeout time.Duration // bounds Get/List/SSHInfo and how long status waits for a busy VM
-	Logger       *log.Logger
+	// DefaultTTL/MaxTTL bound a created VM's lifetime (defaults 3600s / 86400s).
+	// Field-aware validation of these settings belongs to the config layer.
+	DefaultTTL, MaxTTL time.Duration
+	Logger             *log.Logger
 }
 
 // Status is the VM view carried in OpResult, the retired workflow's stored
@@ -68,6 +83,8 @@ type Status struct {
 // lifecycle work through the per-VM owner workflows (owner.go, control.go).
 type Controller struct {
 	control ControlPolicy
+	admins  []int64 // immutable after configuration, separate from ordinary access
+	adminMu sync.Mutex
 	// authorizer is an optional extra allow decision (durable username bindings).
 	authorizer func(int64) bool
 	lc         vmlib.Lifecycle
@@ -78,6 +95,12 @@ type Controller struct {
 	// testBeforeProject is a test seam called at the start of the projection step
 	// (after the child completed, before the outcome is written). Nil in production.
 	testBeforeProject func(OwnerCmd)
+
+	// ownerFn is the registered owner workflow body (vmOwner). Tests substitute a
+	// frozen baseline body to produce genuine old histories. Nil means vmOwner.
+	ownerFn func(dbos.Context, OwnerIn) (OwnerOut, error)
+	// clock is a test seam for admission/expiry decisions; nil means time.Now.
+	clock func() time.Time
 
 	// rebuild holds the VM IDs whose terminal is rebuilt once after Start.
 	rebuild sync.Map
@@ -94,8 +117,31 @@ func NewController(lc vmlib.Lifecycle, st *Store, term Terminals, cfg Controller
 	if cfg.QueryTimeout <= 0 {
 		cfg.QueryTimeout = 20 * time.Second
 	}
+	if cfg.MaxTTL <= 0 {
+		cfg.MaxTTL = MaxVMTTL
+	}
+	if cfg.DefaultTTL <= 0 {
+		cfg.DefaultTTL = DefaultVMTTL
+	}
+	if cfg.DefaultTTL > cfg.MaxTTL {
+		cfg.DefaultTTL = cfg.MaxTTL
+	}
 	cfg.PublicOrigin = strings.TrimRight(cfg.PublicOrigin, "/")
 	return &Controller{lc: lc, st: st, term: term, cfg: cfg}
+}
+
+func (c *Controller) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
+}
+
+func (c *Controller) ownerBody() func(dbos.Context, OwnerIn) (OwnerOut, error) {
+	if c.ownerFn != nil {
+		return c.ownerFn
+	}
+	return vmOwner
 }
 
 func (c *Controller) logf(format string, a ...any) {
@@ -138,7 +184,14 @@ func (c *Controller) ensureTerminalLocked(ctx context.Context, rec VMRecord) err
 		r, ok := c.st.Snapshot().ByID(cur.ID)
 		return ok && (!c.st.Snapshot().Control || (r.OwnerUserID == cur.OwnerUserID && c.ControlAllowed(r.OwnerUserID))) && r.Phase == PhaseActive && r.Generation == cur.Generation && r.Token == cur.Token
 	}
-	if err := c.term.Start(ctx, TerminalTarget{VMID: cur.ID, Token: cur.Token, Host: info.Host, User: info.User, ProxyJump: info.ProxyJump(), authorize: authorized}); err != nil {
+	host, jump := info.Host, info.ProxyJump()
+	if info.InternalTarget != nil {
+		if info.InternalTarget.Port != 22 {
+			return fmt.Errorf("terminal internal SSH target must use port 22")
+		}
+		host, jump = info.InternalTarget.Host, ""
+	}
+	if err := c.term.Start(ctx, TerminalTarget{VMID: cur.ID, Token: cur.Token, Host: host, User: info.User, ProxyJump: jump, AuthMode: info.AuthMode, authorize: authorized}); err != nil {
 		return err
 	}
 	if after, ok := c.st.Snapshot().ByID(cur.ID); !ok || after.Phase != PhaseActive {
