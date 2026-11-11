@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 )
@@ -24,6 +25,17 @@ type countCreateLC struct {
 func (l *countCreateLC) Create(ctx context.Context, r vmlib.CreateRequest) (vmlib.VM, error) {
 	l.creates.Add(1)
 	return l.Lifecycle.Create(ctx, r)
+}
+
+// runLegacyOp enqueues a previous build's vmbot-op workflow on the retained
+// vmops queue (partitioned by VM) and waits for its result.
+func runLegacyOp(c *Controller, in OpInput, id string) (OpResult, error) {
+	e := c.engine()
+	h, err := dbos.RunWorkflow(e.ctx, vmbotOp, in, dbos.WithQueue(e.queue), dbos.WithWorkflowID(id), dbos.WithQueuePartitionKey(in.VMID))
+	if err != nil {
+		return OpResult{}, err
+	}
+	return h.GetResult(dbos.WithHandleTimeout(3 * time.Second))
 }
 
 func writeLegacy(t *testing.T, dir string, rec VMRecord, offset int64) {
@@ -169,11 +181,7 @@ func TestControlMigrationQueuedLegacyDeleteWorkflowHandoff(t *testing.T) {
 	st, c := startMigrated(t, dir, base)
 	defer st.Close()
 	defer c.Close()
-	h, e := c.submit(OpInput{Kind: opDelete, VMID: legacyVM, Seq: 1}, deleteID(legacyVM, 1))
-	if e != nil {
-		t.Fatal(e)
-	}
-	r, e := c.wait(h, 3*time.Second)
+	r, e := runLegacyOp(c, OpInput{Kind: "delete", VMID: legacyVM, Seq: 1}, "delete-"+legacyVM+"-1")
 	if e != nil || r.Msg != "legacy workflow retired by control migration" {
 		t.Fatalf("legacy workflow must be retired: %+v %v", r, e)
 	}

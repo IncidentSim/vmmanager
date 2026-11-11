@@ -4,23 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 )
-
-func TestOrchestrationSubsecondStatusReturnsCompletedResult(t *testing.T) {
-	e := newEnv(t)
-	if _, err := e.ctl.Create(context.Background(), "a"); err != nil {
-		t.Fatal(err)
-	}
-	e.ctl.cfg.QueryTimeout = 250 * time.Millisecond
-	s, err := e.ctl.Status(context.Background(), Ref{Sel: "a"})
-	if err != nil {
-		t.Fatalf("completed workflow must return within query budget: %v", err)
-	}
-	if !s.Present || s.Busy || s.Uncertain || s.Phase != PhaseActive {
-		t.Fatalf("status: %+v", s)
-	}
-}
 
 func TestOrchestrationOneEnginePerStore(t *testing.T) {
 	e := newEnv(t)

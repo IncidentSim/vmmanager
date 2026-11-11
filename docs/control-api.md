@@ -337,8 +337,9 @@ GOMAXPROCS=2 go test ./internal/controlapi ./internal/vmbot ./cmd/vmapi ./contro
   is no replacement-owner protocol and no history rollover; recovery is manual.
 * No immediate access revocation and no Delete preemption (deliberate, see above).
 * Each command has about one second of delivery latency (DBOS mailbox polling).
-* Legacy single-tenant (non-control) Telegram controller workflows still exist in
-  `internal/vmbot` for non-control stores; no shipped binary uses them.
+* The former single-tenant (non-control) controller workflows were removed. Only
+  a `vmbot-op` retirement stub, the `vmops` queue registration and old JSON
+  fields needed for migration remain ([cleanup](vm-owner-cleanup-verification.md)).
 * `vmapi` operation timeout is the controller default (5 minutes) and is not yet
   configurable.
 * No audit log, retention/pruning of finished operations or DBOS rows, or

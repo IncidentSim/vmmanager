@@ -15,10 +15,7 @@ func (s startHookTerms) Start(ctx context.Context, t TerminalTarget) error { ret
 
 func TestDeleteIntentPreventsTransientTerminalRepublication(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.ctl.Create(context.Background(), "a"); err != nil {
-		t.Fatal(err)
-	}
-	rec := e.only(t)
+	rec := e.seedActive(t, "a")
 	term := newTerm(t, nil)
 	var observed int
 	e.ctl.term = startHookTerms{Terminals: term.m, start: func(ctx context.Context, tg TerminalTarget) error {
@@ -41,10 +38,7 @@ func TestDeleteIntentPreventsTransientTerminalRepublication(t *testing.T) {
 
 func TestDurableDeleteIntentRejectsNewHTTPBeforeCleanup(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.ctl.Create(context.Background(), "a"); err != nil {
-		t.Fatal(err)
-	}
-	rec := e.only(t)
+	rec := e.seedActive(t, "a")
 	term := newTerm(t, nil)
 	e.ctl.term = term.m
 	if err := e.ctl.ensureTerminalLocked(context.Background(), rec); err != nil {

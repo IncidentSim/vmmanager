@@ -308,14 +308,6 @@ func TestStoreKeepsDeterministicGenerationOrder(t *testing.T) {
 	if got[0].Generation != 1 || got[1].Generation != 3 {
 		t.Fatalf("order %+v", got)
 	}
-	for _, sel := range []string{"bot-a", "bot-c"} {
-		if _, ok := s.Snapshot().BySelector(sel); !ok {
-			t.Fatalf("selector %s", sel)
-		}
-	}
-	if _, ok := s.Snapshot().BySelector(""); ok {
-		t.Fatal("empty selector never matches")
-	}
 }
 
 func TestValidateLabel(t *testing.T) {

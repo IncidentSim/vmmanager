@@ -2,6 +2,7 @@ package vmbot
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -157,6 +158,13 @@ func TestControlRealKillRecovery(t *testing.T) {
 			if strings.HasPrefix(mode, "delete-") {
 				if len(st.Snapshot().VMs) != 0 {
 					t.Fatal("delete not settled")
+				}
+				remote, e := os.ReadDir(filepath.Join(root, "remote"))
+				if e != nil || len(remote) != 0 {
+					t.Fatalf("durable delete must converge to an absent remote resource: %v %v", remote, e)
+				}
+				if _, e := os.Stat(filepath.Join(root, "granted")); !errors.Is(e, os.ErrNotExist) {
+					t.Fatalf("delete recovery must never grant a terminal: %v", e)
 				}
 			} else if len(st.Snapshot().VMs) != 1 {
 				t.Fatal("lost VM")

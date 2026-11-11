@@ -15,7 +15,8 @@ Plan: [`plans/vm-library.md`](plans/vm-library.md).
 | `cmd/vmctl` | HTTP API CLI client built on `controlclient` (JSON, `ssh`/Ansible output, JWT bearer from a private file/env) | no |
 | `cmd/vm-launcher` | per-slot launcher + receipt writer (proposed, runs in jail) | host |
 | `cmd/vm-helper`, `cmd/vm-helper-client` | root side / unprivileged side of the one-request `start-slot N` boundary (proposed) | host |
-| `cmd/vmbot`, `internal/vmbot` | Telegram multi-VM bot (up to `max_vms`, per-VM capability-link ttyd terminals), an HTTP API client ([ADR 0002](adr/0002-telegram-single-vm-bot.md), [ADR 0003](adr/0003-vmbot-multi-vm.md), [`vmbot.md`](vmbot.md)) | no |
+| `cmd/vmbot`, `internal/tgbot`, `controlclient` | Telegram frontend that is an HTTP-only client of the control API (no direct `vmlib`/`internal/vmbot` dependency; [bot-api-client.md](bot-api-client.md); history: [ADR 0002](adr/0002-telegram-single-vm-bot.md), [ADR 0003](adr/0003-vmbot-multi-vm.md)) | no |
+| `internal/controlapi`, `internal/vmbot` | HTTP handlers and the durable VM owner runtime (state store, owner/effect workflows, admission, terminals/gateway) used by `cmd/vmapi`; the former single-tenant controller was removed ([cleanup](vm-owner-cleanup-verification.md)) | no |
 | `internal/vmhelper` | protocol, strict `pool.conf` parsing, idle-unit-only handler | no |
 | `examples/pgprovision` | PostgreSQL provisioning as an application over `Lifecycle` | no |
 

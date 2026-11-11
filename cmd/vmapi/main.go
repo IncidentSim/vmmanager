@@ -109,7 +109,7 @@ func run(ctx context.Context, path string, open backendOpener) error {
 		term = manager
 	}
 	defer term.Close()
-	ctl := vmbot.NewController(svc, st, term, vmbot.ControllerConfig{Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin, MaxVMs: cfg.MaxVMs})
+	ctl := vmbot.NewController(svc, st, term, vmbot.ControllerConfig{Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin})
 	ctl.ConfigureControl(cfg.Policy())
 	var jwtAuth *controlapi.JWTAuth
 	if cfg.JWT != nil {

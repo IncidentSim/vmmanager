@@ -87,33 +87,10 @@ type stateV1 struct {
 	Offset     int64     `json:"offset"`
 }
 
-// ByGeneration returns the record with the generation, if any.
-func (s State) ByGeneration(g uint64) (VMRecord, bool) {
-	for _, r := range s.VMs {
-		if r.Generation == g {
-			return r, true
-		}
-	}
-	return VMRecord{}, false
-}
-
 // ByID returns the record with the VM ID, if any.
 func (s State) ByID(id string) (VMRecord, bool) {
 	for _, r := range s.VMs {
 		if r.ID == id {
-			return r, true
-		}
-	}
-	return VMRecord{}, false
-}
-
-// BySelector matches an exact label or an exact VM ID.
-func (s State) BySelector(sel string) (VMRecord, bool) {
-	if sel == "" {
-		return VMRecord{}, false
-	}
-	for _, r := range s.VMs {
-		if r.Label == sel || r.ID == sel {
 			return r, true
 		}
 	}

@@ -5,8 +5,9 @@
 > per-operation workflows; see the [RFC](rfc-vm-owner.md), the
 > [architecture notes](architecture.md#vm-owner-workflow) and the
 > [verification report](vm-owner-verification.md). The queue partitioning below
-> remains the evaluation record and still serves the single-tenant (non-control)
-> controller path. The evaluation criteria and caveats (no exactly-once host
+> remains the evaluation record only: the single-tenant (non-control) controller
+> path it served has been removed (a retirement stub for old executions remains,
+> see [cleanup](vm-owner-cleanup-verification.md)). The evaluation criteria and caveats (no exactly-once host
 > effects, stable identities, live terminals are local) still apply.
 
 ## Decision and scope
@@ -60,8 +61,8 @@ support, queue APIs and license before choosing an integration version.
 
 ## Source and runtime context
 
-- Current design: ADR0001, ADR0002, ADR0003 and `docs/vmbot.md`.
-- Current multi-VM code: `internal/vmbot` and `cmd/vmbot`.
+- Historical design: ADR0001, ADR0002, ADR0003 and `docs/vmbot.md` (historical pointer).
+- Current code: owner runtime in `internal/vmbot`, API in `internal/controlapi`, HTTP-only bot in `cmd/vmbot`.
 - Deployment state lives outside the repository under
   `/home/amnezia/firecracker-vms`; never include filled state, tokens or private
   keys in source or evaluation artifacts. Do not access the runtime during the
