@@ -25,12 +25,14 @@ func (*diskTerms) Close()                                            {}
 // fake launcher/VMM only. No root, real guests or multi-gigabyte allocation.
 func TestOwnerSelectedDiskSnapshotSurvivesRestart(t *testing.T) {
 	r := newRig(t, 3)
-	r.cfg.Profiles = []vmlib.Profile{{Name: "small", VCPU: 1, CPULimitMilli: 500, MemMiB: 128, DiskMiB: 4096}, {Name: "large", VCPU: 2, CPULimitMilli: 1000, MemMiB: 256, DiskMiB: 8192}}
+	r.cfg.Profiles = []vmlib.Profile{{Name: "small", VCPU: 1, CPULimitMilli: 500, MemMiB: 128, DiskMiB: 4}, {Name: "large", VCPU: 2, CPULimitMilli: 1000, MemMiB: 256, DiskMiB: 8}}
 	image := filepath.Join(r.images, "base.ext4")
 	if err := os.Chmod(image, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(image, 6000<<20); err != nil {
+	// Keep the image between the two policy bounds, but small enough that the
+	// real free-space admission check does not require 6 GiB on the test host.
+	if err := os.Truncate(image, 6<<20); err != nil {
 		t.Fatal(err)
 	}
 	r.cfg.CopyFile = func(src, dst string) error {
@@ -85,7 +87,7 @@ func TestOwnerSelectedDiskSnapshotSurvivesRestart(t *testing.T) {
 		}
 	}
 	record, ok := st.Snapshot().ByID(op.VMID)
-	if !ok || record.DiskMiB != 8192 || record.Profile != "large" {
+	if !ok || record.DiskMiB != 8 || record.Profile != "large" {
 		t.Fatalf("admission disk snapshot %+v", record)
 	}
 	checkMeta := func() {
@@ -97,7 +99,7 @@ func TestOwnerSelectedDiskSnapshotSurvivesRestart(t *testing.T) {
 		var m struct {
 			DiskMiB uint32 `json:"disk_mib"`
 		}
-		if err := json.Unmarshal(raw, &m); err != nil || m.DiskMiB != 8192 {
+		if err := json.Unmarshal(raw, &m); err != nil || m.DiskMiB != 8 {
 			t.Fatalf("backend disk reservation %s %v", raw, err)
 		}
 	}
@@ -108,7 +110,7 @@ func TestOwnerSelectedDiskSnapshotSurvivesRestart(t *testing.T) {
 	b.Close()
 	// Remove large, lower the remaining CPU/RAM/disk catalogue. Existing and
 	// deferred admitted snapshots must not be reinterpreted through that catalogue.
-	r.cfg.Profiles = []vmlib.Profile{{Name: "small", VCPU: 1, CPULimitMilli: 500, MemMiB: 128, DiskMiB: 4096}}
+	r.cfg.Profiles = []vmlib.Profile{{Name: "small", VCPU: 1, CPULimitMilli: 500, MemMiB: 128, DiskMiB: 4}}
 	b = r.backend()
 	checkMeta()
 	st, err = vmbot.OpenControlStore(stateDir, 0)
@@ -128,7 +130,7 @@ func TestOwnerSelectedDiskSnapshotSurvivesRestart(t *testing.T) {
 		t.Fatalf("restart replay %+v %v", again, err)
 	}
 	restored, _ := st.Snapshot().ByID(op.VMID)
-	if restored.DiskMiB != 8192 {
+	if restored.DiskMiB != 8 {
 		t.Fatal("restart changed disk bound")
 	}
 	resources := &vmlib.VMResources{VCPU: record.Resources.VCPU, MemMiB: record.Resources.MemoryMiB, CPULimitMilli: record.Resources.CPULimitMilli}
@@ -136,7 +138,7 @@ func TestOwnerSelectedDiskSnapshotSurvivesRestart(t *testing.T) {
 	if _, err := b.Prepare(ctx, prep); err != nil {
 		t.Fatalf("existing reservation replay: %v", err)
 	}
-	prep.DiskMiB = 4096
+	prep.DiskMiB = 4
 	if _, err := b.Prepare(ctx, prep); !errors.Is(err, vmlib.ErrAlreadyExists) {
 		t.Fatalf("changed snapshot aliases: %v", err)
 	}

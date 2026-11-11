@@ -3,6 +3,7 @@ package vmbot
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -34,6 +35,11 @@ var legacyBodyRuns atomic.Int32
 
 func legacyBody(ctx dbos.Context, in OpInput) (OpResult, error) {
 	legacyBodyRuns.Add(1)
+	if marker := os.Getenv("VMBOT_TEST_LEGACY_STARTED"); marker != "" {
+		if err := os.WriteFile(marker, nil, 0600); err != nil {
+			return OpResult{}, err
+		}
+	}
 	select {
 	case <-ctx.Done():
 	case <-time.After(time.Minute):
@@ -51,8 +57,63 @@ func TestOwnerLegacyVersionWorkflowIsNotRecovered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	marker := filepath.Join(dir, "legacy-started")
+	child := exec.Command(os.Args[0], "-test.run=^TestOwnerLegacyCrashFixture$")
+	child.Env = append(os.Environ(), "VMBOT_TEST_LEGACY_STARTED="+marker, "VMBOT_TEST_LEGACY_STATE="+dir)
+	if err = child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		if !waited {
+			_ = child.Process.Kill()
+			_ = child.Wait()
+		}
+	})
+	for end := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(end) {
+			t.Fatal("legacy fixture did not start")
+		}
+	}
+	// A cooperative Shutdown lets legacyBody return success and is not a crash.
+	// Kill the isolated executor so its durable workflow really remains PENDING.
+	if err = child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = child.Wait()
+	waited = true
+
+	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
+	c := NewController(svc, st, &controlTerms{}, ControllerConfig{Profile: "small"})
+	c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11}, SharedImages: []string{"ubuntu"}, MaxVMs: 2, MaxVMsPerUser: 2})
+	if err = c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close(); st.Close() }()
+	if err = c.RecoverControl(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := legacyBodyRuns.Load(); n != 0 {
+		t.Fatalf("legacy workflow was re-executed by the new build (%d runs)", n)
+	}
+	ws, err := dbos.ListWorkflows(c.engine().ctx, dbos.WithFilterWorkflowIDs("control-op-legacy"))
+	if err != nil || len(ws) != 1 || ws[0].Status != dbos.WorkflowStatusPending || ws[0].ApplicationVersion != "vmbot-orch-1" {
+		t.Fatalf("legacy workflow must stay PENDING under its own version: %v %+v", err, ws)
+	}
+}
+
+// Invoked only as a disposable subprocess; never owns the parent's Store.
+func TestOwnerLegacyCrashFixture(t *testing.T) {
+	dir := os.Getenv("VMBOT_TEST_LEGACY_STATE")
+	if dir == "" {
+		t.Skip("isolated legacy crash fixture")
+	}
 	orch := filepath.Join(dir, orchSubdir)
-	if err = os.MkdirAll(orch, 0o700); err != nil {
+	if err := os.MkdirAll(orch, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	// Act as the previous build: same DB file, executor and workflow name, old version.
@@ -67,30 +128,5 @@ func TestOwnerLegacyVersionWorkflowIsNotRecovered(t *testing.T) {
 	if _, err = dbos.RunWorkflow(old, legacyBody, OpInput{Kind: "control", VMID: "bot-legacy"}, dbos.WithWorkflowID("control-op-legacy")); err != nil {
 		t.Fatal(err)
 	}
-	for end := time.Now().Add(3 * time.Second); legacyBodyRuns.Load() == 0 && time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
-	}
-	if legacyBodyRuns.Load() != 1 {
-		t.Fatal("legacy fixture did not start")
-	}
-	// "Crash": shut down without letting the workflow finish.
-	_ = dbos.Shutdown(old, time.Second)
-
-	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
-	c := NewController(svc, st, &controlTerms{}, ControllerConfig{Profile: "small"})
-	c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11}, SharedImages: []string{"ubuntu"}, MaxVMs: 2, MaxVMsPerUser: 2})
-	if err = c.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close(); st.Close() }()
-	if err = c.RecoverControl(); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(500 * time.Millisecond)
-	if n := legacyBodyRuns.Load(); n != 1 {
-		t.Fatalf("legacy workflow was re-executed by the new build (%d runs)", n)
-	}
-	ws, err := dbos.ListWorkflows(c.engine().ctx, dbos.WithFilterWorkflowIDs("control-op-legacy"))
-	if err != nil || len(ws) != 1 || ws[0].Status != dbos.WorkflowStatusPending || ws[0].ApplicationVersion != "vmbot-orch-1" {
-		t.Fatalf("legacy workflow must stay PENDING under its own version: %v %+v", err, ws)
-	}
+	select {} // parent kills this process after legacyBody publishes its marker
 }

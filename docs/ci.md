@@ -15,6 +15,15 @@ Workflow and release contracts are also checked by `internal/repocheck`.
 The executable API smoke uses the **in-memory backend** on loopback. It is not a
 Firecracker E2E. Snapshot jobs never publish; release runs are not cancelled.
 
+The root-free Go job creates a private `TMPDIR` below the runner user's home.
+Credential fixtures use `t.TempDir()` and intentionally exercise production
+ancestry checks: a private leaf below shared writable `/tmp` is not trusted.
+For equivalent local checks, supply a temporary directory below a trusted,
+non-group/world-writable home; never relax the credential validators. Assembly
+tests supply their own pool files rather than reading the host's active pool.
+The legacy workflow recovery test force-kills an isolated test executor; normal
+cooperative shutdown can complete the workflow and is not crash evidence.
+
 ## Real E2E
 
 The KVM job provisions a **clean, disposable** Linux x86_64 host:
@@ -46,7 +55,10 @@ The KVM job provisions a **clean, disposable** Linux x86_64 host:
    settings and run the existing real lifecycle tests directly via `m.Run()`.
    Required tests are recorded after their test cleanup; missing, skipped or
    failed required tests fail TestMain even if a test filter would exit zero.
-   Optional checks still print their explicit skip reasons.
+   Optional checks still print their explicit skip reasons. Credential hygiene
+   inspects both owner and terminal authorized_keys installed by Prepare, then
+   verifies their removal from a committed derivative; it does not require a
+   configured browser-terminal backend or claim browser-session acceptance.
 8. Per-test ownership trackers clean admitted resources. TestMain also drains
    leftovers for the fresh API principal, stops its subprocess, removes its
    base image, stops fixture units, disables the socket, removes the pool and

@@ -31,6 +31,11 @@ jobs:
           cache: true
       - name: Validate workflows with actionlint (pinned)
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+      - name: Private test scratch (credential ancestry must stay trusted)
+        run: |
+          scratch="$(mktemp -d "$HOME/.vm-go-check-XXXXXXXX")"
+          chmod 0700 "$scratch"
+          echo "TMPDIR=$scratch" >> "$GITHUB_ENV"
       - name: vet, format, race tests, build, staged install round trip
         run: make check VERIFY_FLAGS=--require-systemd-analyze
       - name: API executable smoke (in-memory backend over loopback; not an E2E)
