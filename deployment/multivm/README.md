@@ -24,7 +24,7 @@ from the active legacy `firecracker-builder@main.service`, which stays untouched
   and fails (Assert*, not silently skipped) unless
   `/var/lib/firecracker-builder/storage` is a mount point, the work directory
   exists and `/dev/kvm` exists; `RequiresMountsFor=` adds the mount dependency.
-* `firecracker-vm-network@.service` + `fc-vm-network.sh`: host-root oneshot,
+* `firecracker-vm-network@.service` + the Go `fc-vm-network` executable: host-root oneshot,
   `RemainAfterExit`. Creates `tap-vmN`, the /30 and tagged NAT rules; **refuses any
   existing non-default route or interface address that overlaps the slot /30**
   (a covering `172.17.0.0/16` counts). Existing valid TAPs can be safely refreshed
@@ -42,7 +42,7 @@ from the active legacy `firecracker-builder@main.service`, which stays untouched
   thing: ask to start an **idle** `firecracker-vm@N.service`. There is no stop, kill,
   restart, path, unit-name or command verb, and no sudoers/polkit rule.
 * `pool.conf.example` -> `/etc/firecracker-vms/pool.conf`: the operator-chosen
-  guest pool and slot count, read by the network script, the helper and `vmapi`
+  guest pool and slot count, read by the network tool, the helper and `vmapi`
   (`vmapi` refuses to start if its config disagrees).
 * `../vmapi/backend.local.example.json`: the private local-backend policy (the object
   formerly called `backend.local` in `vmd`'s config; now the top-level `backend` of
@@ -54,17 +54,17 @@ from the active legacy `firecracker-builder@main.service`, which stays untouched
 
 Pick `GUEST_PREFIX` yourself (slot N = `PREFIX.N.0/30`, guest `.2`). Do not use
 Docker's `172.17/16`, the legacy `172.16.0.0/30`, or anything your LAN/VPN
-routes. The shipped `10.213` is a placeholder. The network script re-checks
+routes. The shipped `10.213` is a placeholder. The network tool re-checks
 routes at every `up`.
 
 ## Budget (do not read the slice as admission)
 
 Admission is enforced by `vmapi`: `max_vms`, `max_total_mem_mib`, `max_total_vcpu`,
 and each profile must satisfy `mem_mib + vmm_overhead_mib <= unit_mem_limit_mib`
-(= the unit's `MemoryMax`, 768M). The instances run in the **legacy** slice
-`system-firecracker\x2dbuilder.slice` (CPUQuota 100%, MemoryMax 2G, see
-`deployment/resources.md`), so that 2 GiB / 1 CPU is shared with the legacy VMM,
-not multiplied. The slice is a ceiling that kills on overrun; `vmapi` is what refuses
+(= the unit's `MemoryMax`, 768M). The installer ships `firecracker-vms.slice` (CPUQuota 100%, MemoryMax 2G),
+shared by product slots and independent of the retired legacy builder.
+Existing deployments need a separately reviewed cgroup migration; source edits
+do not move running guests between slices. The slice is a ceiling that kills on overrun; `vmapi` is what refuses
 excess work earlier. Keep `max_total_mem_mib` plus VMM overhead and any legacy guest
 inside 2 GiB; do not run a legacy build concurrently. `max_total_vcpu` counts
 **virtual** CPUs for admission (the shipped `2` lets two 1-vCPU guests run
@@ -85,12 +85,12 @@ Do not repartition or format anything.
 `make verify-units` renders the units into a throwaway root and runs the real
 `systemd-analyze verify` (syntax and dependency wiring; not installed, not
 activated, no privileges). It does **not** prove runtime behaviour of the sandbox.
-`make check` runs it, plus unit/contract tests and the network-script collision
+`make check` runs it, plus unit/contract tests and the network-tool collision
 tests against canned `ip` output.
 
 ## Proposed activation order (operator)
 
-1. Build `vmapi`, `vm-launcher`, `vm-helper`, `vm-helper-client` (`make vmapi vm-launcher vm-helper vm-helper-client`).
+1. Build `vmapi`, `vm-launcher`, `vm-helper`, `vm-helper-client` (`make build`, followed by the staged/real installer in [docs/install.md](../../docs/install.md)).
 2. Choose and install `/etc/firecracker-vms/pool.conf` and the tmpfiles.d entry (see "Runtime tree trust"), then `systemd-tmpfiles --create`.
 3. Create jail, `.../storage/vms/{work,images}`; install binaries (root-owned) to
    `/usr/local/libexec/{fc-vm-launcher,fc-vm-network,fc-vm-helper,fc-vm-helper-client}`.
@@ -111,7 +111,7 @@ tests against canned `ip` output.
 6. Start the API, verify health and authenticated HTTP/Swagger, then start the
    HTTP-only bot preserving its separate delivery offset. Verify pre-existing
    VM identities and terminal links before a harness-owned lifecycle test.
-7. Operator runs `scripts/integration/multi-vm.sh` only with a policy allowing
+7. Operator runs `VMAPI_E2E=1 make e2e-live` with [the required settings](../../docs/e2e-live.md) and a policy allowing
    two concurrent VMs **for that principal** (see `docs/verification.md`). The
    production one-VM-per-user policy instead needs the sequential acceptance
    flow: commit, delete source, boot derivative, verify contents, delete it and

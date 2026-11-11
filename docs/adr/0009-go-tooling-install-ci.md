@@ -68,7 +68,7 @@ require the legacy service to exist.
 * `make install [PREFIX=/usr/local] [DESTDIR=]` stages and installs only files.
   It never starts, enables, reloads or reconfigures anything, never touches
   firewall, storage, `pool.conf`, keys, images or state.
-* Layout under PREFIX: `bin/{vmapi,vmbot,vmctl}`,
+* Layout under PREFIX: `bin/{vmapi,vmbot,vmctl,vmhost}`,
   `libexec/{fc-vm-launcher,fc-vm-network,fc-vm-helper,fc-vm-helper-client}`,
   `lib/systemd/user/{vmapi,vmbot}.service`, `share/doc/vm-firecracker/examples`.
   Root-managed system units go to `SYSCONFDIR/systemd/system`, tmpfiles to

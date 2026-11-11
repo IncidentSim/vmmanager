@@ -96,6 +96,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if c.ClientGroup == "" {
 		c.ClientGroup = defaultGroup()
 	}
+	if c.BuildDir == "" {
+		// A release archive is a flat directory of executables including vmhost
+		// itself, so ./vmhost install works without a source tree.
+		if exe, err := os.Executable(); err == nil {
+			c.BuildDir = filepath.Dir(exe)
+		}
+	}
 	switch cmd {
 	case "manifest":
 		plan, err := c.Plan()

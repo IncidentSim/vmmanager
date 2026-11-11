@@ -125,5 +125,11 @@ e2e-kvm:
 	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/e2e-ci" ./cmd/e2e-ci
 	$(BUILD_DIR)/e2e-ci run --dir "$(E2E_DIR)" --vmapi "$(BUILD_DIR)/vmapi"
 
+## release-check  validate .goreleaser.yaml and build a snapshot into dist/ (never publishes)
+GORELEASER ?= goreleaser
+release-check:
+	$(GORELEASER) check
+	$(GORELEASER) release --snapshot --clean --skip=publish
+
 clean:
 	rm -rf "$(BUILD_DIR)"
