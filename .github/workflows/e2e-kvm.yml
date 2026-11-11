@@ -1,0 +1,103 @@
+name: e2e-kvm
+
+# Real end-to-end: real Firecracker guests booted through the installed units,
+# helper socket, slot networking and vmapi, driven by the ./e2e suite. It needs a
+# DISPOSABLE Linux x64 machine with /dev/kvm and root (sudo). It uses no
+# production credentials or servers. See docs/ci.md for the runner contract.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-kvm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    # Default: a GitHub-hosted runner (ephemeral VM, no secrets in this job).
+    # To use your own KVM runner set the repository variable E2E_RUNS_ON to a
+    # JSON runner spec, e.g. ["self-hosted","linux","x64","kvm"]. A self-hosted
+    # runner executes the pull request's code, so it only runs for branches of this
+    # repository and never for fork pull requests.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+      || vars.E2E_RUNS_ON == ''
+    runs-on: ${{ fromJSON(vars.E2E_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Require KVM (fails, never skips)
+        run: |
+          # Hosted Linux runners expose /dev/kvm only after granting access.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          if [ ! -c /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing: this runner cannot run the real E2E. Use a KVM-capable runner (see docs/ci.md)."
+            exit 1
+          fi
+
+      - name: Host packages and sysctl (disposable runner)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iptables conntrack e2fsprogs openssh-client
+          sudo sysctl -w net.ipv4.ip_forward=1
+
+      - name: Storage volume (loopback ext4 file on the disposable runner)
+        run: |
+          sudo truncate -s 12G /mnt/e2e-storage.img
+          sudo mkfs.ext4 -q -F /mnt/e2e-storage.img
+          sudo mkdir -p /var/lib/firecracker-builder/storage
+          sudo mount -o loop /mnt/e2e-storage.img /var/lib/firecracker-builder/storage
+
+      - name: Build
+        run: |
+          make build
+          go build -o bin/e2e-ci ./cmd/e2e-ci
+
+      - name: Fetch pinned, hash-verified artifacts
+        run: bin/e2e-ci fetch --manifest e2e/ci/artifacts.json --out "$RUNNER_TEMP/artifacts"
+
+      - name: Install the product (files only)
+        run: |
+          sudo make install CLIENT_GROUP="$(id -gn)" \
+            FIRECRACKER="$RUNNER_TEMP/artifacts/firecracker" KERNEL="$RUNNER_TEMP/artifacts/vmlinux"
+
+      - name: Generate configuration, credentials and TLS
+        run: |
+          bin/e2e-ci configure --dir "$RUNNER_TEMP/e2e"
+          sudo install -D -m 0644 -o root -g root "$RUNNER_TEMP/e2e/pool.conf" /etc/firecracker-vms/pool.conf
+
+      - name: Host setup and enable (explicit)
+        run: |
+          sudo bin/vmhost setup --apply --user "$(id -un)"
+          sudo bin/vmhost enable --apply --group "$(id -gn)"
+          bin/vmhost preflight --group "$(id -gn)"
+          bin/e2e-ci install-image --rootfs "$RUNNER_TEMP/artifacts/rootfs.ext4"
+
+      - name: Real E2E
+        run: make e2e-kvm E2E_DIR="$RUNNER_TEMP/e2e"
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          sudo journalctl --no-pager -u 'firecracker-vm*' -u 'fc-vm-helper*' | tail -n 300 || true
+
+      - name: Remove installed files
+        if: always()
+        run: |
+          sudo systemctl stop 'firecracker-vm@*.service' 'firecracker-vm-network@*.service' fc-vm-helper.socket || true
+          sudo make uninstall CLIENT_GROUP="$(id -gn)" || true

@@ -1,0 +1,26 @@
+{
+  "artifacts": [
+    {
+      "name": "firecracker",
+      "url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.12.1/firecracker-v1.12.1-x86_64.tgz",
+      "sha256": "PIN_REQUIRED",
+      "bytes": 67108864,
+      "member": "release-v1.12.1-x86_64/firecracker-v1.12.1-x86_64",
+      "mode": 493
+    },
+    {
+      "name": "vmlinux",
+      "url": "https://PIN-REQUIRED.invalid/vmlinux",
+      "sha256": "PIN_REQUIRED",
+      "bytes": 268435456,
+      "mode": 420
+    },
+    {
+      "name": "rootfs.ext4",
+      "url": "https://PIN-REQUIRED.invalid/rootfs.ext4",
+      "sha256": "PIN_REQUIRED",
+      "bytes": 2147483648,
+      "mode": 420
+    }
+  ]
+}

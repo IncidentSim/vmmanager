@@ -1,0 +1,37 @@
+name: ci
+
+# Root-free checks: no KVM, no privileged commands, no secrets.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go (race, vet, build, tooling)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Fail instead of skipping when systemd cannot verify the rendered units.
+      VMHOST_REQUIRE_SYSTEMD_ANALYZE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: vet, format, race tests, build, staged install round trip
+        run: make check VERIFY_FLAGS=--require-systemd-analyze
+      - name: API executable smoke (in-memory backend over loopback; not an E2E)
+        run: make control-smoke
+      - name: legacy builder still builds
+        run: make legacy

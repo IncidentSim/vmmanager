@@ -11,3 +11,5 @@ __pycache__/
 .tools/
 
 /bin/
+/.e2e/
+/dist/
