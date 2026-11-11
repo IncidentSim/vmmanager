@@ -65,5 +65,6 @@ jobs:
         run: |
           mkdir "$RUNNER_TEMP/release-smoke"
           tar -xzf dist/vm-firecracker_*_linux_amd64.tar.gz -C "$RUNNER_TEMP/release-smoke"
-          "$RUNNER_TEMP"/release-smoke/*/vmhost stage-check
-          "$RUNNER_TEMP"/release-smoke/*/vmhost verify-units --require-systemd-analyze
+          hosts=("$RUNNER_TEMP"/release-smoke/*/vmhost)
+          "${hosts[0]}" stage-check
+          "${hosts[0]}" verify-units --require-systemd-analyze

@@ -1,4 +1,4 @@
-package e2eci
+package e2e
 
 import (
 	"archive/tar"
@@ -106,7 +106,7 @@ func TestFetchRefusesUntrustedInput(t *testing.T) {
 }
 
 func TestShippedManifestIsStrict(t *testing.T) {
-	b, err := os.ReadFile("../../e2e/ci/artifacts.json")
+	b, err := os.ReadFile("testdata/artifacts.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestShippedManifestIsStrict(t *testing.T) {
 		t.Fatal("empty pin")
 	}
 	// Every shipped artifact must have a real pin, never a placeholder.
-	if _, err := LoadManifest("../../e2e/ci/artifacts.json"); err != nil {
+	if _, err := LoadManifest("testdata/artifacts.json"); err != nil {
 		t.Fatal(err)
 	}
 }

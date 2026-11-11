@@ -20,7 +20,7 @@ orchestrates. See [ADR 0009](adr/0009-go-tooling-install-ci.md) for the contract
 | `make host-setup` | Create *empty* jail/work/images directories (`USER_NAME=vmapiuser`, add `APPLY=1` to act; otherwise prints the plan) | root |
 | `make host-enable` | `daemon-reload` + enable the helper socket only (`APPLY=1` to act) | root |
 | `make e2e-live` | Opt-in E2E against an already deployed vmapi (`VMAPI_E2E=1`, [e2e-live.md](e2e-live.md)) | none |
-| `make e2e-kvm` | Real E2E on a disposable KVM host ([ci.md](ci.md)) | needs a provisioned host |
+| `VMAPI_E2E_DISPOSABLE=1 make e2e` | Real E2E on a disposable KVM host ([ci.md](ci.md)) | explicit disposable opt-in, passwordless sudo and host prerequisites |
 | `make release-check` | Validate `.goreleaser.yaml` and build a snapshot into `dist/`; never publishes | none |
 
 Variables: `PREFIX` (default `/usr/local`), `DESTDIR`, `SYSCONFDIR` (`/etc`),

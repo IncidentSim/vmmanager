@@ -72,8 +72,8 @@ local unpublished snapshot using `make release-check`.
 ## E2E and CI
 
 [CI](docs/ci.md) separates root-free checks from real KVM tests on a disposable
-Linux host. `make e2e-kvm` requires provisioned KVM/systemd/artifacts and fails if
-prerequisites are absent. [Live E2E](docs/e2e-live.md) can exercise an explicitly
+Linux host. `VMAPI_E2E_DISPOSABLE=1 make e2e` owns its fixtures on a fresh
+KVM/systemd host and fails if prerequisites are absent. [Live E2E](docs/e2e-live.md) can exercise an explicitly
 configured service with an opt-in principal and tracked disposable resources:
 
 ```sh

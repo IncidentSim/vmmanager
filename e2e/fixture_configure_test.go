@@ -1,4 +1,4 @@
-package e2eci
+package e2e
 
 import (
 	"context"
@@ -247,7 +247,7 @@ func writeTLS(caFile, certFile, keyFile, host string) error {
 	}
 	now := time.Now()
 	caTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "vm-e2e-ci-ca"},
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "vm-e2e-ca"},
 		NotBefore: now.Add(-time.Minute), NotAfter: now.Add(24 * time.Hour),
 		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
 	}

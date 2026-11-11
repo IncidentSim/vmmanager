@@ -90,7 +90,11 @@ require the legacy service to exist.
 * Root-free job: `go test -race`, `go vet`, build, Go tooling tests, staged
   install round trip, API executable smoke (in-memory backend over loopback; named
   as a smoke, never as E2E).
-* Real E2E job: a disposable Linux runner with `/dev/kvm`. The job installs the
+* Real E2E job: a disposable Linux runner with `/dev/kvm`. TestMain and helpers
+  in `e2e/*_test.go` own fixture preparation, installation, vmapi startup and
+  cleanup. `VMAPI_E2E_DISPOSABLE=1 make e2e` runs one Go test process, not an
+  extra fixture command/package or nested `go test`. Explicit sudo effects only
+  follow the disposable opt-in and prerequisite checks. TestMain installs the
   product with `vmhost` from pinned, SHA-256-verified Firecracker/kernel/rootfs
   artifacts, runs the existing `e2e/` suite against a vmapi it starts itself,
   and tracks/cleans only fixtures it created. The dedicated target fails (never

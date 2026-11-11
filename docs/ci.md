@@ -7,9 +7,9 @@ Workflow and release contracts are also checked by `internal/repocheck`.
 
 | Workflow | Trigger | Evidence |
 |---|---|---|
-| `ci.yml` / `go` | PR, push to `main` | pinned actionlint; `make check` (vet, formatting, race tests, product build, staged installer round trip, required `systemd-analyze`); executable API smoke; legacy tools build |
+| `ci.yml` / `go` | PR, any branch push | pinned actionlint; `make check` (vet, formatting, race tests, product build, staged installer round trip, required `systemd-analyze`); executable API smoke; legacy tools build |
 | `ci.yml` / `release-snapshot` | same | GoReleaser v2.20.1 OSS `check`, real snapshot builds, archive extraction, extracted `vmhost stage-check` and unit verification without a source tree |
-| `e2e-kvm.yml` | PR, push to `main`, manual | real Firecracker guest lifecycle and SSH on a disposable KVM host |
+| `e2e-kvm.yml` | PR, any branch push, manual | real Firecracker guest lifecycle and SSH on a disposable KVM host |
 | `release.yml` | `v*` tag push only | `make check`, then GoReleaser publishes GitHub Release archives and SHA-256 checksums; only this workflow has `contents: write` |
 
 The executable API smoke uses the **in-memory backend** on loopback. It is not a
@@ -24,27 +24,55 @@ The KVM job provisions a **clean, disposable** Linux x86_64 host:
    explicitly enable IPv4 forwarding and mount a newly formatted 12 GiB loopback
    ext4 volume at `/var/lib/firecracker-builder/storage`. This deliberately
    destructive fixture setup belongs only on a disposable runner.
-3. Build the product and `e2e-ci`. Fetch the three artifacts in
-   `e2e/ci/artifacts.json` over HTTPS with bounded downloads and SHA-256 checking.
-4. `fakeroot bin/e2e-ci prepare-image`: extract the verified Ubuntu squashfs,
-   convert it to ext4 without mounting, preserve guest ownership, and add the
-   udev-settle prerequisite to the upstream fcnet unit. On a disposable copy,
-   exercise the **actual product SSH and guest-network provisioners** before
-   accepting the image. Credentials and slot networking never enter the base.
-5. Install via the built `vmhost install` (the same installer as `make install`);
-   this avoids relying on Go being on sudo's PATH. Generate fresh TLS, token,
-   SSH master key, collision-free pool and API configuration under a **new**
-   private directory, then install root-owned `pool.conf`.
-6. Explicit `vmhost setup --apply`, `vmhost enable --apply`, read-only preflight
-   and base-image installation; existing image files are never overwritten.
-7. `make e2e-kvm` starts its own vmapi on loopback, waits for TLS health and runs
-   `go test -json ./e2e`. Inherited `VMAPI_E2E*` and TLS environment settings are
-   discarded. Core lifecycle, derivative-image, credential hygiene, supplied-key
-   login, finite TTL, profile and public API checks **must actually pass**:
-   missing or skipped required tests fail the harness even if `go test` exits 0.
-8. Delete leftover VMs only for the generated test principal, stop vmapi, always
-   collect journals and test JSON, stop fixture units, uninstall product files
-   and unmount/remove the loopback fixture.
+3. Run `VMAPI_E2E_DISPOSABLE=1 make e2e`. Make builds the product and invokes
+   **one** `go test ./e2e`; `TestMain` and ordinary `_test.go` helpers own the
+   fixture lifecycle, with no additional command or runtime package.
+4. TestMain requires passwordless sudo, a fresh host (no existing pool or
+   installed product manifest), KVM/TUN, a mounted storage volume, and tools.
+   It downloads `e2e/testdata/artifacts.json` pins over HTTPS with bounds and
+   SHA-256 verification. Image preparation runs unsquashfs and mkfs.ext4 under
+   fakeroot with a shared ownership database; the existing offline SSH/network
+   provisioners validate a disposable copy. The upstream fcnet unit gets its
+   examined udev-settle prerequisite; no credentials enter the base image.
+5. Before boot, read the guest ed25519 host public key from the derived ext4
+   using read-only debugfs and create exact per-slot known_hosts entries. This
+   offline, hash-verified trust source is supplied to the existing strict SSH
+   checks; no network TOFU or relaxed host checking is used.
+6. Generate fresh private TLS/token/master-key/config files, choose a
+   collision-free pool, then use the built **shared vmhost installer** through
+   explicit `sudo -n`: install, setup, enable, preflight. Only a newly created
+   base image is copied into the fixture images directory (exclusive create).
+7. Start the fixture vmapi on loopback, scrub inherited `VMAPI_E2E*`/TLS
+   settings and run the existing real lifecycle tests directly via `m.Run()`.
+   Required tests are recorded after their test cleanup; missing, skipped or
+   failed required tests fail TestMain even if a test filter would exit zero.
+   Optional checks still print their explicit skip reasons.
+8. Per-test ownership trackers clean admitted resources. TestMain also drains
+   leftovers for the fresh API principal, stops its subprocess, removes its
+   base image, stops fixture units, disables the socket, removes the pool and
+   uninstalls through vmhost. Reverse-order rollback also runs on partial setup
+   failures and reports cleanup failures. Workflow-level always-cleanup is a
+   fallback for cancellation or forced test timeout; it collects journals,
+   unmounts/removes its loopback fixture and archives the test output.
+
+### Local disposable KVM host
+
+Use a **fresh, throwaway** Linux x86_64 systemd host, never an existing VM
+service host. Install the workflow's listed packages, grant KVM access, enable
+IPv4 forwarding and mount an empty ext4 storage volume at
+`/var/lib/firecracker-builder/storage` (at least 12 GiB). These host preparations
+are deliberate operator actions, not part of `go test` or `make check`. With
+passwordless sudo available to the test user, run:
+
+```sh
+VMAPI_E2E_DISPOSABLE=1 make e2e
+```
+
+Without the explicit opt-in, `make e2e` fails before building or preparing a
+host. Ordinary `go test ./...` and `make check` remain root/KVM-free. To test an
+already deployed service instead, use the separately gated `make e2e-live`;
+it never invokes disposable preparation. Do not export the disposable opt-in
+in a developer shell or combine it with the external-deployment settings.
 
 The reused suite has separate optional checks for Nexterm, public SSH/egress,
 physical CPU readback, a second principal, controlled slow-create TTL behavior,
@@ -63,12 +91,12 @@ The generated ext4 image is derived locally, not a pretend downloadable artifact
 Upstream downloads are not included in product release archives.
 
 To update, download the candidate from the upstream project over HTTPS, calculate
-its SHA-256, update the URL/hash/member/bound together, then run `e2e-ci fetch`
-and `fakeroot e2e-ci prepare-image` before running the disposable KVM job. A
-changed/missing artifact or incompatible guest provisioning format must fail,
-not trigger an unverified fallback. Bucket object names alone are not immutable;
-the pinned digest is authoritative. The fetch/preparation/offline provisioner
-checks do **not** prove bootability: only a successful real KVM job does.
+its SHA-256 and update URL/hash/member/bound together in
+`e2e/testdata/artifacts.json`, then run the disposable suite. A changed/missing
+artifact, incompatible provisioning format or missing offline host key fails,
+never falls back to unverified data. Bucket object names alone are not
+immutable; the digest is authoritative. Download/image/unit tests do not prove
+bootability: only a successful real KVM job does.
 
 ### Runner contract and fork safety
 

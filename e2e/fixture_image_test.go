@@ -1,4 +1,4 @@
-package e2eci
+package e2e
 
 import (
 	"context"
@@ -15,14 +15,11 @@ import (
 )
 
 // PrepareImage converts the verified upstream CI squashfs to a private ext4
-// image without mounting it. Run under fakeroot: unsquashfs and mkfs.ext4 must
-// share its ownership database, otherwise sshd rejects runner-owned /root.
+// image without mounting it. unsquashfs and mkfs.ext4 share a persisted
+// fakeroot ownership database, otherwise sshd rejects runner-owned /root.
 // The sole guest change brings the older upstream unit to the product's exact
 // supported fcnet format (settle udev before assigning MAC-derived addresses).
 func PrepareImage(ctx context.Context, src, dst string, out io.Writer) error {
-	if os.Getenv("FAKEROOTKEY") == "" {
-		return errors.New("prepare-image requires fakeroot (no real root or mounts needed)")
-	}
 	if src == "" || dst == "" {
 		return errors.New("--rootfs and --out are required")
 	}
@@ -43,7 +40,7 @@ func PrepareImage(ctx context.Context, src, dst string, out io.Writer) error {
 		}
 		return nil
 	}
-	if err := run("unsquashfs", "-processors", "2", "-no-progress", "-d", tree, src); err != nil {
+	if err := run("fakeroot", "-s", filepath.Join(work, "owners"), "--", "unsquashfs", "-processors", "2", "-no-progress", "-d", tree, src); err != nil {
 		return err
 	}
 	unit := filepath.Join(tree, "etc/systemd/system/fcnet.service")
@@ -62,7 +59,7 @@ func PrepareImage(ctx context.Context, src, dst string, out io.Writer) error {
 	image := filepath.Join(work, "rootfs.ext4")
 	// 1 GiB fits the downloaded root tree; the backend grows private copies to
 	// the selected 2 GiB profile. Disable orphan_file for older guest kernels.
-	if err := run("mkfs.ext4", "-q", "-F", "-O", "^orphan_file", "-d", tree, image, "1024M"); err != nil {
+	if err := run("fakeroot", "-i", filepath.Join(work, "owners"), "--", "mkfs.ext4", "-q", "-F", "-O", "^orphan_file", "-d", tree, image, "1024M"); err != nil {
 		return err
 	}
 	// Prove compatibility using the actual offline SSH/network provisioners on

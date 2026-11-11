@@ -1,9 +1,4 @@
-// Package e2eci provisions the disposable KVM host used by the real end-to-end
-// CI job: it downloads pinned, hash-verified artifacts and generates the
-// configuration, credentials and TLS material for a vmapi instance owned by the
-// runner. It never contacts production services and holds no production
-// credentials; everything it creates lives in a directory the caller supplies.
-package e2eci
+package e2e
 
 import (
 	"archive/tar"

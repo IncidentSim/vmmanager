@@ -31,7 +31,7 @@ VMHOST_FLAGS = --build-dir "$(BUILD_DIR)" --prefix "$(PREFIX)" --sysconfdir "$(S
 	$(if $(FORCE),--force)
 
 .PHONY: build legacy test vet release-check fmt-check check control-smoke verify-units stage-check \
-	install uninstall preflight host-setup host-enable e2e-live e2e-kvm clean help
+	install uninstall preflight host-setup host-enable e2e-live e2e clean help
 
 define HELP_TEXT
 Targets (details in docs/install.md and docs/ci.md):
@@ -48,7 +48,7 @@ Targets (details in docs/install.md and docs/ci.md):
   host-setup    create empty jail/work/images dirs (USER_NAME=name, APPLY=1)
   host-enable   enable the helper socket only (APPLY=1)
   e2e-live      opt-in E2E against an already deployed vmapi (VMAPI_E2E=1)
-  e2e-kvm       real E2E on a disposable KVM host (see docs/ci.md)
+  e2e           real E2E on a disposable KVM host (see docs/ci.md)
   release-check validate .goreleaser.yaml and build a snapshot (no publishing)
 endef
 export HELP_TEXT
@@ -118,12 +118,12 @@ e2e-live:
 	@test "$$VMAPI_E2E" = 1 || { echo "e2e-live: set VMAPI_E2E=1 and the VMAPI_E2E_* variables (see docs/e2e-live.md)" >&2; exit 2; }
 	$(GO) test -count=1 -p 1 -timeout 45m -v ./e2e
 
-## e2e-kvm      REAL E2E on a disposable KVM host: starts vmapi, runs ./e2e, cleans up (fails, never skips, without prerequisites; see docs/ci.md)
-E2E_DIR ?= $(CURDIR)/.e2e
-e2e-kvm:
-	@mkdir -p "$(BUILD_DIR)"
-	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/e2e-ci" ./cmd/e2e-ci
-	$(BUILD_DIR)/e2e-ci run --dir "$(E2E_DIR)" --vmapi "$(BUILD_DIR)/vmapi"
+## e2e          test-owned preparation and lifecycle on an explicitly disposable KVM host
+# No sudo or privileged preparation without an explicit operator opt-in.
+e2e:
+	@test "$$VMAPI_E2E_DISPOSABLE" = 1 || { echo "e2e: set VMAPI_E2E_DISPOSABLE=1 ONLY on a disposable KVM host (see docs/ci.md)" >&2; exit 2; }
+	$(MAKE) build
+	VMAPI_E2E_BUILD_DIR="$(abspath $(BUILD_DIR))" $(GO) test -count=1 -p 1 -timeout 45m -v ./e2e
 
 ## release-check  validate .goreleaser.yaml and build a snapshot into dist/ (never publishes)
 GORELEASER ?= goreleaser

@@ -63,43 +63,19 @@ jobs:
           sudo mkdir -p /var/lib/firecracker-builder/storage
           sudo mount -o loop /mnt/e2e-storage.img /var/lib/firecracker-builder/storage
 
-      - name: Build
+      - name: Real E2E (test-owned fixtures, shared vmhost installer)
+        env:
+          VMAPI_E2E_DISPOSABLE: "1"
         run: |
-          make build
-          go build -o bin/e2e-ci ./cmd/e2e-ci
+          set -o pipefail
+          make e2e 2>&1 | tee "$RUNNER_TEMP/e2e-results.log"
 
-      - name: Fetch pinned, hash-verified artifacts
-        run: bin/e2e-ci fetch --manifest e2e/ci/artifacts.json --out "$RUNNER_TEMP/artifacts"
-
-      - name: Prepare verified guest image (root-free, no mounts)
-        run: fakeroot bin/e2e-ci prepare-image --rootfs "$RUNNER_TEMP/artifacts/rootfs.squashfs" --out "$RUNNER_TEMP/artifacts/rootfs.ext4"
-
-      - name: Install the product (files only)
-        run: |
-          sudo bin/vmhost install --group "$(id -gn)" \
-            --firecracker "$RUNNER_TEMP/artifacts/firecracker" --kernel "$RUNNER_TEMP/artifacts/vmlinux"
-
-      - name: Generate configuration, credentials and TLS
-        run: |
-          bin/e2e-ci configure --dir "$RUNNER_TEMP/e2e"
-          sudo install -D -m 0644 -o root -g root "$RUNNER_TEMP/e2e/pool.conf" /etc/firecracker-vms/pool.conf
-
-      - name: Host setup and enable (explicit)
-        run: |
-          sudo bin/vmhost setup --apply --user "$(id -un)"
-          sudo bin/vmhost enable --apply --group "$(id -gn)"
-          bin/vmhost preflight --group "$(id -gn)"
-          bin/e2e-ci install-image --rootfs "$RUNNER_TEMP/artifacts/rootfs.ext4"
-
-      - name: Real E2E
-        run: make e2e-kvm E2E_DIR="$RUNNER_TEMP/e2e"
-
-      - name: Preserve E2E test events (no credentials)
+      - name: Preserve E2E output (no credentials)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-results
-          path: ${{ runner.temp }}/e2e/e2e-results.json
+          path: ${{ runner.temp }}/e2e-results.log
           retention-days: 7
 
       - name: Diagnostics

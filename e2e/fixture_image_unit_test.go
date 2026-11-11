@@ -1,4 +1,4 @@
-package e2eci
+package e2e
 
 import (
 	"context"
@@ -9,13 +9,8 @@ import (
 	"testing"
 )
 
-func TestPrepareImageRequiresFakerootAndFreshOutput(t *testing.T) {
-	t.Setenv("FAKEROOTKEY", "")
+func TestPrepareImageRequiresFreshOutput(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "base.ext4")
-	if err := PrepareImage(context.Background(), "unused", dst, io.Discard); err == nil || !strings.Contains(err.Error(), "requires fakeroot") {
-		t.Fatalf("err: %v", err)
-	}
-	t.Setenv("FAKEROOTKEY", "test-only")
 	if err := os.WriteFile(dst, []byte("keep"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +30,7 @@ func TestConfigureRefusesAnExistingDirectory(t *testing.T) {
 }
 
 func TestLoadManifestRejectsTrailingData(t *testing.T) {
-	src, err := os.ReadFile("../../e2e/ci/artifacts.json")
+	src, err := os.ReadFile("testdata/artifacts.json")
 	if err != nil {
 		t.Fatal(err)
 	}
