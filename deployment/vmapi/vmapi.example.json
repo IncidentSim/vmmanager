@@ -8,6 +8,7 @@
   "max_vms": 2,
   "max_vms_per_user": 1,
   "default_profile": "small",
+  "idle_timeout_seconds": 600,
   "credentials": [
     {"token_file": "/home/USER/.config/vmapi/service-token", "service": true},
     {"token_file": "/home/USER/.config/vmapi/user-123456789-token", "user_id": 123456789}

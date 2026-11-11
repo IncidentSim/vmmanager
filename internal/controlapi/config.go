@@ -39,6 +39,12 @@ type Config struct {
 	DefaultProfile      string       `json:"default_profile"`
 	DefaultTTLSeconds   int64        `json:"default_ttl_seconds,omitempty"`
 	MaxTTLSeconds       int64        `json:"max_ttl_seconds,omitempty"`
+	// IdleTimeoutSeconds: a VM with no established SSH connection for longer than
+	// this is deleted through its owner (default 600; see
+	// docs/adr/0008-ssh-idle-expiry.md). It applies to the whole service and is
+	// independent of the TTL upper bound. It only takes effect when the backend
+	// has personal_ssh with shutdown_known_hosts_file (strict host trust).
+	IdleTimeoutSeconds int64 `json:"idle_timeout_seconds,omitempty"`
 	// Backend is the private single-host local backend policy: exactly the object
 	// that vmd called backend.local (see docs/control-api-backend.md). The API
 	// opens vmlib/local.Backend in-process; there is no VM transport.
@@ -125,6 +131,9 @@ func LoadConfig(path string) (Config, error) {
 	if c.MaxTTLSeconds == 0 {
 		c.MaxTTLSeconds = 86400
 	}
+	if c.IdleTimeoutSeconds == 0 {
+		c.IdleTimeoutSeconds = 600
+	}
 	if c.Terminal.MaxClients == 0 {
 		c.Terminal.MaxClients = 4
 	}
@@ -144,6 +153,9 @@ func (c Config) Validate() error {
 	}
 	if c.MaxTTLSeconds > int64((time.Duration(1<<63-1))/time.Second) {
 		return errors.New("max_ttl_seconds exceeds whole-second duration range")
+	}
+	if c.IdleTimeoutSeconds < 1 || c.IdleTimeoutSeconds > 86400 {
+		return errors.New("idle_timeout_seconds must be between 1 and 86400")
 	}
 	policy := Policy{DefaultProfile: c.DefaultProfile, DefaultTTLSeconds: c.DefaultTTLSeconds, MaxTTLSeconds: c.MaxTTLSeconds}
 	if err := policy.Validate(); err != nil {
