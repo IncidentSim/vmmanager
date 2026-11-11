@@ -142,7 +142,14 @@ func runDisposable(ctx context.Context, tests func() int) (code int, err error) 
 	if err = execFixture(ctx, "sudo", "-n", "true"); err != nil {
 		return 1, errors.New("passwordless sudo required on the disposable host")
 	}
-	dir, err := os.MkdirTemp("", "vm-e2e-*")
+	// Credential-store trust rejects writable ancestors such as /tmp and the
+	// hosted runner's shared RUNNER_TEMP before a private barrier. Use the
+	// unprivileged account's home, never weaken production directory checks.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 1, err
+	}
+	dir, err := os.MkdirTemp(home, ".vm-e2e-*")
 	if err != nil {
 		return 1, err
 	}
