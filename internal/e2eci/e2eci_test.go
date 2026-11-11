@@ -113,9 +113,8 @@ func TestShippedManifestIsStrict(t *testing.T) {
 	if strings.Contains(string(b), "sha256\": \"\"") {
 		t.Fatal("empty pin")
 	}
-	// Loading must either succeed with real pins or fail with the explicit
-	// "not pinned" error; it can never silently accept unpinned artifacts.
-	if _, err := LoadManifest("../../e2e/ci/artifacts.json"); err != nil && !strings.Contains(err.Error(), "not pinned") {
+	// Every shipped artifact must have a real pin, never a placeholder.
+	if _, err := LoadManifest("../../e2e/ci/artifacts.json"); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -1,0 +1,40 @@
+name: release
+
+# Publishes a GitHub Release when a version tag is pushed. Nothing is published
+# for branches or pull requests (those only run the snapshot build in ci.yml).
+on:
+  push:
+    tags: ["v*"]
+
+# Only this job needs write access, to create the release and upload assets.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Tests must pass before anything is published
+        run: make check VERIFY_FLAGS=--require-systemd-analyze
+        env:
+          VMHOST_REQUIRE_SYSTEMD_ANALYZE: "1"
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "v2.20.1"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

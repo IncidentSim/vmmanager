@@ -137,7 +137,7 @@ func TestKVMJobIsARealE2EAndGatesSelfHostedRunners(t *testing.T) {
 		runs = append(runs, s.Run)
 	}
 	all := strings.Join(runs, "\n")
-	for _, want := range []string{"/dev/kvm", "exit 1", "e2e-ci fetch", "make install", "vmhost setup --apply", "vmhost enable --apply", "make e2e-kvm"} {
+	for _, want := range []string{"/dev/kvm", "exit 1", "e2e-ci fetch", "vmhost install", "vmhost setup --apply", "vmhost enable --apply", "make e2e-kvm"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("e2e job lacks %q", want)
 		}

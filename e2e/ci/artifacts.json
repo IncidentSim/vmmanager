@@ -3,22 +3,22 @@
     {
       "name": "firecracker",
       "url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.12.1/firecracker-v1.12.1-x86_64.tgz",
-      "sha256": "PIN_REQUIRED",
+      "sha256": "0a75e67ef6e4c540a2cf248b06822b0be9820cbba9fe19f9e0321200fe76ff6b",
       "bytes": 67108864,
       "member": "release-v1.12.1-x86_64/firecracker-v1.12.1-x86_64",
       "mode": 493
     },
     {
       "name": "vmlinux",
-      "url": "https://PIN-REQUIRED.invalid/vmlinux",
-      "sha256": "PIN_REQUIRED",
+      "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128",
+      "sha256": "27a8310b9a727517e9eb02044524b6ceb77de5728e3491b6974d5c846227ecc8",
       "bytes": 268435456,
       "mode": 420
     },
     {
-      "name": "rootfs.ext4",
-      "url": "https://PIN-REQUIRED.invalid/rootfs.ext4",
-      "sha256": "PIN_REQUIRED",
+      "name": "rootfs.squashfs",
+      "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/ubuntu-24.04.squashfs",
+      "sha256": "88821a26b5a38c92b84a064d452167d7f80f9e17cf4441d1ebbae7569e340aee",
       "bytes": 2147483648,
       "mode": 420
     }

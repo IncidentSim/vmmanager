@@ -144,7 +144,8 @@ func Configure(ctx context.Context, s Settings) (*Result, error) {
 	if !filepath.IsAbs(s.Dir) || filepath.Clean(s.Dir) != s.Dir {
 		return nil, errors.New("work directory must be a clean absolute path")
 	}
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+	// A fresh private directory prevents stale fixtures and symlink traversal.
+	if err := os.Mkdir(s.Dir, 0o700); err != nil {
 		return nil, err
 	}
 	if err := os.Chmod(s.Dir, 0o700); err != nil {

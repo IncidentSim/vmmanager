@@ -58,6 +58,9 @@ func LoadManifest(p string) (Manifest, error) {
 	if err := dec.Decode(&m); err != nil {
 		return Manifest{}, fmt.Errorf("manifest: %w", err)
 	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return Manifest{}, errors.New("manifest: trailing data")
+	}
 	return m, m.Validate()
 }
 
@@ -82,6 +85,9 @@ func (m Manifest) Validate() error {
 		}
 		if a.Bytes <= 0 || a.Bytes > 4<<30 {
 			return fmt.Errorf("artifact %s: bytes must be a positive bound up to 4 GiB", a.Name)
+		}
+		if a.Mode != 0 && a.Mode != 0644 && a.Mode != 0755 {
+			return fmt.Errorf("artifact %s: unsafe mode", a.Name)
 		}
 		if a.Member != "" && (path.Clean(a.Member) != a.Member || strings.HasPrefix(a.Member, "/") || strings.HasPrefix(a.Member, "..")) {
 			return fmt.Errorf("artifact %s: unsafe archive member %q", a.Name, a.Member)

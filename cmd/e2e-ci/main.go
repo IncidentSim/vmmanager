@@ -2,6 +2,7 @@
 // CI harness, not part of the installed product.
 //
 //	e2e-ci fetch         download pinned, SHA-256-verified artifacts
+//	e2e-ci prepare-image convert the verified squashfs to ext4 under fakeroot
 //	e2e-ci configure     generate pool.conf, vmapi config, TLS, token and master key
 //	e2e-ci install-image copy the verified rootfs into the images directory
 //	e2e-ci run           start vmapi, run the existing ./e2e suite, stop, clean up
@@ -14,6 +15,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +25,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -44,12 +47,12 @@ func main() {
 
 func run(ctx context.Context, args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: e2e-ci fetch|configure|install-image|run [flags]")
+		return errors.New("usage: e2e-ci fetch|prepare-image|configure|install-image|run [flags]")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	dir := fs.String("dir", "", "private working directory (absolute)")
 	manifest := fs.String("manifest", "e2e/ci/artifacts.json", "fetch: pinned artifact manifest")
-	outDir := fs.String("out", "", "fetch: output directory")
+	outDir := fs.String("out", "", "fetch: output directory; prepare-image: output ext4 file")
 	storage := fs.String("storage-root", "/var/lib/firecracker-builder/storage", "existing storage mount")
 	libexec := fs.String("libexec", "/usr/local/libexec", "directory of fc-vm-helper-client")
 	pool := fs.String("pool-conf", "/etc/firecracker-vms/pool.conf", "installed pool.conf path")
@@ -81,6 +84,8 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 			return err
 		}
 		fmt.Fprintf(out, "guest prefix %s\npool.conf (install root-owned at %s): %s\nvmapi config: %s\n", r.Prefix, *pool, r.PoolConf, r.APIConfig)
+	case "prepare-image":
+		return e2eci.PrepareImage(ctx, *rootfs, *outDir, out)
 	case "install-image":
 		return installImage(*rootfs, filepath.Join(*storage, "vms/images"), *imageID, out)
 	case "run":
@@ -92,6 +97,9 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 }
 
 func installImage(src, imagesDir, id string, out io.Writer) error {
+	if !regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`).MatchString(id) {
+		return errors.New("invalid image ID")
+	}
 	if src == "" {
 		return errors.New("--rootfs is required")
 	}
@@ -188,14 +196,15 @@ func runSuite(ctx context.Context, s e2eci.Settings, vmapi string, timeout time.
 		return fmt.Errorf("start vmapi: %w", err)
 	}
 	exited := make(chan error, 1)
-	go func() { exited <- api.Wait() }()
+	done := make(chan struct{})
+	go func() { exited <- api.Wait(); close(done) }()
 	defer func() {
 		_ = api.Process.Signal(syscall.SIGTERM)
 		select {
-		case <-exited:
+		case <-done:
 		case <-time.After(30 * time.Second):
 			_ = api.Process.Kill()
-			<-exited
+			<-done
 		}
 	}()
 
@@ -210,16 +219,64 @@ func runSuite(ctx context.Context, s e2eci.Settings, vmapi string, timeout time.
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, "go", "test", "-count=1", "-p", "1", "-timeout", timeout.String(), "-v", "./e2e")
+	results, err := os.Create(filepath.Join(s.Dir, "e2e-results.json"))
+	if err != nil {
+		return err
+	}
+	defer results.Close()
+	cmd := exec.CommandContext(ctx, "go", "test", "-json", "-count=1", "-p", "1", "-timeout", timeout.String(), "./e2e")
 	cmd.Env = env
-	cmd.Stdout, cmd.Stderr = out, os.Stderr
+	cmd.Stdout, cmd.Stderr = io.MultiWriter(out, results), os.Stderr
 	testErr := cmd.Run()
 
-	cleanErr := cleanup(context.WithoutCancel(ctx), hc, kv)
+	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	defer cancel()
+	cleanErr := cleanup(cleanCtx, hc, kv)
 	if testErr != nil {
 		return fmt.Errorf("e2e suite failed: %w", testErr)
 	}
-	return cleanErr
+	if cleanErr != nil {
+		return cleanErr
+	}
+	if _, err := results.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return verifySuite(results, out)
+}
+
+// Required lifecycle checks cannot turn green by skipping for lack of capacity.
+// Optional external integrations (Nexterm, restart, public SSH, host readback)
+// remain explicitly optional; their skip events are printed and archived.
+var requiredTests = []string{
+	"TestPublicDocsHealthAndAuth", "TestLifecycleStopCommitsAndConflicts",
+	"TestDerivativeFromCommittedImage", "TestEarlyDeleteAfterCreate",
+	"TestCommitCredentialHygiene", "TestSuppliedKeyLogin",
+	"TestFiniteTTL", "TestProfileAndQuotaMetadata",
+}
+
+func verifySuite(r io.Reader, out io.Writer) error {
+	dec := json.NewDecoder(r)
+	passed := map[string]bool{}
+	for {
+		var event struct{ Action, Test string }
+		if err := dec.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("E2E JSON report: %w", err)
+		}
+		if event.Action == "pass" {
+			passed[event.Test] = true
+		}
+		if event.Action == "skip" {
+			fmt.Fprintf(out, "E2E explicitly skipped: %s\n", event.Test)
+		}
+	}
+	for _, name := range requiredTests {
+		if !passed[name] {
+			return fmt.Errorf("required real E2E %s did not pass (missing, skipped or failed)", name)
+		}
+	}
+	return nil
 }
 
 func waitHealthy(ctx context.Context, hc *http.Client, base string, exited <-chan error) error {

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The real E2E must fail, not skip, when prerequisites are absent.
@@ -20,11 +24,58 @@ func TestRunFailsLoudlyWithoutPrerequisites(t *testing.T) {
 	}
 }
 
-// With the shipped manifest unpinned, fetch must refuse before any network access.
+// Unpinned fixtures must fail before any network access.
 func TestFetchRefusesUnpinnedManifestOffline(t *testing.T) {
-	err := run(context.Background(), []string{"fetch", "--manifest", "../../e2e/ci/artifacts.json", "--out", t.TempDir()}, io.Discard)
+	manifest := t.TempDir() + "/manifest.json"
+	if err := writeFile(manifest, `{"artifacts":[{"name":"bad","url":"https://example.invalid/artifact","sha256":"PIN_REQUIRED","bytes":10}]}`); err != nil {
+		t.Fatal(err)
+	}
+	err := run(context.Background(), []string{"fetch", "--manifest", manifest, "--out", t.TempDir()}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "not pinned") {
-		t.Skipf("manifest is pinned (err=%v); fetch would use the network", err)
+		t.Fatalf("unpinned manifest not refused: %v", err)
+	}
+}
+
+func TestVerifySuiteRequiresActualLifecyclePasses(t *testing.T) {
+	for _, mode := range []string{"pass", "skip", "missing", "malformed"} {
+		t.Run(mode, func(t *testing.T) {
+			var b bytes.Buffer
+			for i, name := range requiredTests {
+				if mode == "missing" && i == 0 {
+					continue
+				}
+				action := "pass"
+				if mode == "skip" && i == 0 {
+					action = "skip"
+				}
+				if err := json.NewEncoder(&b).Encode(map[string]string{"Action": action, "Test": name}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "malformed" {
+				b.WriteString("{")
+			}
+			err := verifySuite(&b, io.Discard)
+			if (err == nil) != (mode == "pass") {
+				t.Fatalf("mode %s: %v", mode, err)
+			}
+		})
+	}
+}
+
+func TestWaitHealthyFailsImmediatelyOnProcessExit(t *testing.T) {
+	exited := make(chan error, 1)
+	exited <- nil
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := waitHealthy(ctx, &http.Client{}, "https://127.0.0.1:1", exited); err == nil || !strings.Contains(err.Error(), "exited") {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestInstallImageRejectsEscapingID(t *testing.T) {
+	if err := installImage("unused", t.TempDir(), "../bad", io.Discard); err == nil || !strings.Contains(err.Error(), "invalid image ID") {
+		t.Fatalf("err: %v", err)
 	}
 }
 
