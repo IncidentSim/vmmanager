@@ -1,5 +1,14 @@
 # DBOS orchestration direction
 
+> **Superseded in part.** The active control API now uses one sequential,
+> long-lived DBOS owner workflow per VM instead of a partitioned queue of
+> per-operation workflows; see the [RFC](rfc-vm-owner.md), the
+> [architecture notes](architecture.md#vm-owner-workflow) and the
+> [verification report](vm-owner-verification.md). The queue partitioning below
+> remains the evaluation record and still serves the single-tenant (non-control)
+> controller path. The evaluation criteria and caveats (no exactly-once host
+> effects, stable identities, live terminals are local) still apply.
+
 ## Decision and scope
 
 Use DBOS Transact for Go with a local SQLite system database as the proposed

@@ -80,6 +80,64 @@ no VM RPC listener, no backend/facade mTLS and no `vmd`. A config containing the
 removed `facade` section is rejected. The backend holds exclusive lifetime
 flocks on its roots, so an old `vmd` must be stopped first.
 
+## VM owner workflow
+
+Design: [RFC](rfc-vm-owner.md). Code: `internal/vmbot/owner.go` (owner, effect
+child, projection) and `internal/vmbot/control.go` (admission, handoff, recovery).
+
+* **One owner per VM.** `vmbot-owner-<vmID>` (workflow `vmbot-vm-owner`) is created
+  with the VM and stays `PENDING` between commands; it ends `SUCCESS` only after
+  confirmed deletion. It runs directly, never on a queue slot. Two VMs' owners
+  are independent.
+* **Commands.** Admission (`AcceptControl`) atomically reserves identities,
+  quota, names and image references in the store, then `dbos.Send`s
+  `OwnerCmd{OpID, Kind, Digest}` with the operation ID as idempotency key
+  (Create instead starts the owner). Send success is durable delivery only.
+  The owner re-checks kind/digest against the stored request, so message
+  deduplication can never hide a changed payload; the changed-payload check for
+  an `Idempotency-Key` itself is the store digest, evaluated before any effect.
+* **Sequential.** The owner runs `begin` (validate, mark `running`, set the
+  transitional phase) -> one finite child `vmbot-vm-effect` (workflow ID
+  `<owner>.<opID>`) -> `project` (write the outcome), then `Recv`s the next
+  command. The child performs the backend effect inside one step and returns a
+  typed `EffectOut`; it never writes application state. Delete waits behind any
+  running/earlier command. There is no preemption, priority mailbox,
+  admission-time revocation or external fence.
+* **Failures.** Expected child failures (backend errors, even a panicking child)
+  are recorded as operation outcomes (`failed` + code) and the owner continues.
+  An unexpected owner failure ends it `ERROR`: it stays visible (`owner_error`,
+  failed pending operations, recovery error/degraded health) and the VM and its
+  capacity stay retained. No replacement owner is started automatically.
+* **Authoritative writers.** Admission writes only *new* records: VM identity
+  (phase `creating`), operations (`pending`), private image reservations
+  (`publishing`) and the image `deleting` fence for shared-image deletion. After
+  that the owner's `begin`/`project` steps are the only writers of VM `phase`,
+  `state`, resources, VM removal, operation `running`/`succeeded`/`failed` and
+  image `ready`. The shared-image deletion workflow (`vmbot-image-delete`) writes
+  its own operation/image outcome. Store writes in these steps are idempotent
+  and safe to replay.
+* **Local projections.** Terminal processes/links are rebuildable and not
+  checkpointed: the owner rebuilds a running VM's terminal once after a process
+  start (only for VMs present at start) and the terminal command/revocation run
+  as effects. SSH metadata/readiness is a read (`GET .../ssh`), not an owner command.
+* **Replay compatibility.** Pinned: workflow names `vmbot-vm-owner`,
+  `vmbot-vm-effect`, `vmbot-image-delete`, DBOS application version
+  `vmbot-owner-1`, step names `begin`/`effect`/`project`, topic `cmd`, IDs above
+  (asserted in `owner_version_test.go`). The application version is constant so
+  living owners are recovered after a rebuild, which means **a constant version
+  does not make a code change compatible**: any change to the order or number of
+  durable calls in `vmOwner`/`ownerHandle` must be guarded with `dbos.Patch`
+  (insert new durable calls only behind `Patch`; never reorder or remove them
+  without a drain plan), or the old history fails with an unexpected-step error
+  and the owner ends `ERROR`. The owner's `Recv` timeout loop adds one history
+  row per idle period (6 h); there is no history rollover in this iteration.
+* **Pre-owner state.** Documented in
+  [control-api.md](control-api.md#migration-from-the-legacy-bot-and-handoff):
+  settled VMs are adopted without Create; transitional legacy VMs are rejected at
+  startup. Legacy workflows (version `vmbot-orch-1`) stay untouched in the
+  database. Rollback to an earlier build after owners exist would run a second
+  executor and is unsupported.
+
 ## Backend contract and trust
 
 See ADR sections 3 and 7. In short: opaque validated IDs, server-owned roots and

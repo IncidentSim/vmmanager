@@ -80,10 +80,17 @@ characters, no spaces), scoped to the principal's user ID.
 | `DELETE /v1/images/{id}` | – | 202 `{"operation_id","image_id"}` |
 | `GET /v1/operations/{id}` | – | 200 `{"id","status","kind","vm_id"?,"image_id"?,"result"?,"error"?}` |
 
-VM: `{"id","name","image_id","state","phase","resources":{"vcpu","memory_mib"}}`.
-`phase` is the API's durable lifecycle (`creating`, `active`, `stopping`,
-`stopped`, `committing`, `committed`, `deleting`); `state` is the last backend
-state the API observed. Operation `status` is `pending|running|succeeded|failed`;
+VM: `{"id","name","image_id","state","phase","resources":{"vcpu","memory_mib"},"owner_error"?}`.
+`phase` is the lifecycle **applied by the VM's owner workflow** (`creating`,
+`active`, `stopping`, `stopped`, `committing`, `committed`, `deleting`): the owner
+sets `stopping`/`committing`/`deleting` when it starts executing that command and
+the final phase when it records the outcome. Accepting a request (202) never
+changes `phase`; a queued Delete is visible only as a `pending` operation until
+the owner reaches it. `state` is the last backend state the owner observed.
+`owner_error:true` (additive; absent otherwise) means the VM's owner workflow
+ended abnormally: the VM and its quota slot are retained and commands for it are
+refused with `503 unavailable` until an operator intervenes
+([owner design](architecture.md#vm-owner-workflow)). Operation `status` is `pending|running|succeeded|failed`;
 a `failed` operation carries `error:{code,message}` with a fixed safe message
 (`operation not confirmed`) and one of `unavailable|conflict|capacity|invalid_argument`.
 Terminal result when succeeded: `{"result":{"url":"https://…/t/<capability>/"}}`.
@@ -126,10 +133,10 @@ include tokens, paths, foreign objects or backend detail.
 | 401 | `unauthorized` | absent/invalid bearer |
 | 403 | `forbidden` | acting-header misuse, user not allowlisted |
 | 404 | `not_found` | unknown, foreign or malformed resource; creating from an image the caller cannot see (including another owner's derived image) |
-| 409 | `conflict` | idempotency key reused with a different request; duplicate VM name or image name for the owner; action not valid in the current phase or another operation is pending/running on the VM; deleting a shared/in-use image |
+| 409 | `conflict` | idempotency key reused with a different request; duplicate VM name or image name for the owner; action not valid in the current phase; another operation is pending/running on the VM (a **Delete** may be admitted behind one unfinished operation, but a second unfinished Delete is refused); deleting a shared/in-use image |
 | 422 | `invalid_argument` | strict-JSON/validation failure, missing or malformed `Idempotency-Key`, query string, `ssh_public_key` (unsupported, see below), zero resources |
 | 429 | `capacity` | the API's global or per-user quota at admission (backend exhaustion appears later as an operation error `capacity`, not as HTTP 429) |
-| 503 | `unavailable` | any other failure |
+| 503 | `unavailable` | any other failure, including a new command for a VM whose owner workflow is not running (`owner_error`) |
 
 ### Idempotency and durability
 
@@ -184,28 +191,47 @@ operation is checked independently of whether its VM still exists).
   immutable image; no RAM snapshot. The source VM becomes `committed`, stays
   stopped and keeps occupying its quota/capacity slot until an explicit Delete.
   Create from the new image after the commit succeeds (and a slot is free).
-* **Stop/Commit/Delete revoke terminals first** (before the intent is
-  enqueued), and a Terminal admission rechecks phase, identity and that the
-  owner is still allowed. The terminal URL is a **bearer capability**: anyone
+* **Access is revoked when the command executes, not when it is accepted.**
+  Stop/Commit/Delete revoke the terminal at the start of their effect (and the
+  owner's transitional phase fences new grants); a Terminal command rechecks
+  phase, identity and that the user is still allowed when it runs. Between
+  acceptance and execution the terminal URL keeps working: there is **no
+  immediate-revocation guarantee**. The URL is a **bearer capability**: anyone
   holding a copy has a shell until revoked. It is not identity-bound.
-* One non-delete operation per VM at a time (409 otherwise). Delete may
-  supersede queued work.
+* **Sequential per VM.** Each VM has one owner that runs one command at a time,
+  in admission order, waiting for each to finish. At most one non-delete
+  operation is unfinished per VM (409 otherwise); one Delete may be queued behind
+  it. **Delete never preempts**: it waits for the running command, and a queued
+  Delete behind a Commit runs after that Commit publishes its image (earlier
+  builds let Delete supersede it). Backend effects of one VM never overlap;
+  different VMs run independently. Each command costs up to about one second of
+  delivery latency (DBOS polls its mailbox once per second).
 
 ## Startup repair, degraded mode and failure retention
 
 On start the process opens the store (exclusive `flock` lifetime lock; second
-process fails), launches DBOS and runs `RecoverControl`, which re-drives
-pending/running operations with stable IDs, repairs the JSON↔SQLite enqueue gap
-and re-establishes terminal projections only for active VMs whose owner is still
-allowed. If recovery returns an error (for example an operation could not be
-re-enqueued), vmapi **keeps serving**: durable status stays queryable and
+process fails), refuses a pre-owner state it cannot hand off safely (see
+migration below), launches DBOS (which resumes the living owner workflows) and
+runs `RecoverControl`. `RecoverControl` makes sure every stored VM has a living
+owner (starting the first owner of an adopted VM, or of a Create whose start was
+interrupted), re-delivers unfinished commands (idempotent by operation ID; the
+owner skips anything finished) and the owner rebuilds a running VM's terminal
+projection once, only if its user is still allowed. An owner that ended
+abnormally is **never replaced automatically**: recovery reports it, the VM and
+its capacity stay retained. If recovery returns an error (for example a dead
+owner, or a command that could not be delivered), vmapi **keeps serving**: durable status stays queryable and
 `/healthz` reports `degraded`, with a one-line log that omits error text. A
 restart re-runs repair. There is no automatic periodic retry in v1. Shutdown
 closes projections and DBOS before releasing the lock.
 
 Uncertain outcomes keep occupancy: failed create/delete/stop operations leave the
-VM record and its quota slot in place; the caller retries by issuing a new
-explicit request (new key) or Delete. Nothing is auto-retried with a new random ID.
+VM record and its quota slot in place (a failed Create keeps phase `creating`,
+or `active` if the VM is known to exist; a failed Stop/Commit/Delete keeps its
+transitional phase and access fence); the owner stays usable and the caller
+retries by issuing a new explicit request (new key) or Delete. Nothing is
+auto-retried with a new random ID. A child timeout does not prove the backend
+effect stopped; the backend's own per-VM serialization and settled-delete
+barrier still guard any later Delete.
 
 ### Image deletion and retry
 
@@ -262,10 +288,21 @@ state directory at once; the lifetime lock enforces that for vmapi/legacy.
    owner-scoped control `delete` operation (key `legacy-delete:<vm>:<seq>`)
    written in the same atomic state write as the migration; `RecoverControl`
    repairs the same gap for stores migrated earlier and never adds a second one.
-   Legacy workflow bodies are retired without any effect, never resumed. A
-   legacy `creating` VM is only reconciled through `Get` (never a fresh
-   `Create`); if the backend lacks it, the refresh fails and it stays `creating`
-   until an explicit Delete.
+   Legacy workflow bodies are retired without any effect, never resumed (this
+   build runs under DBOS application version `vmbot-owner-1`; workflows left
+   `PENDING` by an earlier build keep their own version and are never executed).
+   **Handoff to the VM owner model** (`checkHandoff`, run before DBOS launches):
+   VMs in `active`, `stopped`, `committed` or `deleting` are adopted by a new
+   owner **without a Create** (an unfinished legacy `delete` operation is re-run
+   by the owner; legacy unfinished `terminal`/`refresh` operations were only
+   rebuildable access projections and are marked `failed`/`unavailable`, repeat
+   them if needed). A VM left in `creating`, `stopping` or `committing` by an
+   earlier build is **rejected at startup** with a diagnostic naming the VM and
+   operation: its outcome is unknown to this build and guessing could drop work,
+   republish an image or create a replacement VM. Settle it with the previous
+   build, or inspect the backend and repair the record deliberately, then
+   start again. Rollback to an earlier build after owners exist is not
+   supported (it would run a second executor); see the architecture notes.
 5. Verify `GET /v1/vms` with the owner's token, then start only the new
    frontend. Rollback is not "restart the old bot": the baseline state decoder
    rejects unknown fields (code reading; not executed here), so it refuses
@@ -295,6 +332,13 @@ GOMAXPROCS=2 go test ./internal/controlapi ./internal/vmbot ./cmd/vmapi ./contro
 * Caller SSH public keys unsupported by the current backend.
 * Startup recovery is one-shot per process; degraded state clears only on restart.
 * Failed operations hold their quota slot until an explicit Delete.
+* An owner workflow that ends in ERROR (or is cancelled) is retained and visible
+  (`owner_error`, `/healthz` degraded after a restart) but not repaired: there
+  is no replacement-owner protocol and no history rollover; recovery is manual.
+* No immediate access revocation and no Delete preemption (deliberate, see above).
+* Each command has about one second of delivery latency (DBOS mailbox polling).
+* Legacy single-tenant (non-control) Telegram controller workflows still exist in
+  `internal/vmbot` for non-control stores; no shipped binary uses them.
 * `vmapi` operation timeout is the controller default (5 minutes) and is not yet
   configurable.
 * No audit log, retention/pruning of finished operations or DBOS rows, or

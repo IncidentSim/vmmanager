@@ -3,6 +3,7 @@ package vmbot
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -185,7 +186,9 @@ func TestControlMigrationQueuedLegacyDeleteWorkflowHandoff(t *testing.T) {
 	awaitGone(t, base, st)
 }
 
-// A legacy creating record is only reconciled through Get: never a fresh Create.
+// A legacy creating record cannot be handed to an owner: its Create outcome is
+// unknown to this build. Startup is rejected with a diagnostic; the backend is
+// never touched and no Create is issued (before or after rejection).
 func TestControlMigrationLegacyCreatingNeverIssuesCreate(t *testing.T) {
 	for _, present := range []bool{false, true} {
 		dir := t.TempDir() + "/state"
@@ -195,27 +198,25 @@ func TestControlMigrationLegacyCreatingNeverIssuesCreate(t *testing.T) {
 			remoteVM(t, base)
 		}
 		lc := &countCreateLC{Lifecycle: base}
-		st, c := startMigrated(t, dir, lc)
-		before := lc.creates.Load()
-		if e := c.RecoverControl(); e != nil {
+		st, e := OpenControlStore(dir, 11)
+		if e != nil {
 			t.Fatal(e)
 		}
-		for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
-			done := true
-			for _, o := range st.Snapshot().Operations {
-				done = done && (o.Status == "succeeded" || o.Status == "failed")
-			}
-			if done && len(st.Snapshot().Operations) > 0 {
-				break
-			}
+		c := NewController(lc, st, &controlTerms{}, ControllerConfig{Profile: "small", OpTimeout: 2 * time.Second})
+		c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11}, SharedImages: []string{"ubuntu"}, MaxVMs: 2, MaxVMsPerUser: 2})
+		e = c.Start(context.Background())
+		if e == nil || !strings.Contains(e.Error(), legacyVM) {
+			t.Fatalf("present=%v: start must reject with a diagnostic naming the VM: %v", present, e)
 		}
-		if lc.creates.Load() != before {
-			t.Fatalf("present=%v: recovery issued a fresh Create", present)
+		if lc.creates.Load() != 0 {
+			t.Fatalf("present=%v: rejected handoff issued a Create", present)
 		}
 		if _, e := base.Get(context.Background(), legacyVM); present == errors.Is(e, vmlib.ErrNotFound) {
 			t.Fatalf("present=%v: backend state changed (%v)", present, e)
 		}
-		c.Close()
+		if len(st.Snapshot().VMs) != 1 {
+			t.Fatal("rejected handoff dropped the record")
+		}
 		st.Close()
 	}
 }

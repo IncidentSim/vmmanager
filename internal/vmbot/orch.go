@@ -19,17 +19,19 @@ import (
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
-// This file is the single durable orchestration layer (ADR 0004). Every
-// lifecycle command and every recovery action is a DBOS workflow on the queue
-// "vmops", partitioned by VM ID with concurrency 1. Domain truth stays in
-// state.json; the SQLite system database is an execution log only.
+// This file wires the DBOS engine. Control stores (the cmd/vmapi path) are driven
+// only by the per-VM owner workflows in owner.go. The queue "vmops" (partitioned
+// by VM ID, concurrency 1) and the "vmbot-op" workflows below serve only the
+// single-tenant, non-control controller path (ADR 0004), which no shipped binary
+// uses. Domain truth stays in state.json; the SQLite system database is the
+// durable execution log (owner command consumption, child results, replay).
 
 const (
 	orchAppName    = "vmbot"
 	orchExecutorID = "vmbot" // fixed: a second executor would strand or re-run work
 	// orchAppVersion is a constant, not the binary hash, so pending workflows are
 	// recovered after a rebuild. Bump it only together with a drain/migration plan.
-	orchAppVersion = "vmbot-orch-1"
+	orchAppVersion = "vmbot-owner-1"
 	orchQueue      = "vmops"
 	orchWorkflow   = "vmbot-op"
 	orchSubdir     = "orchestration"
@@ -46,10 +48,9 @@ const (
 
 // OpInput is the workflow input: identifiers only, never a token or a link.
 type OpInput struct {
-	Kind        string
-	VMID        string
-	Seq         uint64
-	OperationID string
+	Kind string
+	VMID string
+	Seq  uint64
 }
 
 // Result codes carried in OpResult (an outcome is a value, not a workflow error:
@@ -103,6 +104,11 @@ func (c *Controller) Start(ctx context.Context) error {
 	if c.engine() != nil {
 		return errors.New("orchestration already started")
 	}
+	if snap := c.st.Snapshot(); snap.Control {
+		if err := checkHandoff(snap); err != nil {
+			return err
+		}
+	}
 	if err := c.st.claimEngine(c); err != nil {
 		return err
 	}
@@ -132,6 +138,9 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("orchestration database: %w", err)
 	}
 	dbos.RegisterWorkflow(dctx, vmbotOp, dbos.WithWorkflowName(orchWorkflow))
+	dbos.RegisterWorkflow(dctx, vmOwner, dbos.WithWorkflowName(ownerWorkflowName))
+	dbos.RegisterWorkflow(dctx, vmEffect, dbos.WithWorkflowName(effectWorkflowName))
+	dbos.RegisterWorkflow(dctx, imageDelete, dbos.WithWorkflowName(imageWorkflowName))
 	q, err := dbos.RegisterQueue(dctx, orchQueue, dbos.WithPartitionConcurrency(1),
 		dbos.WithQueueBasePollingInterval(50*time.Millisecond))
 	if err != nil {
@@ -139,6 +148,10 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("orchestration queue: %w", err)
 	}
 	e := &engine{ctx: dctx, queue: q}
+	// Arm the one-time terminal rebuild for every VM stored now (see owner.go).
+	for _, v := range c.st.Snapshot().VMs {
+		c.rebuild.Store(v.ID, true)
+	}
 	c.engMu.Lock()
 	c.eng = e // publish before Launch can recover workflow bodies
 	c.engMu.Unlock()
@@ -182,12 +195,12 @@ func vmbotOp(ctx dbos.Context, in OpInput) (OpResult, error) {
 	if c == nil {
 		return OpResult{Code: codeFailed, Msg: "no controller"}, nil
 	}
-	if c.st.Snapshot().Control && in.Kind != "control" {
+	if c.st.Snapshot().Control {
+		// Control stores are driven only by the VM owner workflows; the single-
+		// tenant workflows below serve non-control stores.
 		return OpResult{Code: codeFailed, Msg: "legacy workflow retired by control migration"}, nil
 	}
 	switch in.Kind {
-	case "control":
-		return c.controlFlow(ctx, in)
 	case opCreate:
 		return c.createFlow(ctx, in)
 	case opDelete:

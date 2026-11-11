@@ -28,6 +28,7 @@ func (h *commitHook) Commit(ctx context.Context, id, img string) (vmlib.Image, e
 // stays private/unpublished, unbootable and undeletable through the API, the
 // operation fails safely, and the source VM can still be deleted explicitly.
 func TestControlCommitAmbiguityFailsClosedAndNeverAdopts(t *testing.T) {
+	t.Parallel()
 	for name, commitErr := range map[string]error{"collision": vmlib.ErrAlreadyExists, "ambiguous": errors.New("lost response")} {
 		t.Run(name, func(t *testing.T) {
 			st, e := OpenControlStore(t.TempDir()+"/state", 0)

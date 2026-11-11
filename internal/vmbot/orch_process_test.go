@@ -72,6 +72,23 @@ func (d *diskLC) Delete(_ context.Context, id string) (vmlib.DeleteResult, error
 	}
 	return vmlib.DeleteResult{Deleted: true}, nil
 }
+func (d *diskLC) Stop(_ context.Context, id string) (vmlib.VM, error) {
+	f, err := os.OpenFile(filepath.Join(d.root, "stops"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return vmlib.VM{}, err
+	}
+	_, err = f.WriteString(id + "\n")
+	_ = f.Sync()
+	f.Close()
+	if err != nil {
+		return vmlib.VM{}, err
+	}
+	if d.mode == "stop-effect" {
+		d.marker("effect") // effect done, checkpoint not yet written
+		select {}
+	}
+	return vmlib.VM{ID: id, State: vmlib.StateStopped}, nil
+}
 func (d *diskLC) SSHInfo(context.Context, string) (vmlib.SSHInfo, error) {
 	return vmlib.SSHInfo{Host: "127.0.0.1", User: "root"}, nil
 }

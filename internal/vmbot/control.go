@@ -1,6 +1,8 @@
 package vmbot
 
-// The control domain shares the existing Store, lifetime lock and DBOS queue.
+// The control domain shares the existing Store and lifetime lock; its execution
+// belongs to the per-VM owner workflows (owner.go). This file is admission,
+// projections, pre-owner handoff and startup recovery.
 // Domain intent is never allocated inside a replayable workflow.
 import (
 	"context"
@@ -47,8 +49,13 @@ type ControlOperation struct {
 	ImageID     string `json:"image_id,omitempty"`
 	Status      string `json:"status"`
 	ErrorCode   string `json:"error_code,omitempty"`
-	Attempt     uint64 `json:"attempt,omitempty"`
-	Repair      bool   `json:"repair,omitempty"`
+	// Attempt and Repair are written only by pre-owner builds; they stay in the
+	// struct so strict state loading still accepts an upgraded file.
+	Attempt uint64 `json:"attempt,omitempty"`
+	Repair  bool   `json:"repair,omitempty"`
+	// Exec is "owner" for every operation admitted by the owner model. An
+	// operation without it is a pre-owner (legacy) record: see checkHandoff.
+	Exec string `json:"exec,omitempty"`
 }
 type ControlImage struct {
 	ID          string `json:"id"`
@@ -71,6 +78,10 @@ type ControlVMView struct {
 	State     string            `json:"state"`
 	Phase     string            `json:"phase"`
 	Resources *ControlResources `json:"resources"`
+	// OwnerError is true when the VM's owner workflow ended abnormally (ERROR,
+	// cancelled, retries exhausted). The VM and its capacity stay retained;
+	// commands are refused until an operator intervenes. Absent otherwise.
+	OwnerError bool `json:"owner_error,omitempty"`
 }
 
 func validateControlState(s State) error {
@@ -195,7 +206,11 @@ func (c *Controller) ControlVM(u int64, id string) (ControlVMView, error) {
 	if !ok || r.OwnerUserID != u {
 		return ControlVMView{}, ErrNoVM
 	}
-	return ControlVMView{r.ID, r.Label, r.ImageID, r.RemoteState, r.Phase, r.Resources}, nil
+	v := ControlVMView{ID: r.ID, Name: r.Label, ImageID: r.ImageID, State: r.RemoteState, Phase: r.Phase, Resources: r.Resources}
+	if st, err := c.ownerState(r.ID); err == nil && st != "" && !ownerAlive(st) && st != dbos.WorkflowStatusSuccess {
+		v.OwnerError = true
+	}
+	return v, nil
 }
 func (c *Controller) ControlVMs(u int64) []ControlVMView {
 	out := []ControlVMView{}
@@ -306,6 +321,14 @@ func (c *Controller) ControlOperation(u int64, id string) (ControlOperation, err
 	}
 	for _, o := range c.st.Snapshot().Operations {
 		if o.ID == id && o.OwnerUserID == u {
+			// Read-only overlay: an unfinished operation whose owner has terminally
+			// failed will never complete; report that instead of "pending" forever.
+			// Nothing is written and nothing is retried here.
+			if o.Exec == execOwner && o.VMID != "" && (o.Status == "pending" || o.Status == "running") {
+				if st, err := c.ownerState(o.VMID); err == nil && st != "" && !ownerAlive(st) && st != dbos.WorkflowStatusSuccess {
+					o.Status, o.ErrorCode = "failed", "unavailable"
+				}
+			}
 			return o, nil
 		}
 	}
@@ -389,6 +412,9 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 	b, _ := json.Marshal(req)
 	sum := sha256.Sum256(b)
 	digest := hex.EncodeToString(sum[:])
+	if err := c.requireLiveOwner(u, key, req); err != nil {
+		return ControlOperation{}, err
+	}
 	id, e := newVMID()
 	if e != nil {
 		return ControlOperation{}, e
@@ -412,7 +438,7 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 				return nil
 			}
 		}
-		out = ControlOperation{ID: oid, OwnerUserID: u, Key: key, Digest: digest, Kind: req.Kind, VMID: req.VMID, ImageID: req.ImageID, Status: "pending"}
+		out = ControlOperation{ID: oid, OwnerUserID: u, Key: key, Digest: digest, Kind: req.Kind, VMID: req.VMID, ImageID: req.ImageID, Status: "pending", Exec: execOwner}
 		switch req.Kind {
 		case "create":
 			if _, ok := c.controlImage(*s, u, req.ImageID); !ok {
@@ -442,37 +468,30 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 			if !ok || r.OwnerUserID != u {
 				return ErrNoVM
 			}
-			// No FIFO guarantee: don't accept a command whose prerequisite may be
-			// queued later. Delete may supersede create; all grants recheck phase.
+			// The owner serializes execution; admission only bounds the backlog:
+			// at most one unfinished command per VM, plus one Delete behind it.
+			// The applied phase is never changed here.
+			if req.Kind == "terminal" && r.Phase != PhaseActive {
+				return ErrControlConflict
+			}
 			if req.Kind != "delete" && !(req.Kind == "stop" && r.Phase == "stopping") && r.Phase != PhaseActive && r.Phase != "stopped" && r.Phase != "committed" {
 				return ErrControlConflict
 			}
 			for _, o := range s.Operations {
-				if o.VMID == r.ID && (o.Status == "pending" || o.Status == "running") && req.Kind != "delete" {
+				if o.VMID == r.ID && (o.Status == "pending" || o.Status == "running") && (req.Kind != "delete" || o.Kind == "delete") {
 					return ErrControlConflict
 				}
 			}
-			if req.Kind == "terminal" && r.Phase != PhaseActive {
-				return ErrControlConflict
-			}
-			phase := r.Phase
-			switch req.Kind {
-			case "stop":
-				phase = "stopping"
-			case "delete":
-				phase = PhaseDeleting
-			case "commit":
+			if req.Kind == "commit" {
 				if req.Name == "" {
 					return vmlib.ErrInvalidArgument
 				}
 				if c.imageNameTaken(*s, req.Name) {
 					return ErrControlConflict
 				}
-				phase = "committing"
 				out.ImageID = "img-" + strings.TrimPrefix(oid, "op-")
 				s.Images = append(s.Images, ControlImage{ID: out.ImageID, Name: req.Name, OwnerUserID: u, Phase: "publishing"})
 			}
-			s.update(r.ID, func(v *VMRecord) { v.Phase = phase; v.Seq++ })
 		case "delete_image":
 			i, ok := c.ownedImage(*s, u, req.ImageID)
 			if !ok {
@@ -512,82 +531,42 @@ func (c *Controller) AcceptControl(u int64, key string, req ControlRequest) (Con
 	if err != nil {
 		return ControlOperation{}, err
 	}
-	if out.Kind == "stop" || out.Kind == "commit" || out.Kind == "delete" {
-		c.term.Revoke(out.VMID)
-	}
 	if out.Status == "pending" || out.Status == "running" {
-		_ = c.submitControl(out)
+		c.dispatch(&out)
 	}
 	return out, nil
 }
-func (c *Controller) submitControl(o ControlOperation) error {
-	partition := o.VMID
-	if partition == "" {
-		partition = o.ImageID
+
+// dispatch delivers an admitted operation: Create starts the VM's owner; other
+// VM commands are sent to it; image deletion runs its own workflow. Delivery is
+// idempotent by operation ID. A failure here leaves the durable intent pending
+// (a duplicate request or the next startup re-delivers it); only a provably
+// dead owner fails the operation immediately.
+func (c *Controller) dispatch(o *ControlOperation) {
+	var err error
+	if o.Kind == "create" {
+		err = c.startOwner(OwnerIn{VMID: o.VMID, CreateOpID: o.ID, CreateDigest: o.Digest})
+	} else {
+		err = c.deliver(*o)
 	}
-	id := "control-" + o.ID
-	if o.Attempt > 0 {
-		id = fmt.Sprintf("%s-%d", id, o.Attempt)
+	if err == nil {
+		return
 	}
-	_, e := c.submit(OpInput{Kind: "control", VMID: partition, OperationID: o.ID}, id)
-	return e
-}
-func (c *Controller) RecoverControl() error {
-	var errs []error
-	// Durable repair before any enqueue: deleting VMs without an operation (a
-	// store migrated by an earlier build) get their stable delete operation.
-	if e := c.st.UpdateErr(func(s *State) error {
-		if s.Control {
-			synthesizeLegacyDeletes(s)
-		}
-		return nil
-	}); e != nil {
-		errs = append(errs, e)
-	}
-	for _, o := range c.st.Snapshot().Operations {
-		if o.Status == "pending" || o.Status == "running" {
-			id := "control-" + o.ID
-			if o.Attempt > 0 {
-				id = fmt.Sprintf("%s-%d", id, o.Attempt)
-			}
-			if _, status := c.lookup(id); status != nil && !activeStatus(status.Status) && status.Status != dbos.WorkflowStatusSuccess {
-				if e := c.st.Update(func(s *State) {
-					for n := range s.Operations {
-						if s.Operations[n].ID == o.ID {
-							s.Operations[n].Attempt++
-							s.Operations[n].Repair = true
-							o = s.Operations[n]
-						}
-					}
-				}); e != nil {
-					errs = append(errs, e)
-					continue
+	c.logf("dispatch %s %s: %v", o.Kind, o.ID, err)
+	if errors.Is(err, ErrOwnerUnavailable) {
+		if e := c.st.Update(func(s *State) {
+			for n := range s.Operations {
+				if s.Operations[n].ID == o.ID && s.Operations[n].Status == "pending" {
+					s.Operations[n].Status, s.Operations[n].ErrorCode = "failed", "unavailable"
+					*o = s.Operations[n]
 				}
 			}
-			errs = append(errs, c.submitControl(o))
+		}); e != nil {
+			c.logf("dispatch %s: %v", o.ID, e)
 		}
 	}
-	// Fresh startup projection work uses this same DBOS queue. An already
-	// completed terminal workflow is not evidence of a live socket.
-	for _, r := range c.st.Snapshot().VMs {
-		if r.Phase == PhaseDeleting || r.Phase == "stopping" || r.Phase == "committing" {
-			continue
-		}
-		id, e := newVMID()
-		if e != nil {
-			errs = append(errs, e)
-			continue
-		}
-		sum := sha256.Sum256([]byte(id))
-		o := ControlOperation{ID: "op-" + strings.TrimPrefix(id, "bot-"), OwnerUserID: r.OwnerUserID, Key: "recovery:" + id, Digest: hex.EncodeToString(sum[:]), Kind: "refresh", VMID: r.ID, Status: "pending"}
-		e = c.st.Update(func(s *State) { s.Operations = append(s.Operations, o) })
-		if e == nil {
-			e = c.submitControl(o)
-		}
-		errs = append(errs, e)
-	}
-	return errors.Join(errs...)
 }
+
 func (c *Controller) deletableImage(s State, op ControlOperation) bool {
 	for _, id := range c.control.SharedImages {
 		if id == op.ImageID {
@@ -607,188 +586,188 @@ func (c *Controller) deletableImage(s State, op ControlOperation) bool {
 	}
 	return found
 }
-func (c *Controller) controlFlow(ctx dbos.Context, in OpInput) (OpResult, error) {
-	// Unlike legacy attach-terminal steps, a terminal projection must be started
-	// in the live body on replay, not recovered from a step checkpoint.
-	err := c.executeControl(ctx, in.OperationID)
-	return OpResult{}, err
-}
-func (c *Controller) executeControl(ctx context.Context, id string) error {
-	var op ControlOperation
-	for _, o := range c.st.Snapshot().Operations {
-		if o.ID == id {
-			op = o
+
+// checkHandoff is the conservative pre-owner -> owner boundary. It reads only
+// the store and runs before DBOS launches, so no owner ever exists beside an old
+// executor. It rejects (with a diagnostic naming the VM and operation) any VM
+// that an earlier build left in a transitional phase: its Create/Stop/Commit
+// outcome is unknown to this build, and guessing could drop work, republish an
+// image or create a replacement VM. Settled VMs (active, stopped, committed)
+// and deleting VMs (Delete is idempotent and barrier-protected) are adopted.
+// Operations the old build left unfinished and that this build cannot run are
+// listed in the diagnostic only when they block adoption; see RecoverControl.
+func checkHandoff(s State) error {
+	var problems []string
+	for _, v := range s.VMs {
+		switch v.Phase {
+		case PhaseActive, "stopped", "committed", PhaseDeleting:
+			continue
 		}
+		owned := false
+		var legacy []string
+		for _, o := range s.Operations {
+			if o.VMID != v.ID {
+				continue
+			}
+			if o.Exec == execOwner {
+				owned = true
+			} else if o.Status == "pending" || o.Status == "running" {
+				legacy = append(legacy, fmt.Sprintf("%s %s (%s)", o.Kind, o.ID, o.Status))
+			}
+		}
+		if owned {
+			continue
+		}
+		detail := "no recorded operation"
+		if len(legacy) > 0 {
+			detail = "unfinished " + strings.Join(legacy, ", ")
+		}
+		problems = append(problems, fmt.Sprintf("VM %s is in transitional phase %q with %s", v.ID, v.Phase, detail))
 	}
-	if op.ID == "" || op.Status == "succeeded" || op.Status == "failed" {
+	if len(problems) == 0 {
 		return nil
 	}
-	if e := c.st.Update(func(s *State) {
-		for n := range s.Operations {
-			if s.Operations[n].ID == id {
-				s.Operations[n].Status = "running"
-			}
+	return fmt.Errorf("cannot hand off pre-owner state: %s; finish or settle these with the previous build (or inspect the backend and repair the record deliberately) before starting this build", strings.Join(problems, "; "))
+}
+
+// RecoverControl runs after Start. It makes sure every stored VM has a living
+// owner and re-delivers unfinished commands (delivery is idempotent by
+// operation ID; the owner skips anything already finished). It never creates a
+// replacement for an owner that ended abnormally: that is reported, the VM and
+// its capacity stay retained, and an operator decides.
+func (c *Controller) RecoverControl() error {
+	var errs []error
+	// A store migrated by an earlier build may hold a deleting VM without its
+	// stable delete operation (explicit migration boundary, idempotent).
+	if e := c.st.UpdateErr(func(s *State) error {
+		if s.Control {
+			synthesizeLegacyDeletes(s)
 		}
+		return nil
 	}); e != nil {
-		return e
+		errs = append(errs, e)
 	}
-	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.OpTimeout)
-	defer cancel()
-	var effectErr error
-	absentBarrier := false
-	var vm vmlib.VM
-	r, exists := c.st.Snapshot().ByID(op.VMID)
-	// Owner is immutable in intent. Recovery may clean up a removed user's
-	// resources, but must never issue a new terminal grant for that owner.
-	if op.Kind != "delete_image" && (!exists || r.OwnerUserID != op.OwnerUserID) {
-		effectErr = ErrNoVM
-	} else {
-		switch op.Kind {
-		case "refresh":
-			vm, effectErr = c.lc.Get(qctx, r.ID)
-			if effectErr == nil && r.Phase == PhaseActive && vm.State == vmlib.StateRunning && c.ControlAllowed(r.OwnerUserID) {
-				effectErr = c.ensureTerminalLocked(qctx, r)
+	snap := c.st.Snapshot()
+	opsFor := func(vm string) (ops []ControlOperation) {
+		for _, o := range c.st.Snapshot().Operations {
+			if o.VMID == vm && (o.Status == "pending" || o.Status == "running") {
+				ops = append(ops, o)
 			}
-		case "create":
-			if r.Phase != PhaseCreating {
-				effectErr = ErrControlConflict
-				break
-			}
-			vm, effectErr = c.lc.Get(qctx, r.ID)
-			if errors.Is(effectErr, vmlib.ErrNotFound) {
-				if op.Repair {
-					res, e := c.lc.Delete(qctx, r.ID)
-					absentBarrier = e == nil && res.Deleted
-					effectErr = ErrUncertain
-					break
+		}
+		return
+	}
+	unfinished := func(o ControlOperation) bool { return o.Status == "pending" || o.Status == "running" }
+	for _, v := range snap.VMs {
+		st, err := c.ownerState(v.ID)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		switch {
+		case ownerAlive(st):
+		case st != "":
+			errs = append(errs, fmt.Errorf("owner of VM %s is %s: VM retained, no replacement is started", v.ID, st))
+			continue
+		default:
+			in := OwnerIn{VMID: v.ID}
+			for _, o := range opsFor(v.ID) {
+				if o.Kind == "create" && o.Exec == execOwner && v.Phase == PhaseCreating {
+					in.CreateOpID, in.CreateDigest = o.ID, o.Digest
 				}
-				req := vmlib.CreateRequest{ID: r.ID, ImageID: r.ImageID, Profile: c.cfg.Profile, SSHPublicKey: r.SSHPublicKey}
-				if r.Resources != nil {
-					req.Profile = ""
-					req.Resources = &vmlib.VMResources{VCPU: r.Resources.VCPU, MemMiB: r.Resources.MemoryMiB}
+			}
+			if err := c.startOwner(in); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+		}
+		for _, o := range opsFor(v.ID) {
+			if o.Kind == "create" {
+				continue // carried by the owner input
+			}
+			if o.Exec != execOwner {
+				// A pre-owner operation. A delete is safely re-run by the owner;
+				// terminal/refresh were rebuildable access projections; anything else
+				// would already have been rejected by checkHandoff.
+				if o.Kind != "delete" {
+					c.markLegacyAbandoned(o.ID)
+					continue
 				}
-				vm, effectErr = c.lc.Create(qctx, req)
+				c.adoptLegacy(o.ID)
+				o.Exec = execOwner
 			}
-		case "stop":
-			if r.Phase != "stopping" {
-				effectErr = ErrControlConflict
-				break
+			if err := c.deliver(o); err != nil {
+				errs = append(errs, err)
 			}
-			c.term.Revoke(r.ID)
-			vm, effectErr = c.lc.Stop(qctx, r.ID)
-		case "commit":
-			if r.Phase != "committing" {
-				effectErr = ErrControlConflict
-				break
-			}
-			c.term.Revoke(r.ID)
-			// Never adopt an unknown image on AlreadyExists: even a random collision
-			// cannot confer ownership. Ambiguous publication retains the private intent.
-			_, effectErr = c.lc.Stop(qctx, r.ID)
-			if effectErr == nil {
-				_, effectErr = c.lc.Commit(qctx, r.ID, op.ImageID)
-			}
-		case "delete":
-			c.term.Revoke(r.ID)
-			var res vmlib.DeleteResult
-			res, effectErr = c.lc.Delete(qctx, r.ID)
-			if effectErr == nil && !res.Deleted {
-				effectErr = ErrUncertain
-			}
-		case "terminal":
-			if !c.ControlAllowed(r.OwnerUserID) || r.Phase != PhaseActive {
-				effectErr = ErrNotRunning
-				break
-			}
-			effectErr = c.ensureTerminalLocked(qctx, r)
-		case "delete_image":
-			// Only a durably fenced, owned, unreferenced private image is ever
-			// sent to the backend.
-			if !c.deletableImage(c.st.Snapshot(), op) {
-				effectErr = ErrControlConflict
-				break
-			}
-			effectErr = c.lc.DeleteImage(qctx, op.ImageID)
 		}
 	}
-	// A durable success is written only after the remote outcome is known. Errors
-	// retain VM occupancy and terminal fences; retry uses a new explicit request.
-	return c.st.Update(func(s *State) {
+	// Operations whose VM no longer exists cannot run; image deletions are
+	// re-driven by their own workflow.
+	for _, o := range snap.Operations {
+		if !unfinished(o) {
+			continue
+		}
+		if o.Kind == "delete_image" {
+			if o.Exec != execOwner {
+				c.adoptLegacy(o.ID)
+				o.Exec = execOwner
+			}
+			if err := c.deliver(o); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		if _, ok := snap.ByID(o.VMID); !ok {
+			c.markLegacyAbandoned(o.ID)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (c *Controller) adoptLegacy(opID string) {
+	_ = c.st.Update(func(s *State) {
 		for n := range s.Operations {
-			if s.Operations[n].ID == id {
-				s.Operations[n].Status = "succeeded"
-				if effectErr != nil {
-					s.Operations[n].Status = "failed"
-					s.Operations[n].ErrorCode = "unavailable"
-					if errors.Is(effectErr, vmlib.ErrAlreadyExists) || errors.Is(effectErr, ErrControlConflict) {
-						s.Operations[n].ErrorCode = "conflict"
-					}
-					if errors.Is(effectErr, vmlib.ErrResourceExhausted) {
-						s.Operations[n].ErrorCode = "capacity"
-					}
-					if errors.Is(effectErr, vmlib.ErrInvalidArgument) {
-						s.Operations[n].ErrorCode = "invalid_argument"
-					}
-				}
+			if s.Operations[n].ID == opID {
+				s.Operations[n].Exec = execOwner
 			}
-		}
-		if effectErr != nil {
-			if absentBarrier {
-				s.remove(r.ID)
-			}
-			return
-		}
-		switch op.Kind {
-		case "refresh":
-			s.update(r.ID, func(v *VMRecord) {
-				v.ImageID = vm.ImageID
-				v.RemoteState = string(vm.State)
-				if vm.Resources.VCPU != 0 {
-					v.Resources = &ControlResources{vm.Resources.VCPU, vm.Resources.MemMiB}
-				}
-				if v.Phase == PhaseCreating {
-					v.Phase = PhaseActive
-				}
-			})
-		case "create":
-			s.update(r.ID, func(v *VMRecord) {
-				if v.Phase == PhaseCreating {
-					v.Phase = PhaseActive
-				}
-				v.RemoteState = string(vm.State)
-				if v.Resources == nil && vm.Resources.VCPU != 0 {
-					v.Resources = &ControlResources{vm.Resources.VCPU, vm.Resources.MemMiB}
-				}
-			})
-		case "stop":
-			s.update(r.ID, func(v *VMRecord) {
-				if v.Phase == "stopping" {
-					v.Phase = "stopped"
-				}
-				v.RemoteState = string(vm.State)
-			})
-		case "commit":
-			s.update(r.ID, func(v *VMRecord) {
-				if v.Phase == "committing" {
-					v.Phase = "committed"
-				}
-				v.RemoteState = "committed"
-			})
-			for n := range s.Images {
-				if s.Images[n].ID == op.ImageID {
-					s.Images[n].Phase = "ready"
-				}
-			}
-		case "delete":
-			s.remove(r.ID)
-		case "delete_image":
-			out := s.Images[:0]
-			for _, i := range s.Images {
-				if i.ID != op.ImageID {
-					out = append(out, i)
-				}
-			}
-			s.Images = out
 		}
 	})
+}
+
+// markLegacyAbandoned records, visibly, that an unfinished operation could not
+// be carried over. The VM itself is untouched; the client may simply repeat it.
+func (c *Controller) markLegacyAbandoned(opID string) {
+	c.logf("operation %s was unfinished before the owner model and is marked failed (unavailable)", opID)
+	_ = c.st.Update(func(s *State) {
+		for n := range s.Operations {
+			if s.Operations[n].ID == opID && (s.Operations[n].Status == "pending" || s.Operations[n].Status == "running") {
+				s.Operations[n].Status, s.Operations[n].ErrorCode = "failed", "unavailable"
+			}
+		}
+	})
+}
+
+// requireLiveOwner refuses a NEW command for a VM whose owner workflow ended
+// abnormally or is gone: the operation would never run and must not be reported
+// as accepted. A repeat of an existing request (same key) skips this and gets
+// the recorded operation, so completed duplicates stay idempotent. No owner row
+// at all is allowed: startup recovery has not created it yet.
+func (c *Controller) requireLiveOwner(u int64, key string, req ControlRequest) error {
+	switch req.Kind {
+	case "stop", "delete", "commit", "terminal":
+	default:
+		return nil
+	}
+	for _, o := range c.st.Snapshot().Operations {
+		if o.OwnerUserID == u && o.Key == key {
+			return nil
+		}
+	}
+	if r, ok := c.st.Snapshot().ByID(req.VMID); !ok || r.OwnerUserID != u {
+		return nil // admission reports ErrNoVM
+	}
+	st, err := c.ownerState(req.VMID)
+	if err != nil || st == "" || ownerAlive(st) {
+		return nil
+	}
+	return ErrOwnerUnavailable
 }

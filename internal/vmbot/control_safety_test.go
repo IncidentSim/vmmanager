@@ -11,6 +11,7 @@ import (
 )
 
 func TestControlSnapshotDoesNotAliasResources(t *testing.T) {
+	t.Parallel()
 	s, e := OpenControlStore(t.TempDir()+"/state", 0)
 	if e != nil {
 		t.Fatal(e)
@@ -33,6 +34,7 @@ func TestControlSnapshotDoesNotAliasResources(t *testing.T) {
 }
 
 func TestControlMigrationFailsWithoutOwnerBeforeWriting(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "state")
 	if e := os.Mkdir(dir, 0700); e != nil {
 		t.Fatal(e)
@@ -67,6 +69,7 @@ func TestControlMigrationFailsWithoutOwnerBeforeWriting(t *testing.T) {
 // explicitly configured legacy owner; the exact v2 bytes are backed up and the
 // identity, capability token, generation, phase, Seq and delivery offset survive.
 func TestControlMigrationFromV2PreservesIdentityAndBacksUpExactBytes(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "state")
 	if e := os.Mkdir(dir, 0700); e != nil {
 		t.Fatal(e)
@@ -107,6 +110,7 @@ func TestControlMigrationFromV2PreservesIdentityAndBacksUpExactBytes(t *testing.
 }
 
 func TestControlTerminalFenceIncludesRemovedOwner(t *testing.T) {
+	t.Parallel()
 	st, e := OpenControlStore(filepath.Join(t.TempDir(), "state"), 0)
 	if e != nil {
 		t.Fatal(e)

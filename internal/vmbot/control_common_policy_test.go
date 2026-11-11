@@ -6,6 +6,7 @@ import (
 )
 
 func TestProtectedImageNeverOverridesDurablePhase(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []string{"publishing", "deleting"} {
 		t.Run(phase, func(t *testing.T) {
 			r, id := commonRig(t)
@@ -25,16 +26,17 @@ func TestProtectedImageNeverOverridesDurablePhase(t *testing.T) {
 	}
 }
 func TestPendingDeleteCannotRemoveNewlyProtectedImage(t *testing.T) {
+	t.Parallel()
 	r, id := commonRig(t)
+	// Admit the delete while orchestration is down: the intent stays pending and
+	// is re-delivered by the next start, which also carries the new policy.
+	_ = r.c.Close()
 	op, e := r.c.AcceptControl(11, "delete-before-policy", ControlRequest{Kind: "delete_image", ImageID: id})
 	if e != nil {
 		t.Fatal(e)
 	}
-	r.c.control.SharedImages = append(r.c.control.SharedImages, id)
-	if e = r.c.executeControl(context.Background(), op.ID); e != nil {
-		t.Fatal(e)
-	}
-	got, e := r.c.ControlOperation(11, op.ID)
+	r.c = r.controller(func(p *ControlPolicy) { p.SharedImages = append(p.SharedImages, id) })
+	got := awaitControl(t, r.c, 11, op.ID)
 	if e != nil || got.Status != "failed" {
 		t.Fatalf("pending delete not fenced: %+v %v", got, e)
 	}

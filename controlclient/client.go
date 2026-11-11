@@ -30,6 +30,9 @@ type VM struct {
 	State     string    `json:"state"`
 	Phase     string    `json:"phase"`
 	Resources Resources `json:"resources"`
+	// OwnerError: the VM's durable owner workflow ended abnormally; the VM is
+	// retained and commands are refused. Omitted (false) otherwise.
+	OwnerError bool `json:"owner_error,omitempty"`
 }
 type Image struct {
 	ID     string `json:"id"`

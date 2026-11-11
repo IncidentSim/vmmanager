@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/petruekhin/vibe-firecracker/vmlib"
 	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
@@ -30,20 +31,48 @@ type imgRig struct {
 	c   *Controller
 	svc *vmlib.Service
 	lc  *failFirstDeleteImage
+	// gate sits under lc so a test can hold one backend call open.
+	gate *gateLC
 }
 
-// newImgRig opens (or reopens) dir and builds a controller whose engine is not
-// started: operations are executed synchronously with executeControl.
+// newImgRig opens (or reopens) dir and builds a STARTED controller on real DBOS
+// file SQLite: operations run through the owner workflows and are awaited.
 func newImgRig(t *testing.T, dir string, svc *vmlib.Service, fail int) *imgRig {
 	t.Helper()
 	st, e := OpenControlStore(dir, 0)
 	if e != nil {
 		t.Fatal(e)
 	}
-	lc := &failFirstDeleteImage{Lifecycle: svc, fail: fail}
-	c := NewController(lc, st, &controlTerms{}, ControllerConfig{Profile: "small"})
-	c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11, 22}, SharedImages: []string{"ubuntu"}, MaxVMs: 4, MaxVMsPerUser: 4})
-	return &imgRig{t, st, c, svc, lc}
+	gate := newGateLC(svc)
+	lc := &failFirstDeleteImage{Lifecycle: gate, fail: fail}
+	r := &imgRig{t: t, st: st, svc: svc, lc: lc, gate: gate}
+	r.c = r.controller(nil)
+	return r
+}
+
+// controller builds and starts a controller on the rig's store; mutate may
+// change the policy before Start.
+func (r *imgRig) controller(mutate func(*ControlPolicy)) *Controller {
+	r.t.Helper()
+	c := NewController(r.lc, r.st, &controlTerms{}, ControllerConfig{Profile: "small", OpTimeout: 3 * time.Second})
+	p := ControlPolicy{AllowedUsers: []int64{11, 22}, SharedImages: []string{"ubuntu"}, MaxVMs: 4, MaxVMsPerUser: 4}
+	if mutate != nil {
+		mutate(&p)
+	}
+	c.ConfigureControl(p)
+	if e := c.Start(context.Background()); e != nil {
+		r.t.Fatal(e)
+	}
+	if e := c.RecoverControl(); e != nil {
+		r.t.Fatal(e)
+	}
+	return c
+}
+
+// close stops orchestration, then releases the store.
+func (r *imgRig) close() {
+	_ = r.c.Close()
+	r.st.Close()
 }
 
 func (r *imgRig) run(key string, req ControlRequest) ControlOperation {
@@ -52,11 +81,7 @@ func (r *imgRig) run(key string, req ControlRequest) ControlOperation {
 	if e != nil {
 		r.t.Fatalf("accept %s: %v", key, e)
 	}
-	if e = r.c.executeControl(context.Background(), o.ID); e != nil {
-		r.t.Fatal(e)
-	}
-	o, _ = r.c.ControlOperation(11, o.ID)
-	return o
+	return awaitControl(r.t, r.c, 11, o.ID)
 }
 
 // derivedImage creates a VM and commits a private image named "derived".
@@ -92,9 +117,10 @@ func (r *imgRig) durable(id string) bool {
 }
 
 func TestControlDeleteImageTransientFailureRetriesWithNewKey(t *testing.T) {
+	t.Parallel()
 	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
 	r := newImgRig(t, t.TempDir()+"/state", svc, 1)
-	defer r.st.Close()
+	defer r.close()
 	img := r.derivedImage()
 
 	d := r.run("rm", ControlRequest{Kind: "delete_image", ImageID: img})
@@ -141,6 +167,7 @@ func TestControlDeleteImageTransientFailureRetriesWithNewKey(t *testing.T) {
 }
 
 func TestControlDeleteImageRetryAfterRestart(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir() + "/state"
 	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
 	r := newImgRig(t, dir, svc, 1)
@@ -148,10 +175,10 @@ func TestControlDeleteImageRetryAfterRestart(t *testing.T) {
 	if d := r.run("rm", ControlRequest{Kind: "delete_image", ImageID: img}); d.Status != "failed" {
 		t.Fatal(d)
 	}
-	r.st.Close()
+	r.close()
 
 	r2 := newImgRig(t, dir, svc, 0)
-	defer r2.st.Close()
+	defer r2.close()
 	if got, ok := r2.image(11, img); !ok || got.Phase != "deleting" {
 		t.Fatalf("after restart: %+v %v", got, ok)
 	}
@@ -164,9 +191,10 @@ func TestControlDeleteImageRetryAfterRestart(t *testing.T) {
 }
 
 func TestControlDeleteImageRetryWhenRemoteAlreadyAbsent(t *testing.T) {
+	t.Parallel()
 	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
 	r := newImgRig(t, t.TempDir()+"/state", svc, 1)
-	defer r.st.Close()
+	defer r.close()
 	img := r.derivedImage()
 	if d := r.run("rm", ControlRequest{Kind: "delete_image", ImageID: img}); d.Status != "failed" {
 		t.Fatal(d)
@@ -184,23 +212,25 @@ func TestControlDeleteImageRetryWhenRemoteAlreadyAbsent(t *testing.T) {
 }
 
 func TestControlDeleteImageRetryRefusedWhileOperationActiveOrUnsafe(t *testing.T) {
+	t.Parallel()
 	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
 	r := newImgRig(t, t.TempDir()+"/state", svc, 0)
-	defer r.st.Close()
+	defer r.close()
 	img := r.derivedImage()
 
-	// Accepted but not executed: the previous operation is not terminal.
+	// Accepted but held at the backend: the previous operation is not terminal.
+	release := r.gate.arm("deleteimage")
+	defer release()
 	first, e := r.c.AcceptControl(11, "rm", ControlRequest{Kind: "delete_image", ImageID: img})
 	if e != nil {
 		t.Fatal(e)
 	}
+	r.gate.waitEntered(t, "deleteimage")
 	if _, e = r.c.AcceptControl(11, "rm-2", ControlRequest{Kind: "delete_image", ImageID: img}); !errors.Is(e, ErrControlConflict) {
 		t.Fatalf("concurrent fresh attempt must conflict: %v", e)
 	}
-	if e = r.c.executeControl(context.Background(), first.ID); e != nil {
-		t.Fatal(e)
-	}
-	if o, _ := r.c.ControlOperation(11, first.ID); o.Status != "succeeded" {
+	release()
+	if o := awaitControl(t, r.c, 11, first.ID); o.Status != "succeeded" {
 		t.Fatal(o)
 	}
 	// Shared and unknown images are never deletable.

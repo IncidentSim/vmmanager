@@ -2,67 +2,55 @@ package vmbot
 
 import (
 	"context"
-	"github.com/petruekhin/vibe-firecracker/vmlib"
-	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
+	"errors"
 	"testing"
 )
 
 func TestControlStopCanRetryFailedAttempt(t *testing.T) {
-	st, e := OpenControlStore(t.TempDir()+"/state", 0)
-	if e != nil {
-		t.Fatal(e)
+	t.Parallel()
+	e := newOwnerEnv(t)
+	c := e.create("create")
+	e.lc.mu.Lock()
+	e.lc.fail["stop"] = errors.New("injected backend failure")
+	e.lc.mu.Unlock()
+	stop := e.accept("stop", ControlRequest{Kind: "stop", VMID: c.VMID})
+	if got := awaitControl(t, e.ctl, ownerUser, stop.ID); got.Status != "failed" {
+		t.Fatalf("injected failure not recorded: %+v", got)
 	}
-	defer st.Close()
-	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
-	c := NewController(svc, st, &controlTerms{}, ControllerConfig{Profile: "small"})
-	c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11}, SharedImages: []string{"ubuntu"}, MaxVMs: 2, MaxVMsPerUser: 1})
-	o, _ := c.AcceptControl(11, "create", ControlRequest{Kind: "create", ImageID: "ubuntu"})
-	c.executeControl(context.Background(), o.ID)
-	stop, e := c.AcceptControl(11, "stop", ControlRequest{Kind: "stop", VMID: o.VMID})
-	if e != nil {
-		t.Fatal(e)
+	e.lc.mu.Lock()
+	delete(e.lc.fail, "stop")
+	e.lc.mu.Unlock()
+	retry, err := e.ctl.AcceptControl(ownerUser, "retry-stop", ControlRequest{Kind: "stop", VMID: c.VMID})
+	if err != nil {
+		t.Fatal("failed stop not retryable", err)
 	}
-	st.Update(func(s *State) {
-		for n := range s.Operations {
-			if s.Operations[n].ID == stop.ID {
-				s.Operations[n].Status = "failed"
-			}
-		}
-	})
-	if _, e = c.AcceptControl(11, "retry-stop", ControlRequest{Kind: "stop", VMID: o.VMID}); e != nil {
-		t.Fatal("failed stop not retryable", e)
+	if got := awaitControl(t, e.ctl, ownerUser, retry.ID); got.Status != "succeeded" {
+		t.Fatalf("retry %+v", got)
 	}
 }
 
-func TestControlDeleteSupersedesQueuedCommit(t *testing.T) {
-	st, e := OpenControlStore(t.TempDir()+"/state", 0)
-	if e != nil {
-		t.Fatal(e)
+// Agreed sequential semantics (docs/rfc-vm-owner.md): a Delete delivered behind a
+// queued Commit no longer supersedes it. The earlier command runs to its
+// outcome first; only then is the VM deleted. (Before the owner model the
+// Delete won and the Commit never published.)
+func TestControlDeleteWaitsForQueuedCommit(t *testing.T) {
+	t.Parallel()
+	e := newOwnerEnv(t)
+	c := e.create("create")
+	release := e.lc.arm("commit")
+	defer release()
+	commit := e.accept("commit", ControlRequest{Kind: "commit", VMID: c.VMID, Name: "derived"})
+	e.lc.waitEntered(t, "commit")
+	del := e.accept("delete", ControlRequest{Kind: "delete", VMID: c.VMID})
+	release()
+	if got := awaitControl(t, e.ctl, ownerUser, commit.ID); got.Status != "succeeded" {
+		t.Fatalf("commit %+v", got)
 	}
-	defer st.Close()
-	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
-	c := NewController(svc, st, &controlTerms{}, ControllerConfig{Profile: "small"})
-	c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11}, SharedImages: []string{"ubuntu"}, MaxVMs: 2, MaxVMsPerUser: 1})
-	create, e := c.AcceptControl(11, "create", ControlRequest{Kind: "create", ImageID: "ubuntu"})
-	if e != nil {
-		t.Fatal(e)
+	if got := awaitControl(t, e.ctl, ownerUser, del.ID); got.Status != "succeeded" {
+		t.Fatalf("delete %+v", got)
 	}
-	if e = c.executeControl(context.Background(), create.ID); e != nil {
-		t.Fatal(e)
-	}
-	commit, e := c.AcceptControl(11, "commit", ControlRequest{Kind: "commit", VMID: create.VMID, Name: "derived"})
-	if e != nil {
-		t.Fatal(e)
-	}
-	_, e = c.AcceptControl(11, "delete", ControlRequest{Kind: "delete", VMID: create.VMID})
-	if e != nil {
-		t.Fatal(e)
-	}
-	if e = c.executeControl(context.Background(), commit.ID); e != nil {
-		t.Fatal(e)
-	}
-	images, _ := svc.ListImages(context.Background())
-	if len(images) != 1 {
-		t.Fatal("superseded commit published image")
+	images, _ := e.svc.ListImages(context.Background())
+	if len(images) != 2 { // base image + the committed one
+		t.Fatalf("earlier commit must publish before delete: %d images", len(images))
 	}
 }

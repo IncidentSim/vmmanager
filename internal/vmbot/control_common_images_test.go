@@ -15,11 +15,7 @@ func (r *imgRig) runAs(u int64, key string, req ControlRequest) ControlOperation
 	if e != nil {
 		r.t.Fatalf("accept %s: %v", key, e)
 	}
-	if e = r.c.executeControl(context.Background(), o.ID); e != nil {
-		r.t.Fatal(e)
-	}
-	o, _ = r.c.ControlOperation(u, o.ID)
-	return o
+	return awaitControl(r.t, r.c, u, o.ID)
 }
 
 // commonRig returns a rig where synthetic user 11 has committed image "derived".
@@ -27,13 +23,14 @@ func (r *imgRig) runAs(u int64, key string, req ControlRequest) ControlOperation
 func commonRig(t *testing.T) (*imgRig, string) {
 	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
 	r := newImgRig(t, t.TempDir()+"/state", svc, 0)
-	t.Cleanup(func() { r.st.Close() })
+	t.Cleanup(func() { r.close() })
 	return r, r.derivedImage()
 }
 
 func (r *imgRig) sourceVM() string { return r.st.Snapshot().VMs[0].ID }
 
 func TestCommonImageVisibleAndBootableByOtherUserButNotItsVM(t *testing.T) {
+	t.Parallel()
 	r, img := commonRig(t)
 	src := r.sourceVM()
 	got, ok := r.image(22, img)
@@ -70,6 +67,7 @@ func TestCommonImageVisibleAndBootableByOtherUserButNotItsVM(t *testing.T) {
 }
 
 func TestCommonImageDeleteCreatorOnlyAndGlobalReferenceGuard(t *testing.T) {
+	t.Parallel()
 	r, img := commonRig(t)
 	if _, e := r.c.AcceptControl(22, "rm-b", ControlRequest{Kind: "delete_image", ImageID: img}); !errors.Is(e, ErrControlForbidden) {
 		t.Fatalf("foreign delete: %v", e)
@@ -77,19 +75,23 @@ func TestCommonImageDeleteCreatorOnlyAndGlobalReferenceGuard(t *testing.T) {
 	if got, _ := r.image(11, img); got.Phase != "ready" {
 		t.Fatalf("foreign delete changed phase: %+v", got)
 	}
-	// A pending create by B (not executed yet) must fence A's delete.
+	// A pending create by B (held at the backend) must fence A's delete.
+	release := r.gate.arm("create")
+	defer release()
 	pend, e := r.c.AcceptControl(22, "boot-b", ControlRequest{Kind: "create", ImageID: img, Name: "b-vm"})
 	if e != nil {
 		t.Fatal(e)
 	}
+	r.gate.waitEntered(t, "create")
 	if _, e = r.c.AcceptControl(11, "rm-a", ControlRequest{Kind: "delete_image", ImageID: img}); !errors.Is(e, ErrControlConflict) {
 		t.Fatalf("pending create must fence delete: %v", e)
 	}
 	if got, _ := r.image(11, img); got.Phase != "ready" {
 		t.Fatalf("refused delete changed phase: %+v", got)
 	}
-	if e = r.c.executeControl(context.Background(), pend.ID); e != nil {
-		t.Fatal(e)
+	release()
+	if got := awaitControl(t, r.c, 22, pend.ID); got.Status != "succeeded" {
+		t.Fatalf("B create %+v", got)
 	}
 	if _, e = r.c.AcceptControl(11, "rm-a2", ControlRequest{Kind: "delete_image", ImageID: img}); !errors.Is(e, ErrControlConflict) {
 		t.Fatalf("running B VM must fence delete: %v", e)
@@ -101,9 +103,10 @@ func TestCommonImageDeleteCreatorOnlyAndGlobalReferenceGuard(t *testing.T) {
 }
 
 func TestCommonImageDeletingVisibleToCreatorOnlyAndNotBootable(t *testing.T) {
+	t.Parallel()
 	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
 	r := newImgRig(t, t.TempDir()+"/state", svc, 1)
-	defer r.st.Close()
+	defer r.close()
 	img := r.derivedImage()
 	if d := r.run("rm", ControlRequest{Kind: "delete_image", ImageID: img}); d.Status != "failed" {
 		t.Fatal(d)
@@ -123,6 +126,7 @@ func TestCommonImageDeletingVisibleToCreatorOnlyAndNotBootable(t *testing.T) {
 }
 
 func TestSystemImageProtectedAndNotDeletable(t *testing.T) {
+	t.Parallel()
 	r, _ := commonRig(t)
 	got, ok := r.image(11, "ubuntu")
 	if !ok || !got.Shared || got.CanDelete {
@@ -134,6 +138,7 @@ func TestSystemImageProtectedAndNotDeletable(t *testing.T) {
 }
 
 func TestCommonImageNamesReservedGloballyForNewCommits(t *testing.T) {
+	t.Parallel()
 	r, _ := commonRig(t)
 	src := r.sourceVM()
 	b := r.runAs(22, "b-create", ControlRequest{Kind: "create", ImageID: "ubuntu", Name: "b-src"})
@@ -157,6 +162,7 @@ func TestCommonImageNamesReservedGloballyForNewCommits(t *testing.T) {
 }
 
 func TestCommonImageNameRaceHasOneWinner(t *testing.T) {
+	t.Parallel()
 	r, _ := commonRig(t)
 	a := r.runAs(22, "b-create", ControlRequest{Kind: "create", ImageID: "ubuntu", Name: "b-src"})
 	r.runAs(22, "b-stop", ControlRequest{Kind: "stop", VMID: a.VMID})
@@ -190,14 +196,15 @@ func TestCommonImageNameRaceHasOneWinner(t *testing.T) {
 }
 
 func TestLegacyPrivateImageBecomesCommonPreservingIdentity(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir() + "/state"
 	svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
 	r := newImgRig(t, dir, svc, 0)
 	img := r.derivedImage()
 	before := r.st.Snapshot().Images
-	r.st.Close()
+	r.close()
 	r2 := newImgRig(t, dir, svc, 0)
-	defer r2.st.Close()
+	defer r2.close()
 	after := r2.st.Snapshot().Images
 	if len(after) != 1 || after[0] != before[0] || after[0].Shared {
 		t.Fatalf("stored record changed: %+v -> %+v", before, after)
@@ -209,6 +216,7 @@ func TestLegacyPrivateImageBecomesCommonPreservingIdentity(t *testing.T) {
 }
 
 func TestLegacyDuplicateNamesRemainListedWithStableIDs(t *testing.T) {
+	t.Parallel()
 	r, _ := commonRig(t)
 	if e := r.st.Update(func(s *State) {
 		s.Images = append(s.Images, ControlImage{ID: "img-legacydup", Name: "derived", OwnerUserID: 22, Phase: "ready"})

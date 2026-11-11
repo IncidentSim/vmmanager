@@ -87,6 +87,13 @@ components:
           type: string
           enum: [creating, active, stopping, stopped, committing, committed, deleting]
         resources: {$ref: "#/components/schemas/Resources"}
+        owner_error:
+          type: boolean
+          description: >-
+            Additive; present (true) only when the VM's durable owner workflow ended
+            abnormally. The VM and its quota slot are retained and new commands for it
+            return 503. `phase` is the lifecycle applied by the owner; accepting a
+            request never changes it.
     CreateVM:
       type: object
       additionalProperties: false
@@ -260,9 +267,10 @@ paths:
         default: {$ref: "#/components/responses/Error"}
     delete:
       parameters: [{$ref: "#/components/parameters/idempotency"}]
+      summary: Sequential delete. Accepted while another command runs, but executed only after it (and nothing admitted before it) has finished; never preempts and does not revoke access at acceptance.
       responses:
         "202":
-          description: Accepted.
+          description: Accepted (durably delivered to the VM's owner; not yet processed).
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Accepted"}

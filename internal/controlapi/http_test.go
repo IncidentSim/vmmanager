@@ -116,12 +116,22 @@ func TestAuthenticatedHTTPContract(t *testing.T) {
 	if code != 200 || b["status"] != "succeeded" {
 		t.Fatalf("poll %d %v", code, b)
 	}
-	code, _ = call(t, s, "POST", "/v1/vms/"+vm+"/stop", "one", "stop-1", `{}`, "")
+	code, sb := call(t, s, "POST", "/v1/vms/"+vm+"/stop", "one", "stop-1", `{}`, "")
 	if code != 202 {
 		t.Fatal(code)
 	}
+	// Sequential owner semantics (docs/rfc-vm-owner.md): admission does not revoke
+	// access; the terminal is fenced once the Stop actually executed.
+	stopOp := sb["operation_id"].(string)
+	until = time.Now().Add(5 * time.Second)
+	for time.Now().Before(until) {
+		if o, _ := c.ControlOperation(11, stopOp); o.Status == "succeeded" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if _, e := c.ControlTerminalURL(11, vm); e == nil {
-		t.Fatal("stop must fence terminal before enqueue")
+		t.Fatal("terminal must be fenced after the stop executed")
 	}
 	code, _ = call(t, s, "DELETE", "/v1/vms/"+vm, "two", "evil", "", "")
 	if code != 404 {

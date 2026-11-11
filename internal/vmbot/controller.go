@@ -94,6 +94,13 @@ type Controller struct {
 	term       Terminals
 	cfg        ControllerConfig
 
+	// testBeforeProject is a test seam called at the start of the projection step
+	// (after the child completed, before the outcome is written). Nil in production.
+	testBeforeProject func(OwnerCmd)
+
+	// rebuild holds the VM IDs whose terminal is rebuilt once after Start.
+	rebuild sync.Map
+
 	eng      *engine
 	engMu    sync.RWMutex
 	startMu  sync.Mutex

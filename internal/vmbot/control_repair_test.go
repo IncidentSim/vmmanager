@@ -2,68 +2,48 @@ package vmbot
 
 import (
 	"context"
-	"github.com/dbos-inc/dbos-transact-golang/dbos"
-	"github.com/petruekhin/vibe-firecracker/vmlib"
-	"github.com/petruekhin/vibe-firecracker/vmlib/vmlibtest"
 	"testing"
-	"time"
+
+	"github.com/petruekhin/vibe-firecracker/vmlib"
 )
 
-func TestControlTerminalWorkflowErrorRepair(t *testing.T) {
+// An unexpected failure of the Create child (here a panic inside the effect,
+// before or after the VM came into existence) is an operation outcome: the
+// operation fails, the record is retained, the owner stays usable and nothing
+// recreates the VM. An explicit Delete then settles it.
+func TestControlChildFailureIsOutcomeNotRepair(t *testing.T) {
 	for _, exists := range []bool{false, true} {
 		t.Run(map[bool]string{false: "before", true: "after"}[exists], func(t *testing.T) {
-			st, e := OpenControlStore(t.TempDir()+"/state", 0)
-			if e != nil {
-				t.Fatal(e)
-			}
-			defer st.Close()
-			svc, _ := vmlib.NewService(vmlibtest.New(3, "ubuntu"))
-			lc := &hookLC{Lifecycle: svc}
+			t.Parallel()
+			e := newOwnerEnv(t)
 			creates := 0
-			lc.create = func(ctx context.Context, r vmlib.CreateRequest) (vmlib.VM, error) {
+			e.ctl.lc = &hookLC{Lifecycle: e.svc, create: func(ctx context.Context, r vmlib.CreateRequest) (vmlib.VM, error) {
 				creates++
 				if exists {
-					svc.Create(ctx, r)
+					e.svc.Create(ctx, r)
 				}
 				panic("injected durable workflow failure")
+			}}
+			o := e.accept("create", ControlRequest{Kind: "create", ImageID: "ubuntu"})
+			got := awaitControl(t, e.ctl, ownerUser, o.ID)
+			if got.Status != "failed" {
+				t.Fatalf("want failed outcome, got %+v", got)
 			}
-			c := NewController(lc, st, &controlTerms{}, ControllerConfig{Profile: "small"})
-			c.ConfigureControl(ControlPolicy{AllowedUsers: []int64{11}, SharedImages: []string{"ubuntu"}, MaxVMs: 2, MaxVMsPerUser: 1})
-			if e = c.Start(context.Background()); e != nil {
-				t.Fatal(e)
+			if st := e.ownerStatus(o.VMID); st != "PENDING" {
+				t.Fatalf("owner must survive a child failure, status %s", st)
 			}
-			defer c.Close()
-			o, e := c.AcceptControl(11, "create", ControlRequest{Kind: "create", ImageID: "ubuntu"})
-			if e != nil {
-				t.Fatal(e)
+			if _, err := e.ctl.ControlVM(ownerUser, o.VMID); err != nil {
+				t.Fatal("record must be retained")
 			}
-			end := time.Now().Add(3 * time.Second)
-			for time.Now().Before(end) {
-				_, status := c.lookup("control-" + o.ID)
-				if status != nil && status.Status == dbos.WorkflowStatusError {
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
+			if err := e.ctl.RecoverControl(); err != nil || creates != 1 {
+				t.Fatalf("recovery recreated or failed: %v creates=%d", err, creates)
 			}
-			lc.create = func(context.Context, vmlib.CreateRequest) (vmlib.VM, error) {
-				creates++
-				return vmlib.VM{}, vmlib.ErrAlreadyExists
+			d := e.accept("delete", ControlRequest{Kind: "delete", VMID: o.VMID})
+			if got := awaitControl(t, e.ctl, ownerUser, d.ID); got.Status != "succeeded" {
+				t.Fatalf("explicit delete %+v", got)
 			}
-			if e = c.RecoverControl(); e != nil {
-				t.Fatal(e)
-			}
-			got := awaitControl(t, c, 11, o.ID)
-			if got.Status == "running" || got.Status == "pending" {
-				t.Fatal("stranded workflow")
-			}
-			if creates != 1 {
-				t.Fatal("repair recreated VM")
-			}
-			if exists && got.Status != "succeeded" {
-				t.Fatalf("not adopted %+v", got)
-			}
-			if !exists && len(st.Snapshot().VMs) != 0 {
-				t.Fatal("absence barrier failed")
+			if len(e.st.Snapshot().VMs) != 0 {
+				t.Fatal("record not released after confirmed delete")
 			}
 		})
 	}

@@ -35,7 +35,17 @@ func TestControlProcessWorker(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer c.Close()
-	if mode == "recover" {
+	if mode == "stop-before-projection" {
+		// The child has completed (its result is checkpointed); die before the
+		// owner writes the outcome.
+		c.testBeforeProject = func(cmd OwnerCmd) {
+			if cmd.Kind == "stop" {
+				lc.marker("effect")
+				select {}
+			}
+		}
+	}
+	if mode == "recover" || mode == "recover-stop" {
 		if e = c.RecoverControl(); e != nil {
 			t.Fatal(e)
 		}
@@ -45,6 +55,17 @@ func TestControlProcessWorker(t *testing.T) {
 				if got.Status != "succeeded" {
 					t.Fatalf("recovered %+v", got)
 				}
+			}
+		}
+		if mode == "recover-stop" {
+			// The idle owner that survived the kill must still take a command.
+			vm := st.Snapshot().VMs[0]
+			stop, e := c.AcceptControl(11, "post-restart-stop", ControlRequest{Kind: "stop", VMID: vm.ID})
+			if e != nil {
+				t.Fatal(e)
+			}
+			if got := awaitControl(t, c, 11, stop.ID); got.Status != "succeeded" {
+				t.Fatalf("post-restart stop %+v", got)
 			}
 		}
 		return
@@ -63,10 +84,20 @@ func TestControlProcessWorker(t *testing.T) {
 		}
 		select {}
 	}
+	switch mode {
+	case "idle-owner":
+		lc.marker("effect")
+		select {}
+	case "stop-effect", "stop-before-projection":
+		if _, e = c.AcceptControl(11, "stable-stop", ControlRequest{Kind: "stop", VMID: create.VMID}); e != nil {
+			t.Fatal(e)
+		}
+		select {}
+	}
 	t.Fatal("unknown child mode")
 }
 func TestControlRealKillRecovery(t *testing.T) {
-	for _, mode := range []string{"enqueue-gap", "create-effect", "delete-intent", "delete-effect"} {
+	for _, mode := range []string{"enqueue-gap", "create-effect", "delete-intent", "delete-effect", "idle-owner", "stop-effect", "stop-before-projection"} {
 		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
 			if e := os.Mkdir(filepath.Join(root, "remote"), 0700); e != nil {
@@ -99,7 +130,11 @@ func TestControlRealKillRecovery(t *testing.T) {
 			if e := cmd.Wait(); e == nil {
 				t.Fatal("expected SIGKILL")
 			}
-			if out, e := child("recover").CombinedOutput(); e != nil {
+			recoverMode := "recover"
+			if mode == "idle-owner" {
+				recoverMode = "recover-stop"
+			}
+			if out, e := child(recoverMode).CombinedOutput(); e != nil {
 				t.Fatalf("restart: %v %s", e, out)
 			}
 			st, e := OpenControlStore(filepath.Join(root, "state"), 0)
@@ -125,6 +160,24 @@ func TestControlRealKillRecovery(t *testing.T) {
 				}
 			} else if len(st.Snapshot().VMs) != 1 {
 				t.Fatal("lost VM")
+			}
+			// Raw effect invocations are not exactly-once (DBOS recovery may rerun an
+			// effect whose checkpoint was lost); a completed child is never rerun.
+			stops, _ := os.ReadFile(filepath.Join(root, "stops"))
+			n := len(strings.Fields(string(stops)))
+			switch mode {
+			case "stop-effect":
+				if n < 1 || n > 2 || st.Snapshot().VMs[0].Phase != "stopped" {
+					t.Fatalf("stop-effect: raw stops=%d phase=%s", n, st.Snapshot().VMs[0].Phase)
+				}
+			case "stop-before-projection":
+				if n != 1 || st.Snapshot().VMs[0].Phase != "stopped" {
+					t.Fatalf("completed child was rerun or outcome lost: stops=%d phase=%s", n, st.Snapshot().VMs[0].Phase)
+				}
+			case "idle-owner":
+				if n != 1 || st.Snapshot().VMs[0].Phase != "stopped" {
+					t.Fatalf("idle owner after restart: stops=%d phase=%s", n, st.Snapshot().VMs[0].Phase)
+				}
 			}
 		})
 	}

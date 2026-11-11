@@ -10,6 +10,7 @@ import (
 )
 
 func TestControlDurableAdmission(t *testing.T) {
+	t.Parallel()
 	st, e := OpenControlStore(t.TempDir()+"/state", 0)
 	if e != nil {
 		t.Fatal(e)
@@ -75,6 +76,7 @@ var _ = vmlib.ErrNotFound
 // A backend policy refusal after durable admission must surface as a stable,
 // safe operation error code, not a blanket "unavailable".
 func TestControlOperationErrorCodeForBackendRefusal(t *testing.T) {
+	t.Parallel()
 	st, e := OpenControlStore(t.TempDir()+"/state", 0)
 	if e != nil {
 		t.Fatal(e)
