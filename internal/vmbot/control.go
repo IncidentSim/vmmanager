@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/petruekhin/vibe-firecracker/vmlib"
@@ -320,11 +321,45 @@ func (c *Controller) ControlTerminalURL(u int64, id string) (string, error) {
 	}
 	return c.cfg.PublicOrigin + "/t/" + r.Token + "/", nil
 }
+
+// ControlSSH returns metadata even when readiness cannot be established. Ready
+// is a fresh, host-side TCP observation, not authenticated SSH or client routing
+// proof. This read never invokes the polling WaitSSHReady lifecycle operation.
 func (c *Controller) ControlSSH(ctx context.Context, u int64, id string) (vmlib.SSHInfo, error) {
 	if _, e := c.ControlVM(u, id); e != nil {
 		return vmlib.SSHInfo{}, e
 	}
-	return c.lc.SSHInfo(ctx, id)
+	// Unlike detached workflow queries, HTTP reads honor caller cancellation.
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.QueryTimeout)
+	defer cancel()
+	info, err := c.lc.SSHInfo(ctx, id)
+	if err != nil {
+		return vmlib.SSHInfo{}, err
+	}
+	info.Ready = false // never forward a stale backend readiness bit
+	active := func() bool {
+		v, err := c.ControlVM(u, id)
+		return err == nil && v.Phase == PhaseActive
+	}
+	if !active() || info.Host == "" || info.Port <= 0 || info.Port > 65535 {
+		return info, nil
+	}
+	// Bound the entire observation (state checks and one TCP connection), rather
+	// than polling until guest boot. The parent deadline may be shorter.
+	probeCtx, probeCancel := context.WithTimeout(ctx, time.Second)
+	defer probeCancel()
+	vm, err := c.lc.Get(probeCtx, id)
+	if err != nil || vm.State != vmlib.StateRunning || !active() {
+		return info, nil
+	}
+	if vmlib.TCPProber(probeCtx, info) != nil {
+		return info, nil
+	}
+	// A stop/delete may have won while the network call was in flight. Do not
+	// publish a successful probe from before a completed lifecycle transition.
+	vm, err = c.lc.Get(probeCtx, id)
+	info.Ready = err == nil && vm.State == vmlib.StateRunning && probeCtx.Err() == nil && active()
+	return info, nil
 }
 
 // AcceptControl atomically reserves identities, quota, image publication and

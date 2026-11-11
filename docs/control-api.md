@@ -88,6 +88,34 @@ a `failed` operation carries `error:{code,message}` with a fixed safe message
 (`operation not confirmed`) and one of `unavailable|conflict|capacity|invalid_argument`.
 Terminal result when succeeded: `{"result":{"url":"https://…/t/<capability>/"}}`.
 
+### SSH readiness
+
+`GET /v1/vms/{id}/ssh` keeps connection metadata accessible while the guest
+boots or is unreachable: a readiness failure returns **200** with `ready:false`,
+not an error or a wait-until-ready operation. Failure to retrieve the metadata
+itself still uses the normal error envelope. Foreign/absent VM IDs return 404
+before any lifecycle access or network probe.
+
+`ready:true` means a **fresh TCP connection from the API host** to the returned
+`host:port` succeeded while the API phase was `active` and the live backend VM
+was `running`. Live state is checked before and after that connection, and the
+durable phase is rechecked to fence stop/delete intent. Non-active phases
+(including `stopping`, `stopped`, `committing`, `committed`, `deleting`), missing
+host/port, missing/unavailable/stopped backend state, failed connection and probe
+timeout all yield `false`. The API ignores any stale readiness bit in metadata.
+This is a point-in-time observation, not a guarantee for a later connection.
+
+There is one connection attempt, no boot/readiness polling. The complete
+readiness observation, including backend state checks, gets at most **one
+second** after metadata retrieval and cannot exceed the remaining request/query
+deadline. The whole read honors caller cancellation and the controller's query
+timeout (default **20 seconds**). No lifecycle lock is held while probing.
+
+This does **not** authenticate SSH, verify a host key, test the bastion, or prove
+that a laptop can route to the guest. Consumers requiring authenticated or
+end-to-end readiness must establish their own SSH connection (using the returned
+bastion metadata when needed). No guest credentials are issued by this GET.
+
 ### Status codes and error envelope
 
 `{"error":{"code":"…","message":"…"}}`; messages are fixed safe text that never

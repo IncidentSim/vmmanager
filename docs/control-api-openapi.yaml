@@ -140,7 +140,18 @@ components:
             port: {type: integer}
             user: {type: string}
         host_key_fingerprint: {type: string}
-        ready: {type: boolean}
+        ready:
+          type: boolean
+          description: >-
+            Fresh TCP reachability from the API host to host:port, not SSH
+            authentication, host-key verification, bastion connectivity or
+            off-host client reachability. True only for an active API VM whose
+            live backend state is running before and after one successful TCP
+            probe. The complete readiness observation is bounded to one second
+            and by the remaining query/request deadline; it never waits for boot.
+            False for missing endpoint data, unavailable/stopped backend state,
+            non-active phases (including stopping/deleting), connection failure
+            or timeout. Metadata remains available with ready=false.
         auth_mode: {type: string}
         key_reference: {type: string}
     Operation:
@@ -305,9 +316,17 @@ paths:
   /v1/vms/{id}/ssh:
     parameters: [{$ref: "#/components/parameters/id"}, {$ref: "#/components/parameters/acting"}]
     get:
+      description: >-
+        Owner-only SSH metadata with a bounded live readiness observation.
+        Ownership is checked before metadata/backend access or any network probe.
+        A not-yet-ready guest still returns 200 with ready=false when metadata
+        is available. Metadata lookup failure uses the normal error envelope.
+        The whole read honors request cancellation and the controller query
+        timeout (default 20 seconds); readiness gets at most one second of that
+        budget and does not poll until SSH starts.
       responses:
         "200":
-          description: Public connection metadata only.
+          description: Public connection metadata and current host-side TCP readiness.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/SSH"}
