@@ -42,6 +42,9 @@ func TestPrepareLinkURLUserSessionNotAdminAndReused(t *testing.T) {
 	if u.Query().Get("sidebarCollapsed") != "true" || u.Query().Has("fullscreen") {
 		t.Fatal("expected collapsed sidebar without forced fullscreen")
 	}
+	if u.Query().Get("splitLeft") != "sftp" || u.Query().Get("splitRatio") != "40" {
+		t.Fatal("expected SFTP left 40 percent")
+	}
 	if u.Query().Get("splitMode") != "true" {
 		t.Fatal("expected splitMode=true")
 	}

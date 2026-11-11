@@ -594,7 +594,7 @@ func (m *Manager) PrepareLink(ctx context.Context, owner int64, vmID string) (Se
 }
 
 func (m *Manager) linkURL(tok string, entry int64) Secret {
-	return Secret(strings.TrimRight(m.cfg.URL, "/") + "/servers?token=" + url.QueryEscape(tok) + "&connectId=" + strconv.FormatInt(entry, 10) + "&connectFtpId=" + strconv.FormatInt(entry, 10) + "&splitMode=true&sidebarCollapsed=true")
+	return Secret(strings.TrimRight(m.cfg.URL, "/") + "/servers?token=" + url.QueryEscape(tok) + "&connectId=" + strconv.FormatInt(entry, 10) + "&connectFtpId=" + strconv.FormatInt(entry, 10) + "&splitMode=true&splitLeft=sftp&splitRatio=40&sidebarCollapsed=true")
 }
 
 // ErrUnsupported: the VM uses an owner-supplied SSH key, so no browser entry
