@@ -1,7 +1,7 @@
 // Package vmhelper is the narrow privilege boundary between the unprivileged
 // vmapi and the root-owned systemd units of a slot. It defines a one-line
 // protocol ("start-slot N CPU_MILLI"), the strict pool configuration shared by
-// the helper, the network script and vmapi, and a handler that can only set the
+// the helper, the network tool and vmapi, and a handler that can only set the
 // CPU quota of, and then start, an idle firecracker-vm@N.service. CPU_MILLI is
 // the VMM's CPU-time ceiling in thousandths of a CPU (500 = 50% of one CPU); it
 // is mandatory, so no slot can start with an unspecified quota. There is
@@ -154,7 +154,7 @@ func ParsePool(data []byte) (Pool, error) {
 }
 
 // ValidatePublicIPv4 requires canonical IPv4 outside the helper's denied
-// special/private ranges. Keep this list equal to fc-vm-network.sh's blocked.
+// special/private ranges. Keep this list equal to vmnet.Blocked (asserted by a test in internal/vmnet).
 func ValidatePublicIPv4(s string) error {
 	a, err := netip.ParseAddr(s)
 	if err != nil || !a.Is4() || a.String() != s {

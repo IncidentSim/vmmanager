@@ -10,3 +10,4 @@ recordings/
 __pycache__/
 .tools/
 
+/bin/

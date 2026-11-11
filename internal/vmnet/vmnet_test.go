@@ -718,6 +718,24 @@ func TestExplicitConntrackFlushScopesOriginalTuple(t *testing.T) {
 	}
 }
 
+// Blocked must stay equal to the set vmhelper.ValidatePublicIPv4 rejects, so a
+// public address accepted by pool.conf can never be a destination the tool blocks.
+func TestBlockedMatchesPublicAddressValidation(t *testing.T) {
+	for a := 0; a < 256; a++ {
+		for _, tail := range []string{"0.0.1", "64.0.1", "128.0.1", "255.255.254"} {
+			addr := fmt.Sprintf("%d.%s", a, tail)
+			ip := netip.MustParseAddr(addr)
+			blocked := false
+			for _, c := range Blocked {
+				blocked = blocked || netip.MustParsePrefix(c).Contains(ip)
+			}
+			if rejected := vmhelper.ValidatePublicIPv4(addr) != nil; rejected != blocked {
+				t.Errorf("%s: validation rejects=%v, Blocked contains=%v", addr, rejected, blocked)
+			}
+		}
+	}
+}
+
 // The tool may only ever touch its own interface and tagged rules: it contains
 // no route mutation, no global flush and no foreign interface name.
 func TestSourceOnlyTouchesOwnedObjects(t *testing.T) {

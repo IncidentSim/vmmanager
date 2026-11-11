@@ -3,6 +3,7 @@
 //	vmhost manifest      print the files that would be installed (changes nothing)
 //	vmhost install       place binaries, units, tmpfiles and examples (files only)
 //	vmhost uninstall     remove exactly the files recorded by install
+//	vmhost stage-check   root-free install/uninstall round trip into a temporary root
 //	vmhost verify-units  render units and run systemd-analyze against them
 //	vmhost preflight     read-only host readiness report
 //	vmhost setup         create empty jail/work/images directories (needs --apply)
@@ -18,9 +19,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"syscall"
 
 	"github.com/petruekhin/vibe-firecracker/internal/hostinstall"
@@ -78,7 +81,7 @@ func defaultGroup() string {
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: vmhost manifest|install|uninstall|verify-units|preflight|setup|enable [flags]")
+		return errors.New("usage: vmhost manifest|install|uninstall|stage-check|verify-units|preflight|setup|enable [flags]")
 	}
 	cmd := args[0]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
@@ -124,6 +127,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if len(rep.Kept) > 0 {
 			return errors.New("some modified files were kept; rerun with --force to remove them")
 		}
+	case "stage-check":
+		return stageCheck(c.Options, stdout)
 	case "verify-units":
 		plan, err := c.Plan()
 		if err != nil {
@@ -154,5 +159,54 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
+	return nil
+}
+
+// stageCheck installs into a throwaway DESTDIR, verifies exact modes and
+// hashes, uninstalls, and requires the root to be empty again. It needs no
+// privilege and touches nothing outside the temporary directory.
+func stageCheck(o hostinstall.Options, out io.Writer) error {
+	dir, err := os.MkdirTemp("", "vmhost-stage-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	o.DestDir = dir
+	m, err := hostinstall.Install(o)
+	if err != nil {
+		return fmt.Errorf("staged install: %w", err)
+	}
+	for _, f := range m.Files {
+		fi, err := os.Stat(filepath.Join(dir, f.Path))
+		if err != nil {
+			return err
+		}
+		if got := fmt.Sprintf("%04o", uint32(fi.Mode().Perm())); got != f.Mode {
+			return fmt.Errorf("%s: mode %s, manifest %s", f.Path, got, f.Mode)
+		}
+	}
+	rep, err := hostinstall.Uninstall(o)
+	if err != nil {
+		return fmt.Errorf("staged uninstall: %w", err)
+	}
+	if len(rep.Removed) != len(m.Files) || len(rep.Kept) != 0 {
+		return fmt.Errorf("uninstall removed %d of %d files", len(rep.Removed), len(m.Files))
+	}
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range left {
+		// only directories created by the install may remain; none may hold files
+		if err := filepath.WalkDir(filepath.Join(dir, e.Name()), func(p string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				return fmt.Errorf("left behind: %s", p)
+			}
+			return err
+		}); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(out, "stage-check ok: %d files installed with exact modes, then removed; no files left\n", len(m.Files))
 	return nil
 }
