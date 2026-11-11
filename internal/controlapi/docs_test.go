@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/petruekhin/vibe-firecracker/docs"
+	"gopkg.in/yaml.v2"
 )
 
 func getDoc(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
@@ -169,5 +170,43 @@ func TestOpenAPISpecIsServedAndDescribesJWTAndSameOrigin(t *testing.T) {
 	// No operation but healthz and docs is public.
 	if got := strings.Count(spec, "security: []"); got != 1 {
 		t.Errorf("exactly the health endpoint is public, found %d", got)
+	}
+}
+
+func TestOpenAPINameConstraintsMatchLabelValidation(t *testing.T) {
+	var parsed map[string]interface{}
+	if err := yaml.UnmarshalStrict(docs.OpenAPI, &parsed); err != nil {
+		t.Fatalf("invalid OpenAPI YAML: %v", err)
+	}
+	if parsed["openapi"] != "3.0.3" {
+		t.Fatalf("unexpected OpenAPI version: %v", parsed["openapi"])
+	}
+	spec := string(docs.OpenAPI)
+	// vmbot.ValidateLabel: ^[a-z]([a-z0-9-]{0,18}[a-z0-9])?$, no "bot-" prefix,
+	// exact match (no trimming or case folding), 1-20 characters.
+	const pattern = `pattern: '^(?!bot-)[a-z]([a-z0-9-]{0,18}[a-z0-9])?$'`
+	for _, schema := range []string{"CreateVM", "Name"} {
+		m := regexp.MustCompile(`(?s)\n    ` + schema + `:\n(.*?)\n    [A-Za-z]+:\n`).FindStringSubmatch(spec)
+		if m == nil {
+			t.Fatalf("schema %s not found", schema)
+		}
+		i := strings.Index(m[1], "        name:")
+		if i < 0 {
+			t.Fatalf("%s.name not found", schema)
+		}
+		prop := m[1][i:]
+		if loc := regexp.MustCompile(`\n {8}[^ ]`).FindStringIndex(prop); loc != nil {
+			prop = prop[:loc[0]]
+		}
+		minLength, expectedPattern := "minLength: 1", pattern
+		if schema == "CreateVM" {
+			minLength = "minLength: 0"
+			expectedPattern = `pattern: '^(?!bot-)([a-z]([a-z0-9-]{0,18}[a-z0-9])?)?$'`
+		}
+		for _, want := range []string{minLength, "maxLength: 20", expectedPattern} {
+			if !strings.Contains(prop, want) {
+				t.Errorf("%s.name lacks %q: %s", schema, want, prop)
+			}
+		}
 	}
 }

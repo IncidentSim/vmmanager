@@ -99,7 +99,12 @@ components:
       additionalProperties: false
       required: [image_id]
       properties:
-        name: {type: string}
+        name:
+          type: string
+          minLength: 0
+          maxLength: 20
+          pattern: '^(?!bot-)([a-z]([a-z0-9-]{0,18}[a-z0-9])?)?$'
+          description: Optional label, unique per owner. Non-empty labels use 1-20 characters - lowercase ASCII letters, digits and inner hyphens, starting with a letter, ending with a letter or digit, not starting with `bot-`. Matched exactly (no trimming or case folding). Omit it or send an empty string to leave the VM unnamed.
         image_id: {type: string}
         resources: {$ref: "#/components/schemas/Resources"}
         ssh_public_key:
@@ -110,7 +115,12 @@ components:
       additionalProperties: false
       required: [name]
       properties:
-        name: {type: string}
+        name:
+          type: string
+          minLength: 1
+          maxLength: 20
+          pattern: '^(?!bot-)[a-z]([a-z0-9-]{0,18}[a-z0-9])?$'
+          description: Required, globally unused image name. Same format as a VM name - 1-20 characters, lowercase ASCII letters, digits and inner hyphens, starting with a letter, ending with a letter or digit, not starting with `bot-`. Matched exactly (no trimming or case folding).
     Empty:
       type: object
       additionalProperties: false
