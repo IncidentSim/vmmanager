@@ -10,7 +10,7 @@ BUILD_DIR ?= .
 IMAGE ?= images/ubuntu-postgres.ext4
 FC_SOCKET ?= /run/firecracker-builder/main.sock
 
-.PHONY: build remote-client test vet check shell-syntax run verify demo consumer-smoke verify-units vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi control-build control-smoke no-grpc-check
+.PHONY: build remote-client test vet check shell-syntax run verify demo consumer-smoke verify-units vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi control-build control-smoke no-grpc-check e2e-live
 
 build:
 	mkdir -p "$(BUILD_DIR)"
@@ -59,6 +59,14 @@ consumer-smoke:
 # Real systemd-analyze on rendered copies of the proposed units (nothing installed).
 verify-units:
 	bash scripts/verify-units.sh
+
+# Opt-in live E2E against a REAL deployed vmapi (creates and deletes real VMs and
+# images owned by the configured user). Not run by `check`; without
+# VMAPI_E2E=1 this target refuses to run. Required env and
+# evidence boundary: docs/e2e-live.md.
+e2e-live:
+	@test "$$VMAPI_E2E" = 1 || { echo "e2e-live: set VMAPI_E2E=1 and the VMAPI_E2E_* variables (see docs/e2e-live.md)" >&2; exit 2; }
+	$(GO) test -count=1 -p 1 -timeout 45m -v ./e2e
 
 check: test vet shell-syntax control-build no-grpc-check consumer-smoke verify-units
 
