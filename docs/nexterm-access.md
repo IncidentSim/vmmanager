@@ -37,6 +37,28 @@ as ordinary copyable messages (not protected content). No additional
 login/password message is sent. Pending tells the owner to retry `/terminal`;
 there is no unsolicited credential notification later.
 
+## Built-in monitoring lifecycle
+
+Managed SSH entries explicitly set `config.monitoringEnabled: true` at creation.
+For an existing ready binding, the next normal `PrepareLink` request (including
+an owner's `/ssh`, `/terminal` or Terminal button through the API) repairs a
+missing/false flag on **only its recorded entry ID**. Resumed provisioning also
+repairs the flag after verifying the recorded SSH endpoint and identity.
+`Ensure` alone short-circuits already-ready bindings; background reconciliation
+is not a monitoring migration or global backfill.
+
+Repair runs as the exact recorded ordinary Nexterm account, after VM ownership
+and liveness and account/entry/identity checks. It uses
+`PATCH /api/entries/{entryId}` with the existing local `config`, its SSH protocol
+and `monitoringEnabled: true`, then requires a matching GET readback. Other
+configuration and identity links are preserved; an already-enabled entry causes
+no write. A stored valid link session is reused even across repair retries; no
+global logout, monitoring settings change or admin permission expansion occurs.
+A failed or unverifiable repair withholds the browser link without replacing the
+binding or affecting raw SSH. No live backfill was performed by source tests.
+Nexterm's global monitoring service settings and guest reachability still govern
+actual metric collection; enabling an entry alone is not evidence of live data.
+
 ## Activation configuration (operator action, not deployment performed here)
 
 Put this section in **vmapi** JSON, not vmbot JSON. Complete fragment example:

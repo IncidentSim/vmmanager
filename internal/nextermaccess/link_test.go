@@ -39,6 +39,12 @@ func TestPrepareLinkURLUserSessionNotAdminAndReused(t *testing.T) {
 		t.Fatalf("bad link shape %v", e)
 	}
 	tok, conn := u.Query().Get("token"), u.Query().Get("connectId")
+	if u.Query().Get("sidebarCollapsed") != "true" || u.Query().Has("fullscreen") {
+		t.Fatal("expected collapsed sidebar without forced fullscreen")
+	}
+	if u.Query().Get("splitMode") != "true" {
+		t.Fatal("expected splitMode=true")
+	}
 	if ftp := u.Query().Get("connectFtpId"); ftp != conn || ftp == "" {
 		t.Fatalf("connectFtpId %q must equal connectId %q", ftp, conn)
 	}

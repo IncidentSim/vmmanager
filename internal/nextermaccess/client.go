@@ -326,11 +326,13 @@ func (c *Client) DeleteIdentity(ctx context.Context, tok string, id int64) error
 }
 
 type Entry struct {
-	ID         int64
-	Name       string
-	IP, Port   string
-	Protocol   string
-	Identities []int64
+	ID                int64
+	Name              string
+	IP, Port          string
+	Protocol          string
+	Identities        []int64
+	MonitoringEnabled bool
+	config            map[string]any // local config when available; PATCH replaces the JSON column
 }
 
 func str(v any) string {
@@ -349,7 +351,11 @@ func entryFrom(m map[string]any) (Entry, bool) {
 	if !ok || !ok2 || id <= 0 {
 		return Entry{}, false
 	}
-	e := Entry{ID: int64(id), Name: str(m["name"]), IP: str(cfg["ip"]), Port: str(cfg["port"]), Protocol: str(cfg["protocol"])}
+	e := Entry{ID: int64(id), Name: str(m["name"]), IP: str(cfg["ip"]), Port: str(cfg["port"]), Protocol: str(cfg["protocol"]), config: cfg}
+	e.MonitoringEnabled, _ = cfg["monitoringEnabled"].(bool)
+	if local, ok := m["localConfig"].(map[string]any); ok {
+		e.config = local
+	}
 	if ids, ok := m["identities"].([]any); ok {
 		for _, i := range ids {
 			if f, ok := i.(float64); ok {
@@ -367,7 +373,7 @@ func (c *Client) GetEntry(ctx context.Context, tok string, id int64) (Entry, err
 		return Entry{}, e
 	}
 	e, ok := entryFrom(m)
-	if !ok {
+	if !ok || e.ID != id {
 		return Entry{}, errors.New("nexterm: invalid entry readback")
 	}
 	return e, nil
@@ -411,7 +417,7 @@ func (c *Client) CreateEntry(ctx context.Context, tok, name, host string, port i
 		ID int64 `json:"id"`
 	}
 	in := map[string]any{"name": name, "type": "server", "identities": []int64{identity},
-		"config": map[string]any{"protocol": "ssh", "ip": host, "port": port}}
+		"config": map[string]any{"protocol": "ssh", "ip": host, "port": port, "monitoringEnabled": true}}
 	if e := c.do(ctx, "PUT", "/api/entries", tok, in, &r); e != nil {
 		return 0, e
 	}
@@ -419,6 +425,28 @@ func (c *Client) CreateEntry(ctx context.Context, tok, name, host string, port i
 		return 0, errors.New("nexterm: entry id missing")
 	}
 	return r.ID, nil
+}
+
+// enableMonitoring updates only the recorded entry's config. Stock editEntry
+// replaces config and requires its protocol, so preserve every local setting.
+func (c *Client) enableMonitoring(ctx context.Context, tok string, en Entry) (Entry, error) {
+	cfg := make(map[string]any, len(en.config)+1)
+	for k, v := range en.config {
+		cfg[k] = v
+	}
+	cfg["protocol"] = en.Protocol
+	cfg["monitoringEnabled"] = true
+	if err := c.do(ctx, "PATCH", "/api/entries/"+strconv.FormatInt(en.ID, 10), tok, map[string]any{"config": cfg}, nil); err != nil {
+		return Entry{}, err
+	}
+	got, err := c.GetEntry(ctx, tok, en.ID)
+	if err != nil {
+		return Entry{}, err
+	}
+	if !got.MonitoringEnabled || got.Protocol != en.Protocol || got.IP != en.IP || got.Port != en.Port {
+		return Entry{}, errors.New("nexterm: monitoring readback mismatch")
+	}
+	return got, nil
 }
 
 func (c *Client) DeleteEntry(ctx context.Context, tok string, id int64) error {

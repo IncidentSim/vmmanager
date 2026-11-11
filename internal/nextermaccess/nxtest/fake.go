@@ -25,19 +25,22 @@ type Identity struct {
 }
 
 type Fake struct {
-	Mu           sync.Mutex
-	Users        map[int64]*User
-	Sessions     map[string]int64 // token -> account
-	SessionID    map[string]int64 // token -> session id
-	NextID       int64
-	FailCreate   bool // PUT /api/users -> 200 {"code":500}
-	BadEntryIP   bool
-	AdminImpers  bool // impersonated ordinary accounts claim isAdmin
-	OmitIsAdmin  bool // /me omits the isAdmin field
-	FailImpers   bool // POST /api/users/{id}/login -> domain error
-	GlobalLogout bool // set when the destructive POST /api/auth/logout is called
-	Identities   map[int64]map[int64]Identity
-	Entries      map[int64]map[int64]map[string]any
+	Mu                sync.Mutex
+	Users             map[int64]*User
+	Sessions          map[string]int64 // token -> account
+	SessionID         map[string]int64 // token -> session id
+	NextID            int64
+	FailCreate        bool // PUT /api/users -> 200 {"code":500}
+	MonitoringUpdates int
+	FailMonitoring    bool
+	IgnoreMonitoring  bool
+	BadEntryIP        bool
+	AdminImpers       bool // impersonated ordinary accounts claim isAdmin
+	OmitIsAdmin       bool // /me omits the isAdmin field
+	FailImpers        bool // POST /api/users/{id}/login -> domain error
+	GlobalLogout      bool // set when the destructive POST /api/auth/logout is called
+	Identities        map[int64]map[int64]Identity
+	Entries           map[int64]map[int64]map[string]any
 }
 
 func New() *Fake {
@@ -203,6 +206,22 @@ func (f *Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.Entries[uid][f.NextID] = map[string]any{"id": f.NextID, "name": body["name"], "config": cfg, "identities": body["identities"]}
 		out(map[string]any{"message": "ok", "id": f.NextID})
+	case strings.HasPrefix(p, "/api/entries/") && r.Method == "PATCH":
+		e := f.Entries[uid][seg(3)]
+		cfg, ok := body["config"].(map[string]any)
+		if e == nil || !ok || cfg["protocol"] != "ssh" || cfg["monitoringEnabled"] != true || len(body) != 1 || f.Users[uid].Admin {
+			dom(400)
+			return
+		}
+		f.MonitoringUpdates++
+		if f.FailMonitoring {
+			dom(500)
+			return
+		}
+		if !f.IgnoreMonitoring {
+			e["config"] = cfg // stock replaces, rather than merges, the JSON config
+		}
+		out(map[string]any{"message": "ok"})
 	case strings.HasPrefix(p, "/api/entries/") && r.Method == "GET":
 		e := f.Entries[uid][seg(3)]
 		if e == nil {

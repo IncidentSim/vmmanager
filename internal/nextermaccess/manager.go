@@ -451,6 +451,36 @@ func (m *Manager) provision(ctx context.Context, rec *Record, vm controlclient.V
 	if en.Protocol != "ssh" || en.IP != ssh.Host || en.Port != itoa(ssh.Port) || !okID {
 		return errors.New("nexterm: entry readback mismatch")
 	}
+	return m.ensureMonitoring(ctx, sess, *rec, en)
+}
+
+// ensureMonitoring runs only after the exact ordinary account and entry have
+// been proved. No listing, global settings, identities or sessions are changed.
+func (m *Manager) ensureMonitoring(ctx context.Context, tok string, rec Record, en Entry) error {
+	matches := func(en Entry) bool {
+		if en.ID != rec.EntryID || en.Protocol != "ssh" || rec.IdentityID <= 0 {
+			return false
+		}
+		for _, id := range en.Identities {
+			if id == rec.IdentityID {
+				return true
+			}
+		}
+		return false
+	}
+	if !matches(en) {
+		return errors.New("nexterm: managed entry mismatch")
+	}
+	if en.MonitoringEnabled {
+		return nil
+	}
+	got, err := m.nx.enableMonitoring(ctx, tok, en)
+	if err != nil {
+		return err
+	}
+	if !matches(got) {
+		return errors.New("nexterm: managed entry readback mismatch")
+	}
 	return nil
 }
 
@@ -518,8 +548,11 @@ func (m *Manager) PrepareLink(ctx context.Context, owner int64, vmID string) (Se
 		if me.ID != rec.UserID || me.Username != rec.Username || me.IsAdmin {
 			return errLinkMismatch
 		}
-		_, e = m.nx.GetEntry(ctx, tok, rec.EntryID)
-		return e
+		en, e := m.nx.GetEntry(ctx, tok, rec.EntryID)
+		if e != nil {
+			return e
+		}
+		return m.ensureMonitoring(ctx, tok, rec, en)
 	}
 	if rec.LinkToken != "" {
 		e := valid(rec.LinkToken)
@@ -561,7 +594,7 @@ func (m *Manager) PrepareLink(ctx context.Context, owner int64, vmID string) (Se
 }
 
 func (m *Manager) linkURL(tok string, entry int64) Secret {
-	return Secret(strings.TrimRight(m.cfg.URL, "/") + "/servers?token=" + url.QueryEscape(tok) + "&connectId=" + strconv.FormatInt(entry, 10) + "&connectFtpId=" + strconv.FormatInt(entry, 10))
+	return Secret(strings.TrimRight(m.cfg.URL, "/") + "/servers?token=" + url.QueryEscape(tok) + "&connectId=" + strconv.FormatInt(entry, 10) + "&connectFtpId=" + strconv.FormatInt(entry, 10) + "&splitMode=true&sidebarCollapsed=true")
 }
 
 // ErrUnsupported: the VM uses an owner-supplied SSH key, so no browser entry
