@@ -43,7 +43,7 @@ type Bot struct {
 	signer    *jwtauth.Signer
 	tokenTTL  time.Duration
 	mu        sync.Mutex
-	names     map[int64]string       // verified bootstrap username of users admitted by username
+	names     map[int64]string // verified bootstrap username of users admitted by username
 }
 
 // apiCallTTL is the lifetime of the short per-request tokens the bot uses for
@@ -617,6 +617,7 @@ func (b *Bot) showOperation(ctx context.Context, u int64, op controlclient.Opera
 	}
 	b.send(ctx, u, text)
 }
+
 // browserLine renders the unified terminal link message. ok=false means "nothing
 // to show" for an absent status, or an invalid URL. The URL is a personal
 // session secret and is never logged.
