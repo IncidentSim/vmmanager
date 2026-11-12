@@ -2,10 +2,10 @@
 
 ## Automated (`make check`, no root, no KVM)
 
-`make check` runs `go test -race -cover ./...`, the Python unit tests (legacy
-verifier/layout/mTLS, `deployment/multivm/test_deploy.py` and the offline integration-script tests), `go vet`, `bash -n`
-on all scripts, `make no-grpc-check` (no application imports of gRPC/protobuf, no
-removed gRPC tree) and the external-consumer/cross-build smoke.
+`make check` runs Go race/coverage tests, vet, format checking, product build,
+exact staged install/uninstall and rendered-unit verification. Go tooling tests
+cover host networking, installation, no-RPC dependencies and external consumers.
+No Python or host Bash script is required.
 
 | Area | Evidence (all with FAKES or loopback, never a real VM) |
 |---|---|
@@ -22,16 +22,16 @@ removed gRPC tree) and the external-consumer/cross-build smoke.
 | Data races | concurrent Get/List/SSHInfo against Stop/Commit/Delete with a delayed receipt under `-race` |
 | Durability, admission | marker-before-image publication, classification survives restart, aggregate memory/vCPU caps, profile vs unit-limit, storage-mount guard before any write |
 | Privilege boundary | one-line protocol validation, pool.conf parsing, idle-unit-only handler (fake `systemctl`), client refusal of anything but `start-slot N` |
-| Network script | collision logic against canned `ip` output: covering/more-specific routes, interface addresses, other slots, default route, bad pool/slot input, root requirement |
+| Go network tool | collision logic against canned `ip` output: covering/more-specific routes, interface addresses, other slots, default route, bad pool/slot input, root requirement |
 | Units | static contracts (no network exec in the jail, Requires/After network unit, Assert*/RequiresMountsFor storage guard, socket mode/group) and `make verify-units` (real `systemd-analyze verify` on rendered copies) |
-| Integration script | offline sequence/admission test with fake HTTP `vmctl`/`ssh`: source is deleted before descendants under `max_vms=2` |
+| Go E2E harness | root-free fixture/admission tracking and cleanup tests; real guest lifecycle requires explicit live opt-in |
 | `vmapi` backend config | strict `backend` loading, stale `facade` rejection, `localcfg` validation and assembly of every policy field; in-process start/stop/restart with lifetime release counted |
 
 ## NOT proven by `make check`
 
 * That a real Firecracker VM boots from a published image, that TAP/NAT work,
   that SSH through `ProxyJump` works, or that `SendCtrlAltDel` ends a real guest.
-* The units, `fc-vm-network.sh` and the helper on a real systemd host.
+* The units, the Go network executable and the helper on a real systemd host.
   `systemd-analyze verify` checks syntax and dependency wiring only; it does not run
   the jail, the `Requires=`/`After=` start/stop order, `AssertPathIsMountPoint`, the
   socket activation or the network script against a real kernel.
@@ -45,14 +45,11 @@ removed gRPC tree) and the external-consumer/cross-build smoke.
 
 ## Operator-run integration (requires approval)
 
-After the operator installs the proposed units/helper and starts `vmapi` (stop any old `vmd` first):
+Use the Go suite with the explicit settings in [e2e-live.md](e2e-live.md), or
+provision a disposable host using [CI/KVM instructions](ci.md).
 
 ```sh
-FC_INTEGRATION_CONFIRM=yes-run-on-real-host \
-FC_URL=https://api.example.com:8443 FC_TOKEN_FILE=$HOME/.config/vmctl/token \
-FC_BASE_IMAGE_ID=ubuntu-base FC_SSH_KEY=$HOME/.ssh/id_ed25519 \
-FC_BASE_IMAGE_PATH=/var/lib/firecracker-vms/images/ubuntu-base.ext4 \
-bash scripts/integration/multi-vm.sh
+VMAPI_E2E=1 make e2e-live # requires the documented VMAPI_E2E_* configuration
 ```
 
 It checks: boot -> SSH -> external mutation -> stop -> commit new image ->
@@ -61,8 +58,7 @@ in one does not affect the other -> distinct addresses -> base hash unchanged.
 The same lifecycle scenario passed on the historical gRPC reference deployment;
 that is not a live test of this rewritten HTTP harness or embedded backend. See
 [live verification report](verification-live.md) for the historical configuration,
-evidence and deployment-discovered fixes. The HTTP migration and every other
-deployment still need their own live run. This two-descendant script requires
+evidence and deployment-discovered fixes. Every changed deployment needs its own live run. Two-descendant tests require
 `max_vms_per_user >= 2` and two free global/backend slots for its principal; do not
 raise production policy or remove another user's VM just to run it. With the
 one-VM-per-user policy, use the sequential migration acceptance described in
@@ -70,7 +66,7 @@ one-VM-per-user policy, use the sequential migration acceptance described in
 
 ## Also verify on the host before trusting resource limits
 
-`systemctl show 'system-firecracker\x2dbuilder.slice' -p CPUQuotaPerSecUSec -p MemoryMax`,
+`systemctl show firecracker-vms.slice -p CPUQuotaPerSecUSec -p MemoryMax`,
 `findmnt` for the work/images mounts with the same `st_dev` as the legacy 20 GiB
 filesystem, and that `max_vms` x profile memory plus VMM overhead fits the shared
 2 GiB budget.

@@ -1,290 +1,105 @@
-# Ubuntu + PostgreSQL image builder
+# vibe-firecracker
 
-## Standalone VM control API
+Self-hosted Firecracker microVM management: HTTP API, Go client/library and an
+optional Telegram frontend. The host runs Linux, systemd and KVM. This is not a
+single-file hypervisor distribution: Firecracker, a compatible guest kernel and
+rootfs, storage and host networking must also be prepared.
 
-`vmapi` owns authenticated VM/image operations, per-user ownership and quotas,
-DBOS/SQLite recovery, and terminal access. The separate `vmbot` process is an
-HTTP client; it does not own VMs or connect to any VM backend.
-Create from an allowed image with CPU/RAM, obtain SSH/terminal access, cold-commit
-into a new common-catalog image, and boot derivatives through the same API.
-See [common image registry](docs/common-image-registry.md) for visibility,
-name uniqueness and managed-image deletion rules.
+## Components
 
-Telegram users may be allowed by username with per-user RS256 tokens (`/token`)
-and a self-hosted Swagger UI on the HTTPS gateway: see
-[username/JWT/Swagger guide](docs/username-jwt-swagger.md).
+- `vmapi`: authenticated VM/image operations, ownership and resource quotas,
+  durable DBOS/SQLite recovery, SSH access and terminal integration. The local
+  Firecracker backend runs in-process; no separate VM RPC daemon is needed.
+- `vmbot`: HTTP-only Telegram client; it does not own the VM lifecycle.
+- `vmctl` / `controlclient`: CLI and Go HTTP client.
+- `vmlib`: public Go lifecycle library for create, SSH metadata, graceful stop,
+  cold disk-image commit, delete and independent derivatives.
+- `vmhost`: Go installer, uninstaller, host preflight/setup and unit verification.
+- `vm-network`, `vm-helper`, `vm-helper-client`, `vm-launcher`: host networking,
+  narrow privileged slot launch, and trusted per-invocation exit receipts.
 
-See [API and migration guide](docs/control-api.md),
-[OpenAPI](docs/control-api-openapi.yaml), [bot-client configuration](docs/bot-api-client.md)
-and [verification evidence and limits](docs/control-api-verification.md).
-Build with `make vmapi vmbot`; run the root/KVM-free executable smoke with
-`make control-smoke`. Source templates are in `deployment/vmapi/` and
-`deployment/vmbot/`; they do not activate services. The legacy builder below
-remains a separate consumer.
+Commit is an offline disk publication after confirmed shutdown, **not** a live
+RAM snapshot. API ownership does not make the underlying trusted-operator host
+backend a hardened multi-tenant boundary.
 
-> **New: `vmlib`, a public Go library for multi-VM lifecycle automation** (create VM
-> from an image, SSH metadata for `ssh -J`/Ansible, graceful stop, offline commit to
-> a new image, independent VMs from it), with a local host backend embedded in the HTTP control API
-> (no VM gRPC plane). See [`docs/architecture.md`](docs/architecture.md),
-> [`docs/ssh-automation.md`](docs/ssh-automation.md), [`docs/verification.md`](docs/verification.md)
-> and [ADR 0007](docs/adr/0007-remove-grpc-vm-plane.md). Deployment templates
-> ([`deployment/multivm`](deployment/multivm/README.md)) do not activate anything;
-> the embedded-backend migration requires the documented exclusive-owner handoff.
-> The separate single-VM service described below is unchanged.
+## Build and checks
 
-Local execution remains Unix-socket-only. An optional HTTPS/mTLS build manager
-runs that same local CLI as an unprivileged child, using server-owned paths.
-The portable remote client never accesses the VMM socket or runs host commands.
-No remote listener is enabled unless `-serve` is selected. For certificate issuance,
-user-service installation and the trust/resource boundaries, see
-[`deployment/remote.md`](deployment/remote.md).
+Use the Go version declared in `go.mod` or newer, Make, and Linux. Root-free
+checks never start a guest or change host services/firewall rules.
 
-Linux x86_64 / KVM image builder. The unprivileged Go client boots a disposable
-Ubuntu ext4 disk, installs PostgreSQL **inside the guest** over SSH, requests a
-clean guest reboot, and publishes the modified filesystem. The output is a
-Firecracker root disk, not an OCI image or a memory snapshot.
-
-## Service deployment contract
-
-An administrator installs, enables and starts the units externally using
-`deployment/` (see its installation instructions). Normal application commands
-below run as **amnezia**, without sudo. The service runs permanently in the
-background, with `Restart=always`, `RestartSec=1`, `RemainAfterExit=no` and
-`RuntimeDirectoryPreserve=restart`. The client only connects to an existing API
-socket: it never starts, stops, restarts or inspects host services. Networking
-is a deployment concern. Do not run `deployment/network.sh` from clients.
-
-- Host API socket: `/run/firecracker-builder/main.sock`, root:amnezia and group
-  writable. This socket is privileged: only trusted local clients may access it.
-- Stable shared workspace: `/var/lib/firecracker-builder/work`, amnezia:amnezia,
-  mode 0770. The jail sees it as `/work`.
-- Fixed host kernel: `/opt/firecracker-builder/vmlinux`; the jail sees
-  `/kernel/vmlinux`. The client neither checks nor opens a local kernel.
-- Working directories use mode 0770; disks use 0660. The root-owned VMM runs
-  with group amnezia and without DAC override, so these group permissions are
-  necessary. Source images and SSH keys need only be readable by the client.
-- One VM/client at a time: every client holds a nonblocking exclusive flock on
-  the stable workspace `.client.lock` inode throughout API preflight, disk copy,
-  guest execution, receipt verification and publication/cleanup.
-
-The root-owned filesystem jail and capability policy are deployment concerns.
-The application never launches Firecracker, uses sudo, or configures host
-networking. This remains a single-tenant example with a trusted guest network,
-static TAP/MAC/IP and demo SSH credentials, not a multi-tenant build platform.
-
-## Build and use
-
-Requirements: installed deployment, Go 1.25+, Make, Python 3, OpenSSH client, coreutils,
-working host KVM, guest Internet access, and sufficient disk space. Prepare a
-matching Ubuntu base rootfs and SSH key in `assets/` using the administrator's
-artifact preparation workflow (`deployment/prepare-ubuntu.sh`); ensure these resulting
-files are accessible to amnezia. Install the matching kernel in the fixed
-service location during deployment.
-
-```bash
+```sh
 make build
-./image-builder -base assets/ubuntu-base.ext4 -ssh-key assets/id_ed25519 \
-  -socket /run/firecracker-builder/main.sock -output images/ubuntu-postgres.ext4
-make run IMAGE=images/ubuntu-postgres.ext4
-```
-
-The builder first checks the existing API with a 2-second timeout and requires
-`Not started` plus a valid per-process invocation ID, before copying the base or
-creating output directories. An offline/busy server fails immediately; start or
-restart it externally as an operator. `-socket` defaults to
-`/run/firecracker-builder/main.sock`; the receipt directory is its parent.
-The builder never changes the base or an existing output. After a successful
-guest reboot and a clean exit receipt for that exact VMM, it copies the working disk
-to a temporary file **in the output directory**, syncs it, and atomically renames
-it with no-replace semantics. Workspace and output may be different filesystems.
-An existing output, even one created concurrently, is never overwritten.
-
-`make run` calls `scripts/run-image.sh`, which makes its own disposable workspace copy. From another terminal:
-
-```bash
-ssh -i assets/id_ed25519 -o StrictHostKeyChecking=accept-new root@172.16.0.2
-# Commands below run inside the guest:
-runuser -u postgres -- pg_isready
-runuser -u postgres -- psql -Atqc 'SHOW server_version;'
-reboot
-```
-
-Low-level `./image-builder -run-image /var/lib/firecracker-builder/work/NAME.ext4`
-boots that writable file directly. Paths outside the workspace, traversal and
-symlink components are rejected. Do not pass a valuable source image. The old
-`-kernel`, `-tap`, `-firecracker`, and `-console-log` flags have been removed.
-
-## Remote build manager (optional)
-
-An operator supplies a private CA, server certificate with the endpoint's DNS/IP
-SAN, and client-auth certificates. Keep private keys outside the repository.
-The manager requires TLS 1.3 and verified client certificates. The client verifies
-the CA and hostname; there is no insecure mode or plaintext fallback. Every
-client trusted by that CA may start, inspect, cancel and download every job:
-this is a trusted-user service, not per-user authorization or a public API.
-
-On the Linux builder host, as the normal unprivileged application user:
-
-```bash
-make build
-./image-builder -serve -listen 0.0.0.0:19443 \
-  -tls-ca /secure/ca.pem -tls-cert /secure/server.pem -tls-key /secure/server.key \
-  -job-dir /home/amnezia/build-jobs \
-  -base assets/ubuntu-base.ext4 -ssh-key assets/id_ed25519 \
-  -socket /run/firecracker-builder/main.sock
-```
-
-`-listen` defaults to `0.0.0.0:19443`; all TLS files and `-job-dir` are required
-in server mode. Base, SSH key and socket retain their local defaults. Do not
-combine `-serve` with `-run-image`. The server spawns its own executable with
-only fixed `-base`, `-ssh-key`, `-socket`, and server-chosen `-output` arguments;
-requests cannot supply commands, paths, flags or guest configuration. The
-server does not start/restart the VMM, change networking, or call host systemctl.
-Firewalling, PKI issuance/rotation and process supervision remain operator tasks.
-
-On macOS or another client machine (standard library only, no KVM dependencies):
-
-```bash
-make remote-client
-./remote-client -endpoint https://builder.example:19443 \
-  -tls-ca /secure/ca.pem -tls-cert /secure/client.pem -tls-key /secure/client.key
-# Add -output ./ubuntu-postgres.ext4 to download after success.
-# With the same endpoint/TLS flags, use -status JOB_ID or -cancel JOB_ID.
-# -status JOB_ID -output ./image.ext4 downloads an already-successful job.
-```
-
-By default the client starts one build, polls the bounded log tail every second,
-and reports that the result is retained server-side. Interrupting the client
-leaves the job running; use `-cancel` explicitly. Downloads stream to a private
-same-directory temporary file, verify the reported byte count and SHA256, sync,
-and atomically publish via a no-replace hard link. Existing files and symlinks
-are never overwritten. The destination filesystem must support hard links;
-a failure leaves no published partial image. Downloads are opt-in.
-
-API (all routes require mTLS):
-
-| Method / path | Behavior |
-| --- | --- |
-| `POST /v1/builds` with `{}` | Fixed PostgreSQL build, 202 with job status; 409 while busy |
-| `GET /v1/builds/ID` | Status: `id`, `state`, bounded `log`, optional `error`, `sha256`, `size` |
-| `GET /v1/builds/ID/image` | Successful completed image only; otherwise 409 |
-| `DELETE /v1/builds/ID` | Request graceful cancellation, 202; does not release the slot early |
-
-IDs are 32 lowercase hexadecimal characters. Unknown IDs return 404; malformed
-IDs/traversal, query strings, oversized bodies or nonempty build parameters are
-rejected. States are `running`, `cancelling`, `succeeded`, `failed`, `cancelled`.
-The latest 64 KiB of combined child stdout/stderr is held in memory. API job
-metadata/logs are in memory and do **not** survive a manager restart. Artifacts
-are retained in private job directories beneath `-job-dir`; no automatic disk
-retention/expiry policy is implemented. Protect that directory from untrusted
-local users and remove old artifacts manually only after confirming inactivity.
-
-Each job has a server-owned **30-minute execution deadline**. Cancellation,
-deadline or manager SIGTERM sends the child SIGTERM, letting its existing
-receipt-based cleanup finish. The manager never force-kills it or deletes a
-possibly active disk. A slot stays occupied until the child actually exits
-(and successful output hashing completes), so cleanup can exceed 30 minutes;
-this is not a strict VM/disk TTL or a promise of deletion at that instant.
-Shutdown also waits for the child; supervisors must not impose an unsafe
-SIGKILL timeout. If cleanup cannot prove a clean VMM exit, the existing local
-builder retains its working disk and reports the reason in the job log.
-
-Only one job/underlying VMM is supported. Resource budgets are externally managed,
-not client-controlled: see [`deployment/resources.md`](deployment/resources.md)
-for a shared **2 GiB RAM / 1 CPU** VMM slice and a real **20 GiB** work/artifact
-filesystem. Those boundaries are enabled on the deployed host. The user API and
-fixed base assets have separate resource accounting. Current VM configuration
-remains 2 vCPUs / 1024 MiB (two vCPU threads share the one-CPU host budget).
-A strict persistent VM TTL and automatic safe artifact deletion are not implemented.
-
-## Lifecycle and diagnostics
-
-The client uses the official Firecracker SDK **Client** for Unix HTTP API
-configuration. A fail-fast `GET /` requires InstanceInfo `Not started` and a
-32-character lowercase hexadecimal ID supplied by the launcher from
-`$INVOCATION_ID`. It configures 2 vCPUs, 1024 MiB,
-`/kernel/vmlinux`, `/work/<relative-disk>`, and `tap-fcpg`, and sends
-`InstanceStart`. It does not use SDK Machine/process spawning.
-
-Guest `reboot=k` makes Firecracker exit. The launcher atomically records its
-exit in `<socket-parent>/<invocation-id>.exit.json`, root:amnezia mode 0640
-inside a root:amnezia mode 0750 directory. Only a receipt matching the original
-ID, with `result="success"`, `exit_code="exited"`, and `exit_status="0"`, proves a
-clean shutdown. Missing, malformed, mismatched, failed or killed-process
-receipts never permit publication or deletion. A new process on the same
-socket is **not** evidence of a clean old exit. Receipts survive automatic
-restart; explicit administrator stops may remove the runtime directory.
-
-The unit remains active globally and automatically launches a fresh VMM after
-each guest exits. Applications never stop it or tear down networking. On errors
-or signals after `InstanceStart`, cleanup checks process identity and requests
-`SendCtrlAltDel` through the SDK (the available x86 guest reboot action), then
-waits for the original exit receipt within a bounded 30-second cleanup window.
-It never reboots a replacement VMM. Normal provisioning still uses SSH guest
-`reboot`, not the cleanup API action.
-
-Before guest start, partial configuration has no safe API process cleanup.
-If a clean process exit cannot be proved, the working disk is retained and the
-error tells the operator to restart the VMM externally. Wrappers conservatively
-retain their copies on any runner failure, including cancellation even when the
-guest subsequently exits cleanly. Inspect retained disks and remove them only
-after an operator confirms no VMM can still access them. Do not SIGKILL the
-client: it would bypass its cleanup. Unavailable deployment/receipt support is
-an explicit error, never simulated success.
-
-VMM and guest console output belong to the root-owned service journal, not the
-client's stdout. Read it with the administrator's journal access policy:
-
-```bash
-journalctl -u firecracker-builder@main.service
-systemctl --no-ask-password show \
-  --property=ActiveState,SubState,Result,ExecMainStatus,ExecMainCode \
-  firecracker-builder@main.service
-```
-
-## Verification
-
-```bash
 make check
+make control-smoke
+make help
 ```
 
-`make check` runs Go race/coverage tests, Python tests (including temporary mTLS
-certificate generation), Go vet and Bash syntax checks. It needs OpenSSL 3 but
-does not start a VM or modify host services. `make run`, `make verify` and
-`make demo` rebuild the local runner and use the already-deployed VMM.
+`make check` runs Go vet, formatting and race tests, builds the product, verifies
+an exact staged install/uninstall round trip and renders/checks systemd units.
+`control-smoke` drives the real API entry point with an in-memory backend; it is
+not a real Firecracker E2E.
 
-Unit tests need neither root nor KVM: they check jail path validation, file
-permissions, stable locking, per-process receipts/cleanup/cancellation, official SDK
-requests against a fake Unix HTTP server, output preservation, and the CLI.
-The Python subprocess regression sends real SIGTERM and verifies runner cleanup.
+## Installation
 
-Real KVM integration, after deployment and image creation:
+See [installation and host prerequisites](docs/install.md) for the complete
+contract, files/modes, configurable paths, preflight, storage and activation.
 
-```bash
-make verify
-# Optional image/report/socket overrides:
-FC_VERIFY_REPORT=verification.json make verify IMAGE=images/ubuntu-postgres.ext4
-make demo
+```sh
+make build
+make install DESTDIR="$PWD/stage" CLIENT_GROUP="$(id -gn)"  # no root, test layout
+make uninstall DESTDIR="$PWD/stage" CLIENT_GROUP="$(id -gn)"
+# On a prepared host, as administrator:
+sudo make install CLIENT_GROUP=vmusers
 ```
 
-The verifier runs unprivileged, copies the image into the shared workspace,
-boots it twice through the same runner, performs SQL INSERT/SELECT persistence
-checks, records the **actual SQL server version**, and verifies the published
-image hash did not change. It never changes networking or file ownership.
-Its `boot-*.log` files capture runner diagnostics, not guest console output.
-Both helpers use `FC_SOCKET` (default `/run/firecracker-builder/main.sock`);
-`verify-image.py` also accepts `-socket`. They perform a read-only API preflight
-before copying. The two-boot verifier waits for external automatic restart
-between successful receipt-proven guest exits, records the number of clean exits, and
-checks the published image hash; it never asserts that the service stops.
-A successful report is written only after both clean boots; no past SDK-spawned
-verification result is evidence that a new systemd deployment works.
+Installation places binaries, systemd units, tmpfiles rules and example configs;
+it does not enable services, change networking, overwrite active configuration
+or prepare/format a volume. Host setup and helper activation are explicit steps.
+Never run competing backend owners against the same VM storage; follow the
+[migration guide](docs/control-api.md) for an existing deployment.
 
-Guest provisioning currently uses DNS 1.1.1.1. Production images should regenerate
-guest identity/SSH host keys and avoid reusable demo credentials.
+Tagged [GoReleaser](.goreleaser.yaml) releases contain static host executables and
+portable CLI archives with checksums. The installer embeds its deployment
+resources, so extracted host archives need no source checkout:
 
-## Sources
+```sh
+sudo ./vmhost install --group vmusers
+```
 
-- [Firecracker Getting Started](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)
-- [Firecracker Network Setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md)
-- [Firecracker FAQ](https://github.com/firecracker-microvm/firecracker/blob/main/FAQ.md)
+GoReleaser is a build/release tool, not a runtime dependency. Validate and build a
+local unpublished snapshot using `make release-check`.
+
+## E2E and CI
+
+[CI](docs/ci.md) separates root-free checks from real KVM tests on a disposable
+Linux host. `VMAPI_E2E_DISPOSABLE=1 make e2e` owns its fixtures on a fresh
+KVM/systemd host and fails if prerequisites are absent. [Live E2E](docs/e2e-live.md) can exercise an explicitly
+configured service with an opt-in principal and tracked disposable resources:
+
+```sh
+VMAPI_E2E=1 make e2e-live   # requires the documented VMAPI_E2E_* settings
+```
+
+Do not point disposable-host provisioning at a production machine. CI workflows
+use no production server or credentials. A passing unit test or generated unit
+check is not evidence of real guest boot or external SSH reachability.
+
+## Guides
+
+- [Architecture](docs/architecture.md) and [ADRs](docs/adr/).
+- [Control API](docs/control-api.md), [OpenAPI](docs/control-api-openapi.yaml).
+- [Username/JWT/Swagger](docs/username-jwt-swagger.md), [bot client](docs/bot-api-client.md).
+- [Common image registry](docs/common-image-registry.md), [SSH automation](docs/ssh-automation.md).
+- [Guest networking](deployment/multivm/NETWORK.md).
+- [Recorded live verification](docs/verification-live.md): historical evidence
+  for the named revision/deployment, not automatic acceptance of current changes.
+
+## Legacy consumers
+
+The root Go package and `cmd/remote-client` / `cmd/service-launcher` remain tested
+compatibility consumers of the original single-VM image builder (`make legacy`).
+They are not installed or packaged as the current product. Their old host
+installer, fixed-network deployment, Bash/Python verification and demo wrappers
+have been retired; see [ADR 0009](docs/adr/0009-go-tooling-install-ci.md).
+The only remaining `.sh` file is an embedded **guest boot** template, not a host
+installer or test harness. Host orchestration and tests are Go-native.

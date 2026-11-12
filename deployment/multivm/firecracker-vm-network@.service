@@ -1,9 +1,9 @@
-# PROPOSED (source only). Per-slot TAP/NAT as a host-root oneshot, so it runs with
-# the real filesystem (ip, iptables, sysctl) rather than inside the VMM jail.
+# Per-slot TAP/NAT as a host-root oneshot, so it runs with
+# the real filesystem (ip, iptables, conntrack) rather than inside the VMM jail.
 # RemainAfterExit keeps the slot's TAP while the slot is idle; the operator (or
 # boot/shutdown) stops it explicitly: systemctl stop firecracker-vm-network@N.
 # Stopping it removes only what its marker recorded. It refuses any overlapping
-# route/address (see fc-vm-network.sh).
+# route/address (see internal/vmnet).
 [Unit]
 Description=TAP/NAT for Firecracker VM slot %i
 AssertPathExists=/etc/firecracker-vms/pool.conf
@@ -13,10 +13,10 @@ StopWhenUnneeded=no
 Type=oneshot
 RemainAfterExit=yes
 User=root
-ExecStart=/usr/local/libexec/fc-vm-network up %i
+ExecStart=@LIBEXECDIR@/fc-vm-network up %i
 # Reload refreshes owned rules only; never restart this unit with a live VMM.
-ExecReload=/usr/local/libexec/fc-vm-network refresh %i
-ExecStop=/usr/local/libexec/fc-vm-network down %i
+ExecReload=@LIBEXECDIR@/fc-vm-network refresh %i
+ExecStop=@LIBEXECDIR@/fc-vm-network down %i
 NoNewPrivileges=yes
 ProtectHome=yes
 PrivateTmp=yes

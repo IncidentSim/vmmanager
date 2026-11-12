@@ -14,6 +14,7 @@ func TestFractionalCPUConfigAndLegacyMemory(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		c.PoolConf = publicationPool(t, "")
 		cfg, err := c.Assemble(Seams{Launcher: fakeLauncher{}, VMM: fakeVMM{}})
 		if err != nil {
 			t.Fatal(err)

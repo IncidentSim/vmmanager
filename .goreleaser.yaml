@@ -1,0 +1,93 @@
+# GoReleaser v2 (OSS). The archive is the installer's build directory: a flat
+# set of static executables including `vmhost`, so after extraction
+#   sudo ./vmhost install --group <vmapi user's group>
+# uses the same layout, unit rendering and manifest as `make install`.
+version: 2
+project_name: vm-firecracker
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - &product
+    id: vmapi
+    main: ./cmd/vmapi
+    binary: vmapi
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w"]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - <<: *product
+    id: vmbot
+    main: ./cmd/vmbot
+    binary: vmbot
+  - <<: *product
+    id: vmctl
+    main: ./cmd/vmctl
+    binary: vmctl
+  - <<: *product
+    id: vm-launcher
+    main: ./cmd/vm-launcher
+    binary: vm-launcher
+  - <<: *product
+    id: vm-network
+    main: ./cmd/vm-network
+    binary: vm-network
+  - <<: *product
+    id: vm-helper
+    main: ./cmd/vm-helper
+    binary: vm-helper
+  - <<: *product
+    id: vm-helper-client
+    main: ./cmd/vm-helper-client
+    binary: vm-helper-client
+  - <<: *product
+    id: vmhost
+    main: ./cmd/vmhost
+    binary: vmhost
+  # Portable HTTP client only: no Linux/KVM requirement.
+  - <<: *product
+    id: vmctl-client
+    main: ./cmd/vmctl
+    binary: vmctl
+    goos: [darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: host
+    ids: [vmapi, vmbot, vmctl, vm-launcher, vm-network, vm-helper, vm-helper-client, vmhost]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    wrap_in_directory: true
+    files:
+      - src: README.md
+      - src: docs/install.md
+        dst: docs/install.md
+  - id: client
+    ids: [vmctl-client]
+    formats: [tar.gz]
+    name_template: "vmctl_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    wrap_in_directory: true
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - src: README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github
+  sort: asc
+
+release:
+  github: {}
+  prerelease: auto

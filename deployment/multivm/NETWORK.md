@@ -9,8 +9,7 @@ Never run them from the API worker, helper socket protocol, or inside a VMM jail
 `/etc/firecracker-vms/pool.conf` remains root:root 0644, with a root-owned,
 non-client-writable parent. Literal `KEY=VALUE`, no surrounding whitespace,
 inline comments, interpolation, quotes or duplicate/unknown keys. Empty lines,
-column-zero `#` comments and CRLF are accepted. The shell and Go pool parser
-have the same canonical value rules:
+column-zero `#` comments and CRLF are accepted. The Go network tool and helper share the same parser and canonical value rules:
 
 - `GUEST_PREFIX=10.213`, required, existing two-octet pool contract.
 - `MAX_SLOTS=4`, required, 1..64 (four-slot source proposal uses slots 0..3).
@@ -38,7 +37,7 @@ with this root pool. The network helper never edits that config.
 - Explicit `iptables-nft`, `ip6tables-nft` and their `*-restore --noflush` tools;
   no switch of firewall backend, global flush/policy change, UFW or Docker edit.
 - Slot-owned chains `FCVM<N>F`, `I`, `N`, `M`, `V6` and hook comment
-  `firecracker-vms:slot<N>` are reserved to this script. Do not create unrelated
+  `firecracker-vms:slot<N>` are reserved to this tool. Do not create unrelated
   rules in these chains. Dedicated chains are rebuilt atomically **per table**;
   there is no all-tables transaction. Initial hook installation is incremental.
 - Guest IPv4 source must equal the slot's `.2`. Guest-initiated NEW host INPUT
@@ -56,7 +55,7 @@ with this root pool. The network helper never edits that config.
   IPv6. There is intentionally no IPv6 opt-out knob in this version.
 - Review policy routing, local L2 bridges, other nft base-chain priorities and
   competing firewall managers before approval. Existing TAP must be a TAP with
-  the expected `.1/30`; this script does not enslave/reconfigure it. Unrelated
+  the expected `.1/30`; this tool does not enslave/reconfigure it. Unrelated
   firewall managers can still block permitted traffic or reorder hooks. Refresh
   after route/uplink changes, and recheck hook precedence after firewall reloads.
   A new earlier foreign ACCEPT can bypass these hooks until refresh. Refresh
@@ -65,12 +64,12 @@ with this root pool. The network helper never edits that config.
 
 ## Safe install / refresh without restarting active VMs
 
-First record the old installed script/unit/pool and full IPv4/IPv6 firewall
+First record the old installed tool/unit/pool and full IPv4/IPv6 firewall
 snapshots **for review**, not for a blind global restore. Inspect listeners and
 other NAT mappings to reserve the entire port range (DNAT has no host listener).
 Verify the old marker `/run/firecracker-vms-net/N.iface` is root-owned if present.
 Provision the `conntrack` userspace tool and both nft iptables variants separately
-if missing. Verify `net.ipv4.ip_forward=1`; the script never changes this sysctl.
+if missing. Verify `net.ipv4.ip_forward=1`; the tool never changes this sysctl.
 The latest helper binary/parser must be installed before enabling new root pool
 keys; the old helper rejects unknown keys. That binary install is separate from
 this source-only network change. Preserve all existing pool/CPU/capacity values.
@@ -78,8 +77,8 @@ this source-only network change. Preserve all existing pool/CPU/capacity values.
 Example root command payloads, from the reviewed repository directory:
 
 ```sh
-install -o root -g root -m 0755 deployment/multivm/fc-vm-network.sh /usr/local/libexec/fc-vm-network
-install -o root -g root -m 0644 deployment/multivm/firecracker-vm-network@.service /etc/systemd/system/firecracker-vm-network@.service
+make build
+make install CLIENT_GROUP=vmusers # renders all units; does not activate them
 # Install the separately reviewed, host-specific pool.conf; do not blindly copy an example.
 systemctl daemon-reload
 /usr/local/libexec/fc-vm-network check 0
@@ -138,7 +137,7 @@ fails closed before quota mutation or start. The socket request still has only
 flag. Publication is derived only from the parsed root pool; disabled pools
 retain the old no-flush path. This is per-start enforcement, not network-unit
 `ExecStart`: that unit's `RemainAfterExit=yes` would skip cleanup on TAP reuse.
-The network global lock nests inside the helper slot lock; the network script
+The network global lock nests inside the helper slot lock; the network tool
 never takes a helper slot lock, so there is no reverse lock order.
 
 Deploy the updated helper binary **and** `fc-vm-helper@.service` before enabling
@@ -175,8 +174,8 @@ conntrack -D -f ipv4 -p tcp --orig-dst OLD_PUBLIC_IPV4 --dport OLD_SLOT_PORT
 
 A refresh with publication disabled removes DNAT/new inbound permission without
 tearing down the TAP or egress. Existing conntrack sessions can persist until
-explicit deletion. Keep this hardened script when rolling back public access;
-restoring the old broad-ACCEPT script would undo isolation. If a full network
+explicit deletion. Keep this hardened tool when rolling back public access;
+restoring the old broad-ACCEPT tool would undo isolation. If a full network
 teardown is required, only after separately verifying the VMM is dead/receipted,
 run `down N` (or stop an idle owned network unit). It deletes only a marked TAP
 and the exact slot hooks/chains. Never restore full host firewall snapshots
@@ -185,17 +184,12 @@ blindly: that would overwrite unrelated concurrent changes.
 ## Source verification
 
 ```sh
-bash -n deployment/multivm/fc-vm-network.sh
-python3 -m unittest deployment/multivm/test_deploy.py deployment/multivm/test_network.py -v
-go test ./internal/vmhelper
+go test -race ./internal/vmnet ./internal/hostinstall ./internal/vmhelper
+make verify-units
 ```
 
-Python runs copied source with fixed paths replaced and every privileged network
-command mocked, even when testing root-only branches. It checks repeated apply,
-foreign rule preservation, existing TAP non-destruction, DNAT tuple binding,
-IPv6 denial, anti-spoof/private/host policy, and targeted conntrack deletion. When
-installed, real rootless `iptables-translate`/`ip6tables-translate` validate every
-emitted rule as nft syntax (also exercised during this implementation). The Go
-tests compare shell/Go parsing of a shared adversarial corpus, including NUL,
-whitespace, CRLF, private addresses and overflowing port ranges. No
-root namespace, live firewall, service, VMM or credential is touched.
+Go tests exercise the network runner with canned command output and validate
+repeated apply, foreign rules, TAP ownership, tuple binding, IPv6 denial,
+anti-spoof/private/host policy and targeted conntrack cleanup. Installer tests
+render units and check runtime trust. These are root-free checks, not real
+kernel/firewall evidence; use the opt-in Go E2E and external-host probes for that.

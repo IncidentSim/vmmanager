@@ -46,6 +46,9 @@ type suite struct {
 // failure (never a silent skip). Only GET requests happen before it returns.
 func newSuite(t *testing.T) *suite {
 	t.Helper()
+	if os.Getenv(disposableGate) == "1" || disposableActive {
+		t.Cleanup(func() { fixturePasses[t.Name()] = !t.Failed() && !t.Skipped() })
+	}
 	if os.Getenv(envGate) != "1" {
 		t.Skip("live E2E disabled; set VMAPI_E2E=1 (see docs/e2e-live.md)")
 	}
@@ -61,7 +64,7 @@ func newSuite(t *testing.T) *suite {
 	s := &suite{t: t, cfg: cfg, c: c, hc: hc, n: newNamer(), owner: cfg.UserID, keys: map[string]string{}}
 	s.tr = &tracker{user: cfg.UserID, base: cfg.BaseImageID, keySeq: s.n.key}
 	var cancel context.CancelFunc
-	s.ctx, cancel = context.WithTimeout(context.Background(), testBudget)
+	s.ctx, cancel = context.WithTimeout(disposableContext, testBudget)
 	t.Cleanup(cancel)
 	// Runs at test end (t.Cleanup is LIFO) on
 	// its own bounded context, independent of the (maybe expired) test context.

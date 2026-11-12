@@ -1,4 +1,4 @@
-# PROPOSED (source only): one instance per accepted connection of fc-vm-helper.socket.
+# One instance per accepted connection of fc-vm-helper.socket.
 # The connection is stdin/stdout. cmd/vm-helper serves exactly one validated
 # "start-slot N CPU_MILLI" line; locks/checks/sets/verifies/starts an idle slot.
 [Unit]
@@ -9,7 +9,7 @@ User=root
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
-ExecStart=/usr/local/libexec/fc-vm-helper
+ExecStart=@LIBEXECDIR@/fc-vm-helper
 RuntimeMaxSec=90
 MemoryMax=32M
 TasksMax=16

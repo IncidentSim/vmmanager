@@ -140,6 +140,7 @@ func (c *Controller) Start(ctx context.Context) error {
 		_ = os.Chmod(dbPath+suffix, 0o600)
 	}
 	e.ready.Store(true)
+	c.startIdleMonitor()
 	return nil
 }
 
@@ -153,6 +154,7 @@ func (c *Controller) Close() error {
 		return nil
 	}
 	e.ready.Store(false)
+	c.stopIdleMonitor()
 	e.closeOnce.Do(func() { e.closeErr = dbos.Shutdown(e.ctx, 10*time.Second) })
 	if e.closeErr == nil {
 		c.st.releaseEngine(c)

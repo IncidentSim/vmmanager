@@ -41,12 +41,10 @@ func TestCommitCredentialHygiene(t *testing.T) {
 	src := s.createActive("hsrc", s.cfg.BaseImageID)
 	g := s.guestFor(src.VMID)
 	marker := s.writeMarker(g, "hygiene")
-	term, e := s.c.Terminal(s.ctx, s.owner, src.VMID, s.n.key("hterm"))
-	s.trackAccepted(acceptedReferences, term)
-	if e != nil {
-		t.Fatalf("terminal attach: %v", e)
-	}
-	s.mustWait("terminal attach", term.OperationID)
+	// Prepare installs both owner and dedicated terminal credentials. Inspect
+	// those real guest entries directly: publication hygiene must not depend on
+	// a browser-terminal backend being configured (the disposable API has none).
+	// The assertions below still require and reject reuse of BOTH identities.
 	original := authorizedKeys(s, g)
 	owner, terminal := managedEntries(original, src.VMID)
 	if len(owner) != 1 || len(terminal) != 1 || owner[0] == terminal[0] {

@@ -96,3 +96,26 @@ func TestConfigBackend(t *testing.T) {
 		}
 	}
 }
+
+func TestIdleTimeoutConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	load := func(extra string) (Config, error) {
+		body := `{"state_dir":"/unused","backend":` + testBackend + `,"allowed_user_ids":[11],"shared_image_ids":["ubuntu"],"credentials":[{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","user_id":11}]` + extra + `}`
+		if e := os.WriteFile(path, []byte(body), 0600); e != nil {
+			t.Fatal(e)
+		}
+		return LoadConfig(path)
+	}
+	c, e := load("")
+	if e != nil || c.IdleTimeoutSeconds != 600 {
+		t.Fatalf("default idle timeout %d, %v", c.IdleTimeoutSeconds, e)
+	}
+	if c, e = load(`,"idle_timeout_seconds":900`); e != nil || c.IdleTimeoutSeconds != 900 {
+		t.Fatalf("explicit idle timeout %d, %v", c.IdleTimeoutSeconds, e)
+	}
+	for _, bad := range []string{`,"idle_timeout_seconds":-1`, `,"idle_timeout_seconds":86401`} {
+		if _, e = load(bad); e == nil {
+			t.Fatalf("accepted %s", bad)
+		}
+	}
+}

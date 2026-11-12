@@ -61,6 +61,20 @@ type accessBackend struct {
 
 func (b accessBackend) AccessCredentials() sshaccess.Credentials { return b.credentials }
 
+// idleConnectionCounter is the guest observation seam of SSH-idle expiry: the
+// dedicated managed terminal credential lease plus the operator's strict
+// known-hosts file. Without both there is no trusted observation, so it returns
+// nil and idle expiry stays off (fail closed).
+func idleConnectionCounter(cfg controlapi.Config, credentials sshaccess.Credentials) vmbot.ConnectionCounter {
+	p := cfg.Backend.PersonalSSH
+	if credentials == nil || p == nil || !p.Enabled || p.ShutdownKnownHostsFile == "" {
+		return nil
+	}
+	return sshaccess.ConnCounter{Credentials: credentials,
+		RuntimeDir:     filepath.Join(p.StoreDir, "idle-leases"),
+		KnownHostsFile: p.ShutdownKnownHostsFile}
+}
+
 type unavailableTerminals struct{}
 
 func (unavailableTerminals) Start(context.Context, vmbot.TerminalTarget) error {
@@ -136,7 +150,11 @@ func run(ctx context.Context, path string, open backendOpener) error {
 	if nexterm {
 		ctlTerm = noTerminals{} // never spawn ttyd for new terminal requests
 	}
-	ctl := vmbot.NewController(svc, st, ctlTerm, vmbot.ControllerConfig{Credentials: credentials, Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin, DefaultTTL: time.Duration(cfg.DefaultTTLSeconds) * time.Second, MaxTTL: time.Duration(cfg.MaxTTLSeconds) * time.Second})
+	idleProbe := idleConnectionCounter(cfg, credentials)
+	if idleProbe == nil {
+		fmt.Fprintln(os.Stderr, "vmapi: SSH-idle expiry unsupported: needs personal_ssh with shutdown_known_hosts_file; no VM is deleted for idleness")
+	}
+	ctl := vmbot.NewController(svc, st, ctlTerm, vmbot.ControllerConfig{IdleProbe: idleProbe, IdleTimeout: time.Duration(cfg.IdleTimeoutSeconds) * time.Second, Credentials: credentials, Profile: cfg.DefaultProfile, PublicOrigin: cfg.Terminal.PublicOrigin, DefaultTTL: time.Duration(cfg.DefaultTTLSeconds) * time.Second, MaxTTL: time.Duration(cfg.MaxTTLSeconds) * time.Second})
 	ctl.ConfigureControl(cfg.Policy())
 	var jwtAuth *controlapi.JWTAuth
 	if cfg.JWT != nil {

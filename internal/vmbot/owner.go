@@ -364,6 +364,18 @@ func controlErrorCode(err error) string {
 // is idempotent: a replay finds the operation "running" and proceeds again.
 func (c *Controller) beginOp(vmID string, cmd OwnerCmd) (ownerPlan, error) {
 	plan := ownerPlan{}
+	// A pending owner-authored idle Delete is confirmed once more right before it
+	// runs (outside the store lock: it performs a bounded SSH probe). A resumed
+	// "running" one was confirmed by the execution that began it. Anything but a
+	// clean zero cancels it; the VM is untouched and its idle window restarts.
+	idleCancel := false
+	if cmd.Kind == "delete" && strings.HasPrefix(cmd.OpID, idleOpPrefix) {
+		for _, o := range c.st.Snapshot().Operations {
+			if o.ID == cmd.OpID && o.Status == "pending" {
+				idleCancel = !c.idleStillConfirmed(vmID)
+			}
+		}
+	}
 	err := c.st.UpdateErr(func(s *State) error {
 		oi := -1
 		for i := range s.Operations {
@@ -387,6 +399,11 @@ func (c *Controller) beginOp(vmID string, cmd OwnerCmd) (ownerPlan, error) {
 		reject := func(code string) {
 			op.Status, op.ErrorCode = "failed", code
 			plan.Note = "rejected: " + code
+		}
+		if idleCancel {
+			reject("conflict")
+			plan.Note = "idle delete cancelled: VM not confirmed idle"
+			return nil
 		}
 		if op.Kind == "delete_image" {
 			op.Status, plan.Run = "running", true

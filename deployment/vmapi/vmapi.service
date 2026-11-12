@@ -1,5 +1,5 @@
-# Source-only systemd USER template for the standalone control API (vmapi).
-# NOT installed or enabled by anything in this repository. vmapi embeds the VM
+# Systemd USER unit for the standalone control API (vmapi), installed to the
+# vendor user-unit directory by `vmhost install`; never enabled or started by it. vmapi embeds the VM
 # service directly (vmlib.Service over vmlib/local.Backend); there is no vmd and
 # no gRPC listener. Install only after the explicit handoff in docs/control-api.md
 # ("Migration and handoff"): stop the bot and any old vmapi/vmd first (the API
@@ -21,7 +21,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/vmapi -config %h/.config/vmapi/vmapi.json
+ExecStart=@BINDIR@/vmapi -config %h/.config/vmapi/vmapi.json
 # Restarting never deletes VMs: startup repair re-drives durable operations.
 Restart=on-failure
 RestartSec=5s

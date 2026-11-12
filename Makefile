@@ -1,85 +1,135 @@
 .DEFAULT_GOAL := build
 
+# Thin orchestration only: every non-trivial step lives in Go (cmd/vmhost,
+# cmd/vm-network, internal/*). See docs/install.md.
+
 GO ?= go
-# Go <=1.24 auto-switching to early 1.25 releases can invoke the old `go`
-# binary for coverage tools (golang/go#75031). Keep child tool invocations on
-# the selected toolchain too, without installing/changing the system Go.
+# Keep child tool invocations on the selected toolchain (golang/go#75031).
 export PATH := $(shell $(GO) env GOROOT)/bin:$(PATH)
-PYTHON ?= python3
-BUILD_DIR ?= .
-IMAGE ?= images/ubuntu-postgres.ext4
-FC_SOCKET ?= /run/firecracker-builder/main.sock
+BUILD_DIR ?= bin
 
-.PHONY: build remote-client test vet check shell-syntax run verify demo consumer-smoke verify-units vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi control-build control-smoke no-grpc-check e2e-live
+# Installation (files only; nothing is started, enabled or reloaded).
+PREFIX ?= /usr/local
+DESTDIR ?=
+SYSCONFDIR ?= /etc
+CLIENT_GROUP ?=
+ASSET_DIR ?=
+STORAGE_ROOT ?=
+FIRECRACKER ?=
+KERNEL ?=
+FORCE ?=
+VERIFY_FLAGS ?=
 
+PRODUCT := vmapi vmbot vmctl vm-launcher vm-network vm-helper vm-helper-client vmhost
+LEGACY := image-builder remote-client service-launcher
+
+VMHOST := $(BUILD_DIR)/vmhost
+VMHOST_FLAGS = --build-dir "$(BUILD_DIR)" --prefix "$(PREFIX)" --sysconfdir "$(SYSCONFDIR)" \
+	$(if $(DESTDIR),--destdir "$(DESTDIR)") $(if $(CLIENT_GROUP),--group "$(CLIENT_GROUP)") \
+	$(if $(ASSET_DIR),--asset-dir "$(ASSET_DIR)") $(if $(STORAGE_ROOT),--storage-root "$(STORAGE_ROOT)") \
+	$(if $(FIRECRACKER),--firecracker "$(FIRECRACKER)") $(if $(KERNEL),--kernel "$(KERNEL)") \
+	$(if $(FORCE),--force)
+
+.PHONY: build legacy test vet release-check fmt-check check control-smoke verify-units stage-check \
+	install uninstall preflight host-setup host-enable e2e-live e2e clean help
+
+define HELP_TEXT
+Targets (details in docs/install.md and docs/ci.md):
+  build         build the product executables into BUILD_DIR (default bin/)
+  legacy        build the legacy single-VM builder tools (not the product)
+  test          all Go tests with -race (root-free)
+  check         vet, gofmt, tests, build, staged install round trip, unit verification
+  control-smoke executable API smoke (in-memory backend; not an E2E)
+  stage-check   root-free install/uninstall round trip in a temporary root
+  verify-units  render units and run systemd-analyze verify
+  install       place files under DESTDIR/PREFIX (real install needs root)
+  uninstall     remove exactly the files recorded by install
+  preflight     read-only host readiness report
+  host-setup    create empty jail/work/images dirs (USER_NAME=name, APPLY=1)
+  host-enable   enable the helper socket only (APPLY=1)
+  e2e-live      opt-in E2E against an already deployed vmapi (VMAPI_E2E=1)
+  e2e           real E2E on a disposable KVM host (see docs/ci.md)
+  release-check validate .goreleaser.yaml and build a snapshot (no publishing)
+endef
+export HELP_TEXT
+
+help:
+	@printf '%s\n' "$$HELP_TEXT"
+
+## build        build the product executables into $(BUILD_DIR) (static, CGO off)
 build:
-	mkdir -p "$(BUILD_DIR)"
-	$(GO) build -o "$(BUILD_DIR)/image-builder" .
+	@mkdir -p "$(BUILD_DIR)"
+	@for c in $(PRODUCT); do CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/$$c" ./cmd/$$c || exit 1; done
 
-remote-client:
-	mkdir -p "$(BUILD_DIR)"
-	$(GO) build -o "$(BUILD_DIR)/remote-client" ./cmd/remote-client
+## legacy       build the legacy single-VM image builder tools (not part of the product)
+legacy:
+	@mkdir -p "$(BUILD_DIR)"
+	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/image-builder" .
+	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/remote-client" ./cmd/remote-client
+	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/service-launcher" ./cmd/service-launcher
 
+## test         all Go tests with the race detector (root-free; includes tooling tests)
 test:
-	$(GO) test -race -cover -timeout 3m ./...
-	$(PYTHON) -m unittest -v test_verify_image.py test_project_layout.py deployment/test_mtls.py deployment/multivm/test_deploy.py scripts/integration/test_multi_vm.py scripts/test_no_grpc.py
+	$(GO) test -race -cover -timeout 10m ./...
 
 vet:
 	$(GO) vet ./...
 
-shell-syntax:
-	@for script in scripts/*.sh scripts/integration/*.sh deployment/*.sh deployment/multivm/*.sh; do bash -n "$$script" || exit; done
+fmt-check:
+	@out="$$(gofmt -l .)"; test -z "$$out" || { echo "gofmt needed:" >&2; echo "$$out" >&2; exit 1; }
 
-# New multi-VM applications (build only; no install, no sudo).
-vmctl vm-launcher vm-helper vm-helper-client vmbot vmapi:
-	mkdir -p "$(BUILD_DIR)"
-	CGO_ENABLED=0 $(GO) build -o "$(BUILD_DIR)/$@" ./cmd/$@
-
-# Compile-check the standalone API and the HTTP-only frontend without writing
-# binaries (multi-package builds discard output; nothing is installed).
-control-build:
-	$(GO) build ./cmd/vmapi ./cmd/vmbot
-
-# Executable smoke: runs the REAL vmapi run() entry point in-process against an
-# in-memory vmlibtest fake injected through the backendOpener test seam, driven by
-# the public controlclient. No Firecracker/KVM/root/network beyond loopback. The
-# deployed binary only contains the real local backend. Included in `test`
-# already; kept as an explicit, fast, focused target.
+## control-smoke  executable API smoke (in-memory backend over loopback; NOT an E2E)
 control-smoke:
 	$(GO) test -count=1 -timeout 3m -run 'TestExecutableControlFlow|TestExecutableJWTAndComposedHTTPSGateway|TestRecoveryFailureKeepsServingDegraded' ./cmd/vmapi
 
-# The VM plane has no RPC transport: no application package may import
-# gRPC/protobuf, and the API/CLI binaries must not link them.
-no-grpc-check:
-	bash scripts/no-grpc-check.sh
+## verify-units   render the units and run systemd-analyze verify (VERIFY_FLAGS=--require-systemd-analyze fails if absent)
+verify-units: build
+	$(VMHOST) verify-units $(VMHOST_FLAGS) $(VERIFY_FLAGS)
 
-consumer-smoke:
-	bash scripts/consumer-smoke.sh
+## stage-check    root-free install/uninstall round trip into a temporary root
+stage-check: build
+	$(VMHOST) stage-check $(VMHOST_FLAGS)
 
-# Real systemd-analyze on rendered copies of the proposed units (nothing installed).
-verify-units:
-	bash scripts/verify-units.sh
+## check        vet + format + tests + build + staged install round trip + unit verification
+check: vet fmt-check test build stage-check verify-units
 
-# Opt-in live E2E against a REAL deployed vmapi (creates and deletes real VMs and
-# images owned by the configured user). Not run by `check`; without
-# VMAPI_E2E=1 this target refuses to run. Required env and
-# evidence boundary: docs/e2e-live.md.
+## install      place files under DESTDIR/PREFIX (run `make build` first; real install needs root)
+install:
+	$(VMHOST) install $(VMHOST_FLAGS)
+
+## uninstall    remove exactly the files recorded by install; user data is never touched
+uninstall:
+	$(VMHOST) uninstall $(VMHOST_FLAGS)
+
+## preflight    read-only host readiness report (KVM, systemd, tools, subnet, storage)
+preflight:
+	$(VMHOST) preflight $(VMHOST_FLAGS)
+
+## host-setup   (root) create empty jail/work/images directories; USER=name; APPLY=1 to apply
+host-setup:
+	$(VMHOST) setup $(VMHOST_FLAGS) $(if $(USER_NAME),--user "$(USER_NAME)") $(if $(APPLY),--apply)
+
+## host-enable  (root) enable the helper socket only; APPLY=1 to apply
+host-enable:
+	$(VMHOST) enable $(VMHOST_FLAGS) $(if $(APPLY),--apply)
+
+## e2e-live     opt-in live E2E against an already deployed vmapi (VMAPI_E2E=1, see docs/e2e-live.md)
 e2e-live:
 	@test "$$VMAPI_E2E" = 1 || { echo "e2e-live: set VMAPI_E2E=1 and the VMAPI_E2E_* variables (see docs/e2e-live.md)" >&2; exit 2; }
 	$(GO) test -count=1 -p 1 -timeout 45m -v ./e2e
 
-check: test vet shell-syntax control-build no-grpc-check consumer-smoke verify-units
+## e2e          test-owned preparation and lifecycle on an explicitly disposable KVM host
+# No sudo or privileged preparation without an explicit operator opt-in.
+e2e:
+	@test "$$VMAPI_E2E_DISPOSABLE" = 1 || { echo "e2e: set VMAPI_E2E_DISPOSABLE=1 ONLY on a disposable KVM host (see docs/ci.md)" >&2; exit 2; }
+	$(MAKE) build
+	VMAPI_E2E_BUILD_DIR="$(abspath $(BUILD_DIR))" $(GO) test -count=1 -p 1 -timeout 45m -v ./e2e
 
-# Runtime helpers expect image-builder in the repository root.
-# These targets use the existing external VMM; no host-service management.
-run:
-	$(GO) build -o image-builder .
-	FC_SOCKET="$(FC_SOCKET)" bash scripts/run-image.sh "$(IMAGE)"
+## release-check  validate .goreleaser.yaml and build a snapshot into dist/ (never publishes)
+GORELEASER ?= goreleaser
+release-check:
+	$(GORELEASER) check
+	$(GORELEASER) release --snapshot --clean --skip=publish
 
-verify:
-	$(GO) build -o image-builder .
-	FC_SOCKET="$(FC_SOCKET)" FC_VERIFY_IMAGE="$(IMAGE)" $(PYTHON) ./verify-image.py
-
-demo:
-	$(GO) build -o image-builder .
-	FC_SOCKET="$(FC_SOCKET)" bash scripts/demo-lifecycle.sh
+clean:
+	rm -rf "$(BUILD_DIR)"

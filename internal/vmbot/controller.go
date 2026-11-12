@@ -60,7 +60,15 @@ type ControllerConfig struct {
 	// DefaultTTL/MaxTTL bound a created VM's lifetime (defaults 3600s / 86400s).
 	// Field-aware validation of these settings belongs to the config layer.
 	DefaultTTL, MaxTTL time.Duration
-	Logger             *log.Logger
+	// IdleProbe enables SSH-idle expiry (docs/adr/0008-ssh-idle-expiry.md): a VM
+	// with no established SSH connection for more than IdleTimeout is deleted
+	// through its owner. Nil IdleProbe or a zero IdleTimeout disables it (no
+	// trusted observation exists, so nothing is ever deleted for idleness).
+	// IdlePoll defaults to 30s.
+	IdleProbe   ConnectionCounter
+	IdleTimeout time.Duration
+	IdlePoll    time.Duration
+	Logger      *log.Logger
 }
 
 // Status is the VM view carried in OpResult, the retired workflow's stored
@@ -101,6 +109,12 @@ type Controller struct {
 	ownerFn func(dbos.Context, OwnerIn) (OwnerOut, error)
 	// clock is a test seam for admission/expiry decisions; nil means time.Now.
 	clock func() time.Time
+
+	// idle is the in-memory SSH-idle window per VM; idleStop/idleDone belong to
+	// the monitor goroutine started by Start and ended by Close.
+	idle     idleTracker
+	idleStop context.CancelFunc
+	idleDone chan struct{}
 
 	// rebuild holds the VM IDs whose terminal is rebuilt once after Start.
 	rebuild sync.Map

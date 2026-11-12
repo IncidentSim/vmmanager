@@ -1,0 +1,12 @@
+{
+  "_comment": "Config DELTA template for SSH-idle expiry (docs/adr/0008-ssh-idle-expiry.md). Merge by hand into the real vmapi config; never commit real paths or secrets. The known_hosts file must be operator-maintained, 0644/0600, owned by root or the service user, and contain the guests' SSH host keys (it is never auto-populated). Guests need iproute2 `ss`. Without shutdown_known_hosts_file no VM is deleted for idleness.",
+  "idle_timeout_seconds": 600,
+  "backend": {
+    "personal_ssh": {
+      "enabled": true,
+      "store_dir": "/ABSOLUTE/PATH/personal-ssh-store",
+      "master_key_file": "/ABSOLUTE/PATH/outside-store/master.key",
+      "shutdown_known_hosts_file": "/ABSOLUTE/PATH/guest_known_hosts"
+    }
+  }
+}

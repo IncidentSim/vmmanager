@@ -1,8 +1,8 @@
-# PROPOSED template (source only). Install only after operator review/approval.
+# Template rendered by `vmhost install` (never edit the rendered copy by hand).
 # One VMM process per slot N (firecracker-vm@N.service), separate from the active
 # legacy firecracker-builder@main.service: different unit, runtime dir, jail, TAP
 # prefix (tap-vmN) and operator-chosen guest pool (/etc/firecracker-vms/pool.conf).
-# Replace @CLIENT_GROUP@ with the unprivileged vmapi user's primary group.
+# Tokens (@CLIENT_GROUP@, @LIBEXECDIR@, @ASSET_DIR@, @STORAGE_ROOT@) are rendered by the installer.
 #
 # Networking is NOT done here. RootDirectory= applies to every Exec* line of this
 # unit (a "+" prefix is not relied on), so the jail deliberately contains no
@@ -19,14 +19,14 @@ Requires=firecracker-vm-network@%i.service
 After=firecracker-vm-network@%i.service
 # Assert* (not Condition*) so a missing prerequisite FAILS the start instead of silently skipping it.
 AssertPathExists=/dev/kvm
-RequiresMountsFor=/var/lib/firecracker-builder/storage
-AssertPathIsMountPoint=/var/lib/firecracker-builder/storage
-AssertPathIsDirectory=/var/lib/firecracker-builder/storage/vms/work
+RequiresMountsFor=@STORAGE_ROOT@
+AssertPathIsMountPoint=@STORAGE_ROOT@
+AssertPathIsDirectory=@STORAGE_ROOT@/vms/work
 StartLimitIntervalSec=0
 
 [Service]
 Type=exec
-Slice=system-firecracker\x2dbuilder.slice
+Slice=firecracker-vms.slice
 User=root
 Group=@CLIENT_GROUP@
 UMask=0007
@@ -36,14 +36,14 @@ WorkingDirectory=/work
 RuntimeDirectory=firecracker-vms/slot-%i
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
-BindReadOnlyPaths=/opt/firecracker-builder/firecracker:/bin/firecracker
-BindReadOnlyPaths=/opt/firecracker-builder/vmlinux:/kernel/vmlinux
-BindReadOnlyPaths=/usr/local/libexec/fc-vm-launcher
-BindPaths=/var/lib/firecracker-builder/storage/vms/work:/work
+BindReadOnlyPaths=@ASSET_DIR@/firecracker:/bin/firecracker
+BindReadOnlyPaths=@ASSET_DIR@/vmlinux:/kernel/vmlinux
+BindReadOnlyPaths=@LIBEXECDIR@/fc-vm-launcher
+BindPaths=@STORAGE_ROOT@/vms/work:/work
 BindPaths=/run/firecracker-vms/slot-%i:/run/slot
 BindPaths=/dev/kvm /dev/net/tun
-ExecStart=/usr/local/libexec/fc-vm-launcher run %i
-ExecStopPost=/usr/local/libexec/fc-vm-launcher record-exit %i
+ExecStart=@LIBEXECDIR@/fc-vm-launcher run %i
+ExecStopPost=@LIBEXECDIR@/fc-vm-launcher record-exit %i
 # A guest reboot/exit ends the VMM; the slot stays idle until the helper starts it again.
 Restart=no
 KillMode=control-group

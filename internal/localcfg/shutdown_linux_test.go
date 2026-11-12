@@ -36,6 +36,7 @@ func TestShutdownHookWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 	personal := personalConfig(t)
+	l.PoolConf = publicationPool(t, "")
 	l.PersonalSSH = personal.PersonalSSH
 	l.SSHUser = "root"
 	seams := Seams{Launcher: fakeLauncher{}, VMM: fakeVMM{}}
