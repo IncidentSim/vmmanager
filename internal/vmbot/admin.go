@@ -178,16 +178,12 @@ func (c *Controller) AdminAdvance(admin, chat int64, token string) (AdminBatch, 
 				}
 			}
 		}
+		op = c.adminOperation(op)
 		ref.OperationID = op.ID
 		ref.Status = op.Status
 		ref.ErrorCode = op.ErrorCode
 		if ref.Status == "pending" || ref.Status == "running" {
-			if st, e := c.ownerState(ref.ID); e == nil && st != "" && !ownerAlive(st) {
-				ref.Status = "failed"
-				ref.ErrorCode = "unavailable"
-			} else {
-				break
-			}
+			break
 		}
 	}
 	b.Pending, b.Completed, b.Failed = 0, 0, 0
@@ -206,6 +202,27 @@ func (c *Controller) AdminAdvance(admin, chat int64, token string) (AdminBatch, 
 	}
 	return b, nil
 }
+
+// adminOperation reconciles a split observation of domain and owner state.
+// A terminal owner has already projected its final operation result; refresh
+// that result before turning an unfinished operation into a batch failure.
+func (c *Controller) adminOperation(op ControlOperation) ControlOperation {
+	if op.Status == "pending" || op.Status == "running" {
+		if st, err := c.ownerState(op.VMID); err == nil && st != "" && !ownerAlive(st) {
+			for _, current := range c.st.Snapshot().Operations {
+				if current.ID == op.ID && current.OwnerUserID == op.OwnerUserID {
+					op = current
+					break
+				}
+			}
+			if op.Status == "pending" || op.Status == "running" {
+				op.Status, op.ErrorCode = "failed", "unavailable"
+			}
+		}
+	}
+	return op
+}
+
 func (c *Controller) saveAdminBatch(b AdminBatch) error {
 	return c.st.UpdateErr(func(s *State) error {
 		for i := range s.AdminBatches {
