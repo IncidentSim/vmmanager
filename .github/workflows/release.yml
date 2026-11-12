@@ -3,6 +3,12 @@ name: release
 # Publishes a GitHub Release when a version tag is pushed. Nothing is published
 # for branches or pull requests (those only run the snapshot build in ci.yml).
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish (for example v0.1.0)
+        required: true
+        type: string
   push:
     tags: ["v*"]
 
@@ -22,11 +28,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Private test scratch (credential ancestry must stay trusted)
+        run: |
+          scratch="$(mktemp -d "$HOME/.vm-release-check-XXXXXXXX")"
+          chmod 0700 "$scratch"
+          echo "TMPDIR=$scratch" >> "$GITHUB_ENV"
       - name: Tests must pass before anything is published
         run: make check VERIFY_FLAGS=--require-systemd-analyze
         env:
