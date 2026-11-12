@@ -14,6 +14,25 @@ optional redundant backend assertion (not an API Create field) is:
 }
 ```
 
+### Advertised hostname (presentation only)
+
+`public_ssh.advertised_host` (optional) replaces `host` in the SSH endpoint and
+command reported to users, including for existing VMs. It is validated as an
+IPv4 literal or conservative DNS name, is never resolved, and does not affect
+the root-pool check, port (`port_base + slot`), routing, bastion or lifecycle.
+`host` must still equal the root pool literal `PUBLIC_IPV4`; the operator owns
+DNS and routing for the advertised name. It may resolve to a separate forwarding
+server, provided that server forwards the published slot ports to the backend.
+Omitted = report `host`.
+
+```json
+"public_ssh": {
+  "host": "203.0.113.10",
+  "port_base": 22000,
+  "advertised_host": "ssh.example.test"
+}
+```
+
 These are documentation-only values; the parent/operator chooses the audited
 actual public IPv4 and unoccupied port range. With a root pool, `host` must be
 the exact canonical literal `PUBLIC_IPV4`; DNS names are rejected without any

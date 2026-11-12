@@ -27,6 +27,10 @@ func TestPublicSSHOperatorPolicy(t *testing.T) {
 		{`{"host":"a..test","port_base":22000}`, false},
 		{`{"host":"a-.test","port_base":22000}`, false},
 		{`{"host":"has space.test","port_base":22000}`, false},
+		{`{"host":"203.0.113.10","port_base":22000,"advertised_host":"rkn.petruekhin.tech"}`, true},
+		{`{"host":"203.0.113.10","port_base":22000,"advertised_host":"-bad.test"}`, false},
+		{`{"host":"203.0.113.10","port_base":22000,"advertised_host":"u@x.test"}`, false},
+		{`{"host":"203.0.113.10","port_base":22000,"advertised_host":"x.test:22"}`, false},
 	} {
 		t.Run(tc.policy, func(t *testing.T) {
 			input := strings.Replace(good, `"max_vms":2`, `"max_vms":2,"public_ssh":`+tc.policy, 1)

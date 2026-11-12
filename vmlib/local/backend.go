@@ -659,7 +659,7 @@ func (b *Backend) host(m meta) vmlib.HostVM {
 	}
 	var endpoint *vmlib.SSHEndpoint
 	if b.cfg.PublicSSH != nil {
-		endpoint = &vmlib.SSHEndpoint{Host: b.cfg.PublicSSH.Host, Port: b.cfg.PublicSSH.PortBase + m.Slot}
+		endpoint = &vmlib.SSHEndpoint{Host: b.cfg.PublicSSH.ReportedHost(), Port: b.cfg.PublicSSH.PortBase + m.Slot}
 	}
 	return vmlib.HostVM{SSHEndpoint: endpoint, SSHAuthMode: mode, ID: m.ID, ImageID: m.ImageID, Profile: m.Profile, Resources: vmlib.VMResources{VCPU: m.VCPU, CPULimitMilli: m.CPULimitMilli, MemMiB: m.MemMiB}, State: state, GuestIP: b.slotIP(m.Slot),
 		Retained: m.Retained, RetainedReason: m.Reason, PublicKeyProvisioned: m.AccessManaged && m.State != statePreparing,

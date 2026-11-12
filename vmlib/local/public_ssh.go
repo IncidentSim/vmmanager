@@ -40,6 +40,9 @@ func publicSSHFromPool(pool vmhelper.Pool, policy *vmlib.PublicSSHConfig, slots 
 		return nil, nil
 	}
 	resolved := &vmlib.PublicSSHConfig{Host: pool.PublicIPv4, PortBase: pool.SSHPortBase}
+	if policy != nil {
+		resolved.AdvertisedHost = policy.AdvertisedHost // presentation only
+	}
 	if err := resolved.ValidateSlots(slots); err != nil {
 		return nil, err
 	}
