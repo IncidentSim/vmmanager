@@ -19,8 +19,8 @@ import (
 	"time"
 
 	"github.com/petruekhin/vibe-firecracker/controlclient"
+	"github.com/petruekhin/vibe-firecracker/internal/fixture"
 	"github.com/petruekhin/vibe-firecracker/internal/vmhelper"
-	"golang.org/x/crypto/ssh"
 )
 
 const disposableGate = "VMAPI_E2E_DISPOSABLE"
@@ -167,7 +167,7 @@ func runDisposable(ctx context.Context, tests func() int) (code int, err error) 
 	if err != nil {
 		return 1, err
 	}
-	m, err := LoadManifest("testdata/artifacts.json")
+	m, err := LoadManifest("../internal/fixture/artifacts.json")
 	if err != nil {
 		return 1, err
 	}
@@ -307,18 +307,11 @@ func offlineKnownHosts(ctx context.Context, image, dst, prefix string, slots int
 	if err != nil {
 		return fmt.Errorf("offline guest host key: %w", err)
 	}
-	key, _, _, rest, err := ssh.ParseAuthorizedKey(out)
-	if err != nil || len(strings.TrimSpace(string(rest))) != 0 {
-		return errors.New("verified image lacks exactly one valid ed25519 host public key")
+	data, err := fixture.KnownHosts(out, prefix, slots)
+	if err != nil {
+		return err
 	}
-	if key.Type() != ssh.KeyAlgoED25519 {
-		return errors.New("unexpected guest host key algorithm")
-	}
-	var b strings.Builder
-	for n := 0; n < slots; n++ {
-		fmt.Fprintf(&b, "%s.%d.2 %s", prefix, n, ssh.MarshalAuthorizedKey(key))
-	}
-	return os.WriteFile(dst, []byte(b.String()), 0600)
+	return os.WriteFile(dst, data, 0600)
 }
 
 func waitFixtureHealthy(ctx context.Context, hc *http.Client, base string, done <-chan struct{}, result func() error) error {

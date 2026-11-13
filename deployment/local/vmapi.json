@@ -1,0 +1,39 @@
+{
+  "listen_addr": "127.0.0.1:8090",
+  "state_dir": "/var/lib/vmmanager/api/state",
+  "allowed_user_ids": [1],
+  "shared_image_ids": ["ubuntu"],
+  "max_vms": 1,
+  "max_vms_per_user": 1,
+  "default_profile": "small",
+  "default_ttl_seconds": 3600,
+  "max_ttl_seconds": 86400,
+  "idle_timeout_seconds": 3600,
+  "credentials": [{"token_file": "/var/lib/vmmanager/api/api-token", "user_id": 1}],
+  "backend": {
+    "work_root": "/var/lib/firecracker-builder/storage/vms/work",
+    "images_dir": "/var/lib/firecracker-builder/storage/vms/images",
+    "run_dir": "/run/firecracker-vms",
+    "storage_mount": "/var/lib/firecracker-builder/storage",
+    "max_vms": 1,
+    "helper": "/usr/local/libexec/fc-vm-helper-client",
+    "pool_conf": "/etc/firecracker-vms/pool.conf",
+    "guest_prefix": "10.222",
+    "guest_dns": ["1.1.1.1"],
+    "guest_network_provisioning": "ubuntu-fcnet",
+    "ssh_user": "root",
+    "min_free_mib": 512,
+    "max_total_mem_mib": 256,
+    "max_total_vcpu": 1,
+    "unit_mem_limit_mib": 768,
+    "vmm_overhead_mib": 64,
+    "default_profile": "small",
+    "profiles": [{"name": "small", "vcpu": 1, "mem_mib": 256, "disk_mib": 2048}],
+    "personal_ssh": {
+      "enabled": true,
+      "store_dir": "/var/lib/vmmanager/api/ssh-store",
+      "master_key_file": "/var/lib/vmmanager/api/ssh-master.key",
+      "shutdown_known_hosts_file": "/var/lib/vmmanager/api/known_hosts"
+    }
+  }
+}

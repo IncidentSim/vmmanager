@@ -1,7 +1,6 @@
 # vmmanager
 
 Сервис для управления микровиртуальными машинами [Firecracker](https://firecracker-microvm.github.io/) на одном Linux-хосте.
-Прежнее название проекта — vibe-firecracker.
 
 ## Что это делает
 
@@ -38,8 +37,8 @@
 
 **[Локальный запуск с настоящим Firecracker → LOCAL-RUN.md](LOCAL-RUN.md)**
 
-Пошаговое руководство: API на `127.0.0.1:8090` с реальным Firecracker. Публичный доступ, Telegram-бот и TLS
-не нужны. Проверено на чистой Ubuntu 24.04 x86_64 с вложенным KVM (подробности и границы проверки — в руководстве).
+Готовый архив-пример с короткими командами подготовки хоста: API на `127.0.0.1:8090` с реальным Firecracker.
+Публичный доступ, Telegram-бот и TLS не нужны.
 
 ## Сборка (для разработки)
 
@@ -51,6 +50,7 @@ make check   # проверки без запуска гостевых VM
 ## Документация
 
 - [Установка на хост](docs/install.md)
+- [Локальный запуск](LOCAL-RUN.md)
 - [Архитектура](docs/architecture.md)
 - [Описание API (OpenAPI)](docs/control-api-openapi.yaml)
 - [Автоматизация SSH](docs/ssh-automation.md)

@@ -106,7 +106,7 @@ func TestFetchRefusesUntrustedInput(t *testing.T) {
 }
 
 func TestShippedManifestIsStrict(t *testing.T) {
-	b, err := os.ReadFile("testdata/artifacts.json")
+	b, err := os.ReadFile("../internal/fixture/artifacts.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestShippedManifestIsStrict(t *testing.T) {
 		t.Fatal("empty pin")
 	}
 	// Every shipped artifact must have a real pin, never a placeholder.
-	if _, err := LoadManifest("testdata/artifacts.json"); err != nil {
+	if _, err := LoadManifest("../internal/fixture/artifacts.json"); err != nil {
 		t.Fatal(err)
 	}
 }

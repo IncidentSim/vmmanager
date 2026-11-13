@@ -31,7 +31,7 @@ VMHOST_FLAGS = --build-dir "$(BUILD_DIR)" --prefix "$(PREFIX)" --sysconfdir "$(S
 	$(if $(FORCE),--force)
 
 .PHONY: build legacy test vet release-check fmt-check check control-smoke verify-units stage-check \
-	install uninstall preflight host-setup host-enable e2e-live e2e clean help
+	install uninstall preflight bundle host-setup host-enable e2e-live e2e clean help
 
 define HELP_TEXT
 Targets (details in docs/install.md and docs/ci.md):
@@ -44,6 +44,7 @@ Targets (details in docs/install.md and docs/ci.md):
   verify-units  render units and run systemd-analyze verify
   install       place files under DESTDIR/PREFIX (real install needs root)
   uninstall     remove exactly the files recorded by install
+  bundle        build vmmanager-example.tar.gz (BUNDLE_OUT=dir; IMAGE=, ASSETS= optional; published by release.yml)
   preflight     read-only host readiness report
   host-setup    create empty jail/work/images dirs (USER_NAME=name, APPLY=1)
   host-enable   enable the helper socket only (APPLY=1)
@@ -104,6 +105,12 @@ uninstall:
 ## preflight    read-only host readiness report (KVM, systemd, tools, subnet, storage)
 preflight:
 	$(VMHOST) preflight $(VMHOST_FLAGS)
+
+## bundle       build the self-contained example archive (downloads pinned artifacts, needs fakeroot, squashfs-tools, e2fsprogs; not part of check)
+BUNDLE_OUT ?= ../artifacts
+BUNDLE_WORK ?= $(BUNDLE_OUT)/work
+bundle: build
+	$(GO) run ./cmd/vmbundle --bin "$(BUILD_DIR)" --out "$(BUNDLE_OUT)" --work "$(BUNDLE_WORK)" $(if $(IMAGE),--image "$(IMAGE)") $(if $(ASSETS),--assets "$(ASSETS)")
 
 ## host-setup   (root) create empty jail/work/images directories; USER=name; APPLY=1 to apply
 host-setup:

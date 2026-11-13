@@ -91,3 +91,11 @@ changelog:
 release:
   github: {}
   prerelease: auto
+  # The self-contained example archive and its checksum are built by
+  # `make bundle` in release.yml (downloads, root-free image assembly) into the
+  # directory named by VMMANAGER_EXAMPLE_DIR, outside the checkout so the git
+  # tree stays clean. Only the release pipe reads these, so snapshot/check runs
+  # in branch CI need neither the files nor the variable and never download.
+  extra_files:
+    - glob: "{{ .Env.VMMANAGER_EXAMPLE_DIR }}/vmmanager-example.tar.gz"
+    - glob: "{{ .Env.VMMANAGER_EXAMPLE_DIR }}/vmmanager-example.tar.gz.sha256"

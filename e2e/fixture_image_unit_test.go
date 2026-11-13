@@ -30,7 +30,7 @@ func TestConfigureRefusesAnExistingDirectory(t *testing.T) {
 }
 
 func TestLoadManifestRejectsTrailingData(t *testing.T) {
-	src, err := os.ReadFile("testdata/artifacts.json")
+	src, err := os.ReadFile("../internal/fixture/artifacts.json")
 	if err != nil {
 		t.Fatal(err)
 	}

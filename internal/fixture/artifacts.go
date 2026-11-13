@@ -1,10 +1,14 @@
-package e2e
+// Package fixture downloads the pinned Firecracker artifacts and converts the
+// upstream Ubuntu CI rootfs into a base image the product's offline
+// provisioners accept. It is shared by the E2E suite and the `vmbundle` example builder.
+package fixture
 
 import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +23,12 @@ import (
 	"strings"
 )
 
+//go:embed artifacts.json
+var pinned []byte
+
+// Pinned returns the manifest of the artifacts shipped in this binary.
+func Pinned() (Manifest, error) { return parseManifest(pinned) }
+
 // Artifact is one pinned download.
 type Artifact struct {
 	Name   string `json:"name"`   // destination file name inside the output directory
@@ -31,7 +41,7 @@ type Artifact struct {
 	Mode   uint32 `json:"mode,omitempty"` // extracted file mode (default 0644)
 }
 
-// Manifest lists the artifacts of the E2E job.
+// Manifest lists the pinned upstream artifacts (E2E job and example bundle).
 type Manifest struct {
 	Artifacts []Artifact `json:"artifacts"`
 }
@@ -47,6 +57,10 @@ func LoadManifest(p string) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
+	return parseManifest(b)
+}
+
+func parseManifest(b []byte) (Manifest, error) {
 	dec := json.NewDecoder(strings.NewReader(string(b)))
 	dec.DisallowUnknownFields()
 	var m Manifest

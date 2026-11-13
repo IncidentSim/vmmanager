@@ -70,6 +70,19 @@ jobs:
         run: make check VERIFY_FLAGS=--require-systemd-analyze
         env:
           VMHOST_REQUIRE_SYSTEMD_ANALYZE: "1"
+      # Only after tests passed, and only in this job: tools for the unprivileged
+      # image assembly (unsquashfs, mkfs.ext4/debugfs, fakeroot).
+      - name: Install example image build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fakeroot squashfs-tools e2fsprogs
+      - name: Build the example bundle from pinned upstream artifacts (no secrets)
+        run: |
+          out="$RUNNER_TEMP/vmmanager-example-out"
+          mkdir -p "$out"
+          make bundle BUNDLE_OUT="$out" BUNDLE_WORK="$TMPDIR/bundle-work"
+          (cd "$out" && sha256sum vmmanager-example.tar.gz > vmmanager-example.tar.gz.sha256 && sha256sum -c vmmanager-example.tar.gz.sha256)
+          echo "VMMANAGER_EXAMPLE_DIR=$out" >> "$GITHUB_ENV"
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser

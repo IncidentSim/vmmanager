@@ -10,7 +10,7 @@ Workflow and release contracts are also checked by `internal/repocheck`.
 | `ci.yml` / `go` | PR, any branch push | pinned actionlint; `make check` (vet, formatting, race tests, product build, staged installer round trip, required `systemd-analyze`); executable API smoke; legacy tools build |
 | `ci.yml` / `release-snapshot` | same | GoReleaser v2.20.1 OSS `check`, real snapshot builds, archive extraction, extracted `vmhost stage-check` and unit verification without a source tree |
 | `e2e-kvm.yml` | PR, any branch push, manual | real Firecracker guest lifecycle and SSH on a disposable KVM host |
-| `release.yml` | `v*` tag push only | `make check`, then GoReleaser publishes GitHub Release archives and SHA-256 checksums; only this workflow has `contents: write` |
+| `release.yml` | `v*` tag push, manual retry of an existing tag from `main` | `make check`; then (release job only) apt-installs `fakeroot squashfs-tools e2fsprogs`, runs `make bundle` unprivileged, and GoReleaser publishes the archives, `checksums.txt`, `vmmanager-example.tar.gz` and `vmmanager-example.tar.gz.sha256`; only this workflow has `contents: write` |
 
 The executable API smoke uses the **in-memory backend** on loopback. It is not a
 Firecracker E2E. Snapshot jobs never publish; release runs are not cancelled.
@@ -38,7 +38,7 @@ The KVM job provisions a **clean, disposable** Linux x86_64 host:
    fixture lifecycle, with no additional command or runtime package.
 4. TestMain requires passwordless sudo, a fresh host (no existing pool or
    installed product manifest), KVM/TUN, a mounted storage volume, and tools.
-   It downloads `e2e/testdata/artifacts.json` pins over HTTPS with bounds and
+   It downloads `internal/fixture/artifacts.json` pins over HTTPS with bounds and
    SHA-256 verification. Image preparation runs unsquashfs and mkfs.ext4 under
    fakeroot with a shared ownership database; the existing offline SSH/network
    provisioners validate a disposable copy. The upstream fcnet unit gets its
@@ -100,11 +100,13 @@ project's **Ubuntu 24.04 CI squashfs** under its `firecracker-ci/v1.12/x86_64/`
 S3 prefix. All three were downloaded from their declared URLs and their actual
 SHA-256 values recorded. The Go fetcher was exercised against the full manifest.
 The generated ext4 image is derived locally, not a pretend downloadable artifact.
-Upstream downloads are not included in product release archives.
+Upstream downloads are not included in the product host/client archives; they
+are included only in the separate release asset `vmmanager-example.tar.gz`
+(see Releases).
 
 To update, download the candidate from the upstream project over HTTPS, calculate
 its SHA-256 and update URL/hash/member/bound together in
-`e2e/testdata/artifacts.json`, then run the disposable suite. A changed/missing
+`internal/fixture/artifacts.json`, then run the disposable suite. A changed/missing
 artifact, incompatible provisioning format or missing offline host key fails,
 never falls back to unverified data. Bucket object names alone are not
 immutable; the digest is authoritative. Download/image/unit tests do not prove
@@ -135,6 +137,18 @@ executables, including `vmhost` with embedded units, templates, tmpfiles and
 examples. The extracted archive is the installer's build directory. Portable
 `vmctl` clients are additionally built for Darwin amd64/arm64 and Windows amd64.
 See [install.md](install.md#release-archives) for installation.
+
+Each release also carries the **example bundle** `vmmanager-example.tar.gz`
+(Ubuntu ext4 base image, Firecracker, kernel, configs and product binaries; see
+[LOCAL-RUN.md](../LOCAL-RUN.md)) and `vmmanager-example.tar.gz.sha256`
+(`sha256sum -c` format; the bundle is not listed in `checksums.txt`). The release
+job builds it with `make bundle` from the hash-pinned upstream artifacts in
+`internal/fixture/artifacts.json`: no secrets or state, an unprivileged image
+assembly with fakeroot, scratch in the private home-owned `TMPDIR`, outside the
+checkout so GoReleaser sees a clean tree. GoReleaser uploads it through
+`release.extra_files` (globs from `VMMANAGER_EXAMPLE_DIR`). Branch CI and
+`make check` never build it, download images or need root/KVM; local
+`make bundle` needs network access and the same three packages.
 
 Run `make release-check GORELEASER=/path/to/goreleaser` with GoReleaser v2 OSS.
 It writes real archives and `checksums.txt` into ignored `dist/`, publishing

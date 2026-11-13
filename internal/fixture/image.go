@@ -1,4 +1,4 @@
-package e2e
+package fixture
 
 import (
 	"context"
@@ -57,8 +57,9 @@ func PrepareImage(ctx context.Context, src, dst string, out io.Writer) error {
 		return err
 	}
 	image := filepath.Join(work, "rootfs.ext4")
-	// 1 GiB fits the downloaded root tree; the backend grows private copies to
-	// the selected 2 GiB profile. Disable orphan_file for older guest kernels.
+	// 1 GiB fits the downloaded root tree. The backend never grows the disk: the
+	// profile disk_mib is only an upper bound for the image size. Disable
+	// orphan_file for older guest kernels.
 	if err := run("fakeroot", "-i", filepath.Join(work, "owners"), "--", "mkfs.ext4", "-q", "-F", "-O", "^orphan_file", "-d", tree, image, "1024M"); err != nil {
 		return err
 	}
@@ -87,4 +88,25 @@ func PrepareImage(ctx context.Context, src, dst string, out io.Writer) error {
 	fmt.Fprintln(out, "verified actual offline SSH and guest-network provisioning on a disposable copy")
 	// link is atomic and refuses concurrent replacement, unlike Rename.
 	return os.Link(image, dst)
+}
+
+// CheckCleanImage proves, read-only through debugfs, that a base image is a
+// plain Ubuntu image: no per-VM SSH access receipt, injected network script or
+// drop-in and no root authorized_keys, i.e. nothing a running product or an
+// operator could have added.
+func CheckCleanImage(ctx context.Context, image string) error {
+	debugfs := func(cmd string) (string, error) {
+		out, err := exec.CommandContext(ctx, "debugfs", "-R", cmd, image).CombinedOutput()
+		return string(out), err
+	}
+	if out, err := debugfs("cat /usr/lib/os-release"); err != nil || !strings.Contains(out, "ID=ubuntu") {
+		return errors.New("image is not an Ubuntu root filesystem")
+	}
+	for _, p := range []string{"/etc/vibe-fc-ssh-access", "/etc/vibe-fc-network.sh", "/etc/systemd/system/fcnet.service.d", "/root/.ssh/authorized_keys"} {
+		out, err := debugfs("stat " + p)
+		if err != nil || !strings.Contains(out, "File not found by ext2_lookup") {
+			return fmt.Errorf("image is not clean: %s exists or cannot be checked", p)
+		}
+	}
+	return nil
 }
