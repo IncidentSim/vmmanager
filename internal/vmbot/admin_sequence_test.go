@@ -3,6 +3,8 @@ package vmbot
 import (
 	"testing"
 	"time"
+
+	"github.com/dbos-inc/dbos-transact-golang/dbos"
 )
 
 func TestAdminSnapshotDeletesSequentiallyAcrossOwners(t *testing.T) {
@@ -72,5 +74,36 @@ func TestAdminSnapshotDeletesSequentiallyAcrossOwners(t *testing.T) {
 		if _, ok := e.record(ref.ID); ok {
 			t.Fatal("successful delete retained VM")
 		}
+	}
+}
+
+// The operation is read as pending, then the owner finishes (settling the
+// operation first) before the owner state is read. That stale split read must
+// reconcile to the authoritative success, never to a failure.
+func TestAdminAdvanceStaleOperationReadOwnerSucceeded(t *testing.T) {
+	e := newOwnerEnv(t)
+	vm := e.create("one")
+	e.ctl.ConfigureAdmins([]int64{99})
+	b, err := e.ctl.AdminPreview(99, 99, "preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.ctl.testAfterAdminOpRead = func() {
+		e.ctl.testAfterAdminOpRead = nil
+		e.eventually("owner ends", func() bool { return e.ownerStatus(vm.VMID) == dbos.WorkflowStatusSuccess })
+	}
+	b, err = e.ctl.AdminAdvance(99, 99, b.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Failed != 0 || b.VMs[0].ErrorCode != "" {
+		t.Fatalf("false failure from stale read: %+v", b)
+	}
+	b, err = e.ctl.AdminAdvance(99, 99, b.Token)
+	if err != nil || b.Completed != 1 || b.Failed != 0 || b.Pending != 0 {
+		t.Fatalf("not completed: %+v %v", b, err)
+	}
+	if got := e.st.Snapshot().AdminBatches[0]; got.Completed != 1 || got.Failed != 0 {
+		t.Fatalf("persisted: %+v", got)
 	}
 }

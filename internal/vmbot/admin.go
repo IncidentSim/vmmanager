@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/dbos-inc/dbos-transact-golang/dbos"
 )
 
 // AdminBatch is an immutable inventory snapshot plus durable progress. The
@@ -182,9 +184,27 @@ func (c *Controller) AdminAdvance(admin, chat int64, token string) (AdminBatch, 
 		ref.Status = op.Status
 		ref.ErrorCode = op.ErrorCode
 		if ref.Status == "pending" || ref.Status == "running" {
+			if c.testAfterAdminOpRead != nil {
+				c.testAfterAdminOpRead()
+			}
 			if st, e := c.ownerState(ref.ID); e == nil && st != "" && !ownerAlive(st) {
-				ref.Status = "failed"
-				ref.ErrorCode = "unavailable"
+				if st == dbos.WorkflowStatusSuccess {
+					// The owner settles the operation before it ends, so the
+					// operation read above may be stale. Adopt the authoritative
+					// stored outcome; if still unsettled, stay pending.
+					for _, o := range c.st.Snapshot().Operations {
+						if o.ID == op.ID {
+							ref.Status, ref.ErrorCode = o.Status, o.ErrorCode
+							break
+						}
+					}
+					if ref.Status == "pending" || ref.Status == "running" {
+						break
+					}
+				} else {
+					ref.Status = "failed"
+					ref.ErrorCode = "unavailable"
+				}
 			} else {
 				break
 			}

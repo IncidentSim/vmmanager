@@ -104,6 +104,11 @@ type Controller struct {
 	// (after the child completed, before the outcome is written). Nil in production.
 	testBeforeProject func(OwnerCmd)
 
+	// testAfterAdminOpRead is called by AdminAdvance after it has read an
+	// operation and before it reads owner state, to make the split read
+	// deterministic in tests. Nil in production.
+	testAfterAdminOpRead func()
+
 	// ownerFn is the registered owner workflow body (vmOwner). Tests substitute a
 	// frozen baseline body to produce genuine old histories. Nil means vmOwner.
 	ownerFn func(dbos.Context, OwnerIn) (OwnerOut, error)
