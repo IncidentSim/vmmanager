@@ -2,31 +2,70 @@ name: release
 
 # Publishes a GitHub Release when a version tag is pushed. Nothing is published
 # for branches or pull requests (those only run the snapshot build in ci.yml).
+# An existing tag can be retried with workflow_dispatch on main: the pipeline
+# (this file) comes from main, the published source is always refs/tags/<tag>.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to publish (vMAJOR.MINOR.PATCH[-prerelease])"
+        required: true
+        type: string
 
 # Only this job needs write access, to create the release and upload assets.
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # Manual runs publish with a write token: only from the trusted main pipeline.
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     steps:
+      - name: Validate the release tag (before any checkout or provisioning)
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$REF_NAME"
+          fi
+          num='(0|[1-9][0-9]*)'
+          pre='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          re="^v${num}\\.${num}\\.${num}(-${pre}(\\.${pre})*)?$"
+          case "$tag" in
+            *$'\n'*|*$'\r'*) echo "::error::release tag contains a line break"; exit 1 ;;
+          esac
+          if ! [[ "$tag" =~ $re ]]; then
+            echo "::error::release tag is not a supported vMAJOR.MINOR.PATCH[-prerelease] version"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Private test scratch (credential ancestry must stay trusted)
+        run: |
+          scratch="$(mktemp -d "$HOME/.vm-go-check-XXXXXXXX")"
+          chmod 0700 "$scratch"
+          echo "TMPDIR=$scratch" >> "$GITHUB_ENV"
       - name: Tests must pass before anything is published
         run: make check VERIFY_FLAGS=--require-systemd-analyze
         env:
@@ -38,3 +77,4 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.tag.outputs.tag }}

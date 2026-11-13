@@ -118,7 +118,9 @@ func TestReleaseWorkflowPermissionsAndTrigger(t *testing.T) {
 		On          map[string]any    `yaml:"on"`
 		Permissions map[string]string `yaml:"permissions"`
 		Jobs        map[string]struct {
+			If    string `yaml:"if"`
 			Steps []struct {
+				ID   string            `yaml:"id"`
 				Name string            `yaml:"name"`
 				Uses string            `yaml:"uses"`
 				Run  string            `yaml:"run"`
@@ -135,8 +137,11 @@ func TestReleaseWorkflowPermissionsAndTrigger(t *testing.T) {
 	if err := yaml.UnmarshalStrict(b, &w); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := w.On["push"]; !ok || len(w.On) != 1 {
-		t.Fatalf("release must trigger only on tag pushes: %v", w.On)
+	if _, ok := w.On["push"]; !ok || len(w.On) != 2 {
+		t.Fatalf("release must trigger only on tag pushes and manual dispatch: %v", w.On)
+	}
+	if _, ok := w.On["workflow_dispatch"]; !ok {
+		t.Fatal("release must allow workflow_dispatch to retry an existing tag")
 	}
 	if !strings.Contains(string(b), `tags: ["v*"]`) {
 		t.Error("release must be limited to v* tags")
